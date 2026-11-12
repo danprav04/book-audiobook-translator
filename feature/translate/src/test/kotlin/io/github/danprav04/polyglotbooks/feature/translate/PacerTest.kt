@@ -54,6 +54,47 @@ class PacerTest {
     }
 
     @Test
+    fun testDriftCompensation() {
+        val chunkDurationMs = 100L
+        // At 1.0x speed, nominal delay is 100ms.
+        // With 30ms positive drift (latency), delay is reduced to 70ms to catch up.
+        val delayWithDrift = pacer.calculateDelayMs(chunkDurationMs, 30_000L, driftMs = 30L)
+        assertEquals(70L, delayWithDrift)
+
+        // Excessive drift larger than nominal delay clamps to 0ms (cannot have negative delay)
+        val delayOverDrift = pacer.calculateDelayMs(chunkDurationMs, 30_000L, driftMs = 200L)
+        assertEquals(0L, delayOverDrift)
+    }
+
+    @Test
+    fun testBackpressureSupportWhenBufferExceedsTarget() {
+        // Below target (25s): backpressure is not active
+        assertFalse(pacer.isBackpressureActive(25_000L))
+        assertFalse(pacer.shouldThrottle(25_000L))
+        assertFalse(pacer.shouldPause(25_000L))
+        assertEquals(0L, pacer.calculateBackpressureDelayMs(25_000L))
+
+        // At target (30s): backpressure active
+        assertTrue(pacer.isBackpressureActive(30_000L))
+        assertTrue(pacer.shouldThrottle(30_000L))
+        assertTrue(pacer.shouldPause(30_000L))
+
+        // Over target (35s): backpressure active, throttles with excess buffer delay
+        assertTrue(pacer.isBackpressureActive(35_000L))
+        val backpressureDelay = pacer.calculateBackpressureDelayMs(35_000L, chunkDurationMs = 100L)
+        assertEquals(5_000L, backpressureDelay)
+
+        // calculateDelayMs with applyBackpressure = true throttles
+        val delayWithBackpressure = pacer.calculateDelayMs(100L, 35_000L, applyBackpressure = true)
+        assertTrue(delayWithBackpressure >= 5_000L)
+
+        // Pacer with enableBackpressure = true in constructor
+        val backpressurePacer = Pacer(enableBackpressure = true)
+        val bpDelay = backpressurePacer.calculateDelayMs(100L, 35_000L)
+        assertTrue(bpDelay >= 5_000L)
+    }
+
+    @Test
     fun testMonotonicity() {
         // Speed multiplier should be non-increasing as buffer increases
         var prevSpeed = Float.MAX_VALUE

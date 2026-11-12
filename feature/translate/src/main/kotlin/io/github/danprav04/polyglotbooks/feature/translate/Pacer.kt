@@ -20,7 +20,8 @@ package io.github.danprav04.polyglotbooks.feature.translate
 class Pacer(
     val minBufferAheadMs: Long = 10_000L,
     val targetBufferAheadMs: Long = 30_000L,
-    val maxSendSpeed: Float = 1.5f
+    val maxSendSpeed: Float = 1.5f,
+    val enableBackpressure: Boolean = false
 ) {
     init {
         require(minBufferAheadMs >= 0) { "minBufferAheadMs must be non-negative" }
@@ -46,13 +47,60 @@ class Pacer(
     }
 
     /**
-     * Calculates the wall-clock delay in milliseconds before sending the next audio chunk.
-     * E.g. For a 100 ms chunk at 1.5x speed, delay is 100 / 1.5 = 66 ms.
-     * At 1.0x speed, delay is 100 / 1.0 = 100 ms.
+     * Indicates whether backpressure should be active because the buffer has reached
+     * or exceeded targetBufferAheadMs.
      */
-    fun calculateDelayMs(chunkDurationMs: Long, currentBufferAheadMs: Long): Long {
+    fun isBackpressureActive(currentBufferAheadMs: Long): Boolean =
+        currentBufferAheadMs >= targetBufferAheadMs
+
+    /**
+     * Indicates whether sending should throttle due to buffer exceeding target threshold.
+     */
+    fun shouldThrottle(currentBufferAheadMs: Long): Boolean =
+        isBackpressureActive(currentBufferAheadMs)
+
+    /**
+     * Indicates whether sending should pause due to buffer exceeding target threshold.
+     */
+    fun shouldPause(currentBufferAheadMs: Long): Boolean =
+        isBackpressureActive(currentBufferAheadMs)
+
+    /**
+     * Calculates the wall-clock delay in milliseconds before sending the next audio chunk.
+     * Supports drift compensation for network/transport latency and backpressure throttling
+     * when [applyBackpressure] is enabled and buffer ahead meets or exceeds [targetBufferAheadMs].
+     *
+     * @param chunkDurationMs duration of the audio chunk in milliseconds.
+     * @param currentBufferAheadMs current buffered audio ahead of playback in milliseconds.
+     * @param driftMs transport/send latency drift (in ms). Positive drift reduces the delay
+     *                so transmission catches up; negative drift increases delay.
+     * @param applyBackpressure whether to apply backpressure throttling when buffer >= targetBufferAheadMs.
+     */
+    fun calculateDelayMs(
+        chunkDurationMs: Long,
+        currentBufferAheadMs: Long,
+        driftMs: Long = 0L,
+        applyBackpressure: Boolean = enableBackpressure
+    ): Long {
         require(chunkDurationMs >= 0) { "chunkDurationMs must be non-negative" }
         val speed = calculateSpeedMultiplier(currentBufferAheadMs)
-        return (chunkDurationMs / speed).toLong()
+        val nominalDelay = (chunkDurationMs / speed).toLong()
+        val driftAdjusted = (nominalDelay - driftMs).coerceAtLeast(0L)
+
+        return if (applyBackpressure && isBackpressureActive(currentBufferAheadMs)) {
+            val excessBuffer = currentBufferAheadMs - targetBufferAheadMs
+            driftAdjusted + excessBuffer.coerceAtLeast(chunkDurationMs)
+        } else {
+            driftAdjusted
+        }
+    }
+
+    /**
+     * Calculates backpressure delay when buffer exceeds target threshold.
+     */
+    fun calculateBackpressureDelayMs(currentBufferAheadMs: Long, chunkDurationMs: Long = 100L): Long {
+        if (!isBackpressureActive(currentBufferAheadMs)) return 0L
+        val excess = currentBufferAheadMs - targetBufferAheadMs
+        return excess.coerceAtLeast(chunkDurationMs)
     }
 }
