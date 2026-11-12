@@ -1,5 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.audiobook
 
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -15,10 +17,16 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.viewmodel.compose.viewModel
+import io.github.danprav04.polyglotbooks.core.model.LanguageCode
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -27,15 +35,40 @@ fun AudiobookPlayerScreen(
     onBackClick: () -> Unit = {},
     viewModel: AudiobookPlayerViewModel = androidx.hilt.navigation.compose.hiltViewModel()
 ) {
+    val context = LocalContext.current
     LaunchedEffect(bookId) {
         viewModel.loadBook(bookId)
     }
+    LaunchedEffect(context) {
+        viewModel.initTts(context)
+    }
     val state by viewModel.uiState.collectAsState()
+
+    // 1. Cover Art in Player: Load it via remember(state.coverUri, state.bookId) from state.coverUri or context.filesDir/covers/{bookId}.jpg using BitmapFactory.decodeFile
+    val coverBitmap = remember(state.coverUri, state.bookId) {
+        val bId = state.bookId.ifBlank { bookId }
+        val uriFile = state.coverUri?.let { File(it) }
+        val defaultCoverFile = if (bId.isNotBlank()) File(context.filesDir, "covers/$bId.jpg") else null
+        val targetPath = when {
+            uriFile != null && uriFile.exists() -> uriFile.absolutePath
+            defaultCoverFile != null && defaultCoverFile.exists() -> defaultCoverFile.absolutePath
+            !state.coverUri.isNullOrBlank() -> state.coverUri
+            defaultCoverFile != null -> defaultCoverFile.absolutePath
+            else -> null
+        }
+        targetPath?.let { path ->
+            try {
+                BitmapFactory.decodeFile(path)
+            } catch (_: Exception) {
+                null
+            }
+        } ?: state.coverBitmap
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(state.bookTitle) },
+                title = { Text(state.bookTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
                     IconButton(onClick = onBackClick) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -71,23 +104,48 @@ fun AudiobookPlayerScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.padding(top = 8.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(140.dp)
-                        .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(16.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Audiobook",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                if (coverBitmap != null) {
+                    Image(
+                        bitmap = coverBitmap.asImageBitmap(),
+                        contentDescription = state.bookTitle,
+                        modifier = Modifier
+                            .size(130.dp)
+                            .clip(RoundedCornerShape(16.dp)),
+                        contentScale = ContentScale.Crop
                     )
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(130.dp)
+                            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(16.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Headphones,
+                                contentDescription = null,
+                                modifier = Modifier.size(44.dp),
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Audiobook",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = state.chapters.getOrNull(state.currentChapterIndex)?.title ?: state.bookTitle,
+                    text = state.bookTitle,
                     style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
                 Text(
                     text = state.author,
@@ -102,14 +160,14 @@ fun AudiobookPlayerScreen(
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
             ) {
-                Column(modifier = Modifier.padding(16.dp)) {
+                Column(modifier = Modifier.padding(14.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "ORIGINAL (${state.selectedLanguage.displayName})",
+                            text = "ORIGINAL (${state.sourceLanguage.displayName})",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -130,11 +188,56 @@ fun AudiobookPlayerScreen(
                         style = MaterialTheme.typography.bodyMedium
                     )
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "TRANSLATED",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.secondary
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "TRANSLATED (${state.targetLanguage.displayName})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                        Box {
+                            TextButton(
+                                onClick = { viewModel.setLanguageDropdownVisible(true) },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                            ) {
+                                Text(
+                                    text = state.targetLanguage.displayName,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.ArrowDropDown,
+                                    contentDescription = "Select Target Language",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = state.showLanguageDropdown,
+                                onDismissRequest = { viewModel.setLanguageDropdownVisible(false) }
+                            ) {
+                                listOf(
+                                    LanguageCode.RUSSIAN,
+                                    LanguageCode.ENGLISH,
+                                    LanguageCode.HEBREW,
+                                    LanguageCode.SPANISH,
+                                    LanguageCode.FRENCH,
+                                    LanguageCode.GERMAN,
+                                    LanguageCode.JAPANESE,
+                                    LanguageCode.CHINESE_SIMPLIFIED
+                                ).forEach { lang ->
+                                    DropdownMenuItem(
+                                        text = { Text(lang.displayName) },
+                                        onClick = {
+                                            viewModel.setTargetLanguage(lang)
+                                        }
+                                    )
+                                }
+                            }
+                        }
+                    }
                     Text(
                         text = if (state.isLiveTranslationActive) state.translatedSubtitle else "(Translation Muted)",
                         style = MaterialTheme.typography.bodyMedium,
@@ -143,19 +246,55 @@ fun AudiobookPlayerScreen(
                 }
             }
 
-            // Scrubber Slider
+            // Chapter UI & Scrubber (Requirement 4)
+            val currentChapter = state.chapters.getOrNull(state.currentChapterIndex)
+            val chapterTitle = currentChapter?.title ?: "Chapter ${state.currentChapterIndex + 1}"
+            val chapterCount = state.chapters.size.coerceAtLeast(1)
+            val chapterNumText = "Chapter ${state.currentChapterIndex + 1} of $chapterCount"
+            val chapterStartMs = currentChapter?.startMs ?: 0L
+            val chapterDurationMs = (currentChapter?.durationMs ?: state.durationMs).coerceAtLeast(1000L)
+            val elapsedInChapterMs = (state.currentPositionMs - chapterStartMs).coerceIn(0L, chapterDurationMs)
+
             Column(modifier = Modifier.fillMaxWidth()) {
+                // Chapter Title & "Chapter X of Y"
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { viewModel.setChapterListSheetVisible(true) },
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = chapterTitle,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = chapterNumText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.secondary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                // Chapter progress slider
                 Slider(
-                    value = state.currentPositionMs.toFloat(),
-                    onValueChange = { viewModel.seekTo(it.toLong()) },
-                    valueRange = 0f..state.durationMs.toFloat()
+                    value = elapsedInChapterMs.toFloat(),
+                    onValueChange = { newElapsed ->
+                        viewModel.seekTo(chapterStartMs + newElapsed.toLong())
+                    },
+                    valueRange = 0f..chapterDurationMs.toFloat()
                 )
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = formatTime(state.currentPositionMs),
+                        text = formatTime(elapsedInChapterMs),
                         style = MaterialTheme.typography.bodySmall
                     )
                     Text(
@@ -164,8 +303,39 @@ fun AudiobookPlayerScreen(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        text = formatTime(state.durationMs),
+                        text = formatTime(chapterDurationMs),
                         style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
+                // Total book progress secondary text / indicator
+                Spacer(modifier = Modifier.height(4.dp))
+                val totalProgress = if (state.durationMs > 0L) {
+                    (state.currentPositionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
+                } else 0f
+                LinearProgressIndicator(
+                    progress = { totalProgress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f),
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Total Book: ${formatTime(state.currentPositionMs)} / ${formatTime(state.durationMs)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "${(totalProgress * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -229,17 +399,23 @@ fun AudiobookPlayerScreen(
                 )
             }
 
-            // Transport Controls
+            // Transport Controls (Previous Chapter, Rewind 15s, Play/Pause, Forward 15s, Next Chapter)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 24.dp),
+                    .padding(bottom = 20.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                // Previous Chapter button
+                IconButton(onClick = { viewModel.previousChapter() }) {
+                    Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Chapter")
+                }
+                // Rewind 15s
                 IconButton(onClick = { viewModel.seekBy(-15000L) }) {
                     Icon(Icons.Default.FastRewind, contentDescription = "Rewind 15s")
                 }
+                // Play / Pause
                 IconButton(
                     onClick = { viewModel.togglePlayPause() },
                     modifier = Modifier
@@ -252,8 +428,13 @@ fun AudiobookPlayerScreen(
                         tint = MaterialTheme.colorScheme.onPrimary
                     )
                 }
+                // Forward 15s
                 IconButton(onClick = { viewModel.seekBy(15000L) }) {
                     Icon(Icons.Default.FastForward, contentDescription = "Forward 15s")
+                }
+                // Next Chapter button
+                IconButton(onClick = { viewModel.nextChapter() }) {
+                    Icon(Icons.Default.SkipNext, contentDescription = "Next Chapter")
                 }
             }
         }
@@ -261,24 +442,54 @@ fun AudiobookPlayerScreen(
         // Dialogs & Sheets
         if (state.showChapterListSheet) {
             ModalBottomSheet(onDismissRequest = { viewModel.setChapterListSheetVisible(false) }) {
-                Column(modifier = Modifier.padding(24.dp).fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp)
+                        .padding(bottom = 32.dp)
+                ) {
                     Text("Chapters", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(16.dp))
-                    LazyColumn(modifier = Modifier.height(300.dp)) {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 400.dp)
+                    ) {
                         items(state.chapters) { chapter ->
+                            val isSelected = chapter.index == state.currentChapterIndex
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(
+                                        if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f)
+                                        else MaterialTheme.colorScheme.surface
+                                    )
                                     .clickable { viewModel.selectChapter(chapter.index) }
-                                    .padding(vertical = 12.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
+                                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Chapter ${chapter.index + 1}: ${chapter.title}",
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = "Starts at ${formatTime(chapter.startMs)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
                                 Text(
-                                    chapter.title,
-                                    fontWeight = if (chapter.index == state.currentChapterIndex) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (chapter.index == state.currentChapterIndex) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                    text = formatTime(chapter.durationMs),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                Text(formatTime(chapter.durationMs), style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
