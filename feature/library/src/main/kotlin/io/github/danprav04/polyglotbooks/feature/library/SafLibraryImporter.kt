@@ -10,6 +10,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
 import io.github.danprav04.polyglotbooks.core.model.Chapter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.InputStream
 
 class SafLibraryImporter(
@@ -26,12 +27,20 @@ class SafLibraryImporter(
         val cueUrisByBaseName = mutableMapOf<String, Uri>()
         val imageUrisByBaseName = mutableMapOf<String, Uri>()
         val candidateUris = mutableListOf<Triple<Uri, String, BookFormat>>()
+        val urisNeedingLocalCopy = mutableSetOf<Uri>()
 
         for (uri in uris) {
-            try {
-                val takeFlags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                context.contentResolver.takePersistableUriPermission(uri, takeFlags)
-            } catch (_: Exception) {}
+            if (uri.scheme == "content") {
+                try {
+                    val takeFlags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    context.contentResolver.takePersistableUriPermission(uri, takeFlags)
+                } catch (_: Exception) {
+                    // SecurityException / UnsupportedOperationException: fallback to internal copy unless covered by a persisted tree URI.
+                    if (!hasPersistedReadPermission(context, uri)) {
+                        urisNeedingLocalCopy.add(uri)
+                    }
+                }
+            }
 
             val fileName = queryFileName(context, uri) ?: uri.lastPathSegment ?: "unknown"
             val ext = fileName.substringAfterLast('.', "").lowercase()
@@ -164,12 +173,19 @@ class SafLibraryImporter(
                         parsedChapters
                     }
 
+                    val durableFilePath = if (uri in urisNeedingLocalCopy) {
+                        copyUriToInternalStorage(context, uri, bookModel.id, fileName, format)
+                            ?: bookModel.filePath
+                    } else {
+                        bookModel.filePath
+                    }
+
                     val bookEntity = BookEntity(
                         id = bookModel.id,
                         title = bookModel.title,
                         author = bookModel.author,
                         format = bookModel.format,
-                        filePath = bookModel.filePath,
+                        filePath = durableFilePath,
                         coverUri = bookModel.coverUri ?: extractedCoverPath,
                         addedDate = System.currentTimeMillis(),
                         lastReadDate = System.currentTimeMillis(),
@@ -271,5 +287,69 @@ class SafLibraryImporter(
             }
         }
         return name
+    }
+
+    private fun hasPersistedReadPermission(context: Context, uri: Uri): Boolean {
+        return try {
+            val persisted = context.contentResolver.persistedUriPermissions
+            if (persisted.any { it.isReadPermission && it.uri == uri }) {
+                return true
+            }
+            if (android.provider.DocumentsContract.isTreeUri(uri)) {
+                val treeDocId = android.provider.DocumentsContract.getTreeDocumentId(uri)
+                persisted.any { perm ->
+                    perm.isReadPermission &&
+                        perm.uri.authority == uri.authority &&
+                        android.provider.DocumentsContract.isTreeUri(perm.uri) &&
+                        android.provider.DocumentsContract.getTreeDocumentId(perm.uri) == treeDocId
+                }
+            } else {
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun copyUriToInternalStorage(
+        context: Context,
+        uri: Uri,
+        bookId: String,
+        fileName: String,
+        format: BookFormat
+    ): String? {
+        val rawExt = fileName.substringAfterLast('.', "").lowercase()
+        val ext = rawExt.takeIf { it.isNotBlank() && it.length <= 10 && it.all { c -> c.isLetterOrDigit() } }
+            ?: format.extension.ifBlank { "dat" }
+        val booksDir = File(context.filesDir, "books").apply { mkdirs() }
+        val destFile = File(booksDir, "$bookId.$ext")
+        val tempFile = File(booksDir, "$bookId.$ext.tmp")
+        return try {
+            val copiedBytes = context.contentResolver.openInputStream(uri)?.use { input ->
+                tempFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            } ?: return null
+            if (copiedBytes <= 0L || !tempFile.exists() || tempFile.length() <= 0L) {
+                tempFile.delete()
+                return null
+            }
+            if (destFile.exists()) {
+                destFile.delete()
+            }
+            if (!tempFile.renameTo(destFile)) {
+                tempFile.copyTo(destFile, overwrite = true)
+                tempFile.delete()
+            }
+            Uri.fromFile(destFile).toString()
+        } catch (e: Exception) {
+            tempFile.delete()
+            android.util.Log.w(
+                "SafLibraryImporter",
+                "Failed to copy non-persistable URI to internal storage for $bookId",
+                e
+            )
+            null
+        }
     }
 }
