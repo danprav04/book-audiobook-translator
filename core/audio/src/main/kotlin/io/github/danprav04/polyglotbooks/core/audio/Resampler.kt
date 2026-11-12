@@ -21,6 +21,7 @@ interface Resampler {
 class LinearInterpolationResampler : Resampler {
     override fun resample(input: PcmChunk, targetSampleRate: Int, targetChannels: Int): PcmChunk {
         require(targetChannels == 1) { "Only mono output is supported currently" }
+        require(targetSampleRate > 0) { "Target sample rate must be positive, was $targetSampleRate" }
         if (input.data.isEmpty()) {
             return PcmChunk(ByteArray(0), targetSampleRate, targetChannels, input.timestampMs)
         }

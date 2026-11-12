@@ -28,13 +28,15 @@ class TinkSecureKeyStore(
             if (encodedCiphertext.isEmpty()) return@withContext null
             val ciphertext = Base64.getDecoder().decode(encodedCiphertext)
             val decryptedBytes = aead.decrypt(ciphertext, ASSOCIATED_DATA)
-            String(decryptedBytes, Charsets.UTF_8)
+            val key = String(decryptedBytes, Charsets.UTF_8).trim()
+            if (key.isBlank()) null else key
         } catch (e: Exception) {
             null
         }
     }
 
     override suspend fun saveApiKey(key: String): Unit = withContext(Dispatchers.IO) {
+        require(key.isNotBlank()) { "API key must not be blank" }
         val plaintextBytes = key.toByteArray(Charsets.UTF_8)
         val ciphertext = aead.encrypt(plaintextBytes, ASSOCIATED_DATA)
         val encodedCiphertext = Base64.getEncoder().encodeToString(ciphertext)
