@@ -1,9 +1,36 @@
 package io.github.danprav04.polyglotbooks.feature.translate
 
+import io.github.danprav04.polyglotbooks.core.audio.AudioTrackPcmPlayer
+import io.github.danprav04.polyglotbooks.core.audio.Chunker
+import io.github.danprav04.polyglotbooks.core.audio.PcmPlayer
+import io.github.danprav04.polyglotbooks.core.audio.PcmWaveSourceDecoder
+import io.github.danprav04.polyglotbooks.core.audio.Resampler
+import io.github.danprav04.polyglotbooks.core.audio.SourceDecoder
+import io.github.danprav04.polyglotbooks.core.audio.StreamingLinearResampler
+import io.github.danprav04.polyglotbooks.core.audio.TranslatedCache
+import io.github.danprav04.polyglotbooks.core.data.cache.TranslatedCacheIndex
+import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveTranslateClient
+import io.github.danprav04.polyglotbooks.core.gemini.LiveTranslateClient
+import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
-import kotlinx.coroutines.flow.Flow
+import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * State representing live translation pipeline health and progress.
@@ -19,18 +46,55 @@ data class TranslationPipelineState(
 )
 
 /**
- * High-level orchestration pipeline skeleton coordinating audio decoding,
- * look-ahead buffer pacing via [Pacer], WebSocket streaming to Gemini Live Translate,
- * and audio playback/caching.
+ * High-level orchestration pipeline coordinating source audio decoding, resampling to 16 kHz mono,
+ * 100 ms / 3200 B chunking, look-ahead buffer pacing via [Pacer], WebSocket streaming to
+ * [LiveTranslateClient], and translated PCM playback via [PcmPlayer] with optional segment caching.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class TranslationPipeline(
+    private val sourceDecoder: SourceDecoder = PcmWaveSourceDecoder(),
+    private val resampler: Resampler = StreamingLinearResampler(),
+    private val chunker: Chunker = Chunker(CHUNK_SIZE_BYTES),
     private val pacer: Pacer = Pacer(),
-    private val timelineMapper: TimelineMapper = DefaultTimelineMapper()
+    private val timelineMapper: TimelineMapper = DefaultTimelineMapper(),
+    private val liveTranslateClient: LiveTranslateClient = DefaultLiveTranslateClient(),
+    private val pcmPlayer: PcmPlayer = AudioTrackPcmPlayer(),
+    private val translatedCache: TranslatedCache? = null,
+    private val translatedCacheIndex: TranslatedCacheIndex? = null,
+    private val enablePacingDelay: Boolean = true
 ) {
-    private val _state = MutableStateFlow(TranslationPipelineState())
-    val state: Flow<TranslationPipelineState> = _state.asStateFlow()
+    constructor(
+        pacer: Pacer,
+        timelineMapper: TimelineMapper = DefaultTimelineMapper()
+    ) : this(
+        sourceDecoder = PcmWaveSourceDecoder(),
+        resampler = StreamingLinearResampler(),
+        chunker = Chunker(CHUNK_SIZE_BYTES),
+        pacer = pacer,
+        timelineMapper = timelineMapper
+    )
 
+    private val _state = MutableStateFlow(TranslationPipelineState())
+    val state: StateFlow<TranslationPipelineState> = _state.asStateFlow()
+
+    private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var pipelineJob: Job? = null
+    private var collectorJob: Job? = null
+
+    private val currentPlaybackPositionMs = AtomicLong(0L)
+    private val sourceDecodedCursorMs = AtomicLong(0L)
+    private val receivedTranslatedDurationMs = AtomicLong(0L)
+    private val isPaused = AtomicBoolean(false)
+
+    @Volatile
+    private var currentPlaybackSpeed: Float = 1.0f
+
+    /**
+     * Backwards-compatible state-only start overload.
+     */
     fun start(bookId: String, targetLanguage: LanguageCode, startPositionMs: Long = 0L) {
+        currentPlaybackPositionMs.set(startPositionMs)
+        sourceDecodedCursorMs.set(startPositionMs)
         _state.value = _state.value.copy(
             isRunning = true,
             sourcePositionMs = startPositionMs,
@@ -40,23 +104,358 @@ class TranslationPipeline(
         )
     }
 
+    /**
+     * Starts the full end-to-end live translation pipeline on [scope].
+     */
+    fun start(
+        scope: CoroutineScope,
+        bookId: String,
+        filePath: String,
+        targetLanguage: LanguageCode,
+        apiKey: String?,
+        modelId: String = DefaultModels.get(ModelRole.LIVE_TRANSLATE),
+        echoTargetLanguage: Boolean = false,
+        startPositionMs: Long = 0L,
+        playbackSpeed: Float = 1.0f
+    ) {
+        cancelRunningJobs()
+
+        if (apiKey.isNullOrBlank()) {
+            _state.value = _state.value.copy(
+                isRunning = false,
+                sourcePositionMs = startPositionMs,
+                bufferAheadMs = 0L,
+                errorMessage = MISSING_API_KEY_MESSAGE
+            )
+            return
+        }
+
+        val initialPosMs = startPositionMs.coerceAtLeast(0L)
+        currentPlaybackPositionMs.set(initialPosMs)
+        sourceDecodedCursorMs.set(initialPosMs)
+        receivedTranslatedDurationMs.set(0L)
+        isPaused.set(false)
+        currentPlaybackSpeed = playbackSpeed.coerceIn(0.5f, 3.0f)
+
+        resampler.reset()
+        chunker.reset()
+        pcmPlayer.init(sampleRate = OUTPUT_SAMPLE_RATE, channels = 1)
+        pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
+        pcmPlayer.play()
+
+        _state.value = TranslationPipelineState(
+            isRunning = true,
+            sourcePositionMs = initialPosMs,
+            bufferAheadMs = 0L,
+            speedMultiplier = pacer.calculateSpeedMultiplier(0L),
+            currentSourceSubtitle = "",
+            currentTranslatedSubtitle = "",
+            errorMessage = null
+        )
+
+        pipelineJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                // 1. Check cache first
+                val decodeStartMs = playCachedSegmentsIfAvailable(
+                    bookId = bookId,
+                    targetLanguageCode = targetLanguage.code,
+                    fromMs = initialPosMs
+                )
+                sourceDecodedCursorMs.set(decodeStartMs)
+
+                // 2. Collect incoming translated audio + transcripts from LiveTranslateClient
+                var activeOutputSampleRate = OUTPUT_SAMPLE_RATE
+                var activeOutputChannels = 1
+                val turnBuffer = ByteArrayOutputStream()
+                var turnStartSourceMs = decodeStartMs
+
+                collectorJob = launch(Dispatchers.Unconfined) {
+                    liveTranslateClient.translationStream.collect { output ->
+                        if (!output.errorMessage.isNullOrBlank()) {
+                            _state.update {
+                                it.copy(errorMessage = output.errorMessage)
+                            }
+                        }
+
+                        val newSource = output.sourceTranscript?.takeIf { it.isNotBlank() }
+                        val newTarget = output.targetTranscript?.takeIf { it.isNotBlank() }
+                        if (newSource != null || newTarget != null) {
+                            _state.update { prev ->
+                                prev.copy(
+                                    currentSourceSubtitle = newSource ?: prev.currentSourceSubtitle,
+                                    currentTranslatedSubtitle = newTarget ?: prev.currentTranslatedSubtitle
+                                )
+                            }
+                        }
+
+                        output.audioChunk?.let { chunk ->
+                            if (chunk.data.isNotEmpty()) {
+                                val chunkRate = if (chunk.sampleRate > 0) chunk.sampleRate else OUTPUT_SAMPLE_RATE
+                                val chunkChannels = maxOf(1, chunk.channels)
+                                if (chunkRate != activeOutputSampleRate || chunkChannels != activeOutputChannels) {
+                                    activeOutputSampleRate = chunkRate
+                                    activeOutputChannels = chunkChannels
+                                    pcmPlayer.init(activeOutputSampleRate, activeOutputChannels)
+                                    pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
+                                    if (!isPaused.get()) {
+                                        pcmPlayer.play()
+                                    }
+                                }
+                                pcmPlayer.write(chunk)
+                                turnBuffer.write(chunk.data)
+
+                                val bytesPerSec = maxOf(1, activeOutputSampleRate * activeOutputChannels * 2)
+                                val chunkDurationMs = (chunk.data.size * 1000L) / bytesPerSec
+                                val totalTranslatedMs = receivedTranslatedDurationMs.addAndGet(chunkDurationMs)
+                                val sourcePos = sourceDecodedCursorMs.get()
+                                timelineMapper.recordAnchor(sourcePos, totalTranslatedMs)
+                                val bufferAhead = calculateBufferAheadMs(sourcePos)
+                                updateBuffer(bufferAhead, sourcePos)
+                            }
+                        }
+
+                        if (output.isTurnComplete && turnBuffer.size() > 0) {
+                            val endSourceMs = sourceDecodedCursorMs.get()
+                            if (translatedCache != null && endSourceMs > turnStartSourceMs) {
+                                val pcmBytes = turnBuffer.toByteArray()
+                                try {
+                                    translatedCache.putSegment(
+                                        bookId = bookId,
+                                        targetLanguage = targetLanguage.code,
+                                        sourceStartMs = turnStartSourceMs,
+                                        sourceEndMs = endSourceMs,
+                                        pcmData = pcmBytes
+                                    )
+                                } catch (_: Throwable) {
+                                }
+                            }
+                            turnBuffer.reset()
+                            turnStartSourceMs = endSourceMs
+                        }
+                    }
+                }
+
+                // 3. Connect LiveTranslateClient session
+                liveTranslateClient.start(
+                    apiKey = apiKey,
+                    targetLanguageCode = targetLanguage.code,
+                    echoTargetLanguage = echoTargetLanguage,
+                    model = modelId
+                )
+
+                // 4. Decode source audio -> resample to 16 kHz mono -> chunk 100 ms (3200 B) -> pace -> send
+                sourceDecoder.decode(filePath = filePath, startPositionMs = decodeStartMs).collect { decodedChunk ->
+                    while (isPaused.get()) {
+                        delay(PAUSE_POLL_MS)
+                    }
+
+                    val resampled = resampler.resample(
+                        input = decodedChunk,
+                        targetSampleRate = INPUT_SAMPLE_RATE,
+                        targetChannels = 1
+                    )
+                    val frames = chunker.addBytes(resampled.data)
+                    for (frame in frames) {
+                        while (isPaused.get()) {
+                            delay(PAUSE_POLL_MS)
+                        }
+
+                        val frameStartMs = sourceDecodedCursorMs.get()
+                        val frameEndMs = sourceDecodedCursorMs.addAndGet(CHUNK_DURATION_MS)
+                        val bufferAhead = calculateBufferAheadMs(frameEndMs)
+                        updateBuffer(bufferAhead, frameEndMs)
+
+                        if (enablePacingDelay) {
+                            val delayMs = pacer.calculateDelayMs(
+                                chunkDurationMs = CHUNK_DURATION_MS,
+                                currentBufferAheadMs = bufferAhead
+                            )
+                            if (delayMs > 0L) {
+                                delay(delayMs)
+                            }
+                        }
+
+                        liveTranslateClient.sendAudio(
+                            PcmChunk(
+                                data = frame,
+                                sampleRate = INPUT_SAMPLE_RATE,
+                                channels = 1,
+                                timestampMs = frameStartMs
+                            )
+                        )
+                    }
+                }
+
+                // Flush any remaining partial PCM bytes from the chunker
+                chunker.flush()?.let { remainder ->
+                    if (remainder.isNotEmpty()) {
+                        val remainderDurationMs = (remainder.size * 1000L) / (INPUT_SAMPLE_RATE * 2)
+                        val frameStartMs = sourceDecodedCursorMs.get()
+                        val frameEndMs = sourceDecodedCursorMs.addAndGet(remainderDurationMs)
+                        val bufferAhead = calculateBufferAheadMs(frameEndMs)
+                        updateBuffer(bufferAhead, frameEndMs)
+
+                        liveTranslateClient.sendAudio(
+                            PcmChunk(
+                                data = remainder,
+                                sampleRate = INPUT_SAMPLE_RATE,
+                                channels = 1,
+                                timestampMs = frameStartMs
+                            )
+                        )
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Throwable) {
+                _state.update {
+                    it.copy(
+                        isRunning = false,
+                        errorMessage = e.message ?: "Live translation pipeline failed"
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun playCachedSegmentsIfAvailable(
+        bookId: String,
+        targetLanguageCode: String,
+        fromMs: Long
+    ): Long {
+        var cursorMs = fromMs
+        val indexCoveredUntil = try {
+            translatedCacheIndex?.coveredUntil(bookId, targetLanguageCode, fromMs) ?: fromMs
+        } catch (_: Throwable) {
+            fromMs
+        }
+
+        if (translatedCache != null) {
+            var safetyCounter = 0
+            while (safetyCounter++ < 10_000) {
+                val segment = try {
+                    translatedCache.findCachedRange(bookId, targetLanguageCode, cursorMs)
+                } catch (_: Throwable) {
+                    null
+                } ?: break
+
+                if (segment.sourceEndMs <= cursorMs) break
+                val cachedPcm = try {
+                    translatedCache.getSegmentPcm(segment)
+                } catch (_: Throwable) {
+                    null
+                }
+                if (cachedPcm == null || cachedPcm.isEmpty()) break
+
+                pcmPlayer.write(
+                    PcmChunk(
+                        data = cachedPcm,
+                        sampleRate = OUTPUT_SAMPLE_RATE,
+                        channels = 1,
+                        timestampMs = segment.sourceStartMs
+                    )
+                )
+                val segDurationMs = (segment.sourceEndMs - cursorMs).coerceAtLeast(0L)
+                receivedTranslatedDurationMs.addAndGet(segDurationMs)
+                cursorMs = segment.sourceEndMs
+                val bufferAhead = calculateBufferAheadMs(cursorMs)
+                updateBuffer(bufferAhead, cursorMs)
+            }
+        } else if (indexCoveredUntil > cursorMs) {
+            cursorMs = indexCoveredUntil
+            val bufferAhead = calculateBufferAheadMs(cursorMs)
+            updateBuffer(bufferAhead, cursorMs)
+        }
+
+        return cursorMs
+    }
+
+    private fun calculateBufferAheadMs(sourceCursorMs: Long): Long {
+        val playbackPos = currentPlaybackPositionMs.get()
+        val sourceLookahead = (sourceCursorMs - playbackPos).coerceAtLeast(0L)
+        val translatedLookahead = (receivedTranslatedDurationMs.get() - pcmPlayer.currentPositionMs.value).coerceAtLeast(0L)
+        return maxOf(sourceLookahead, translatedLookahead)
+    }
+
+    fun updatePlaybackPosition(positionMs: Long) {
+        val clampedPos = positionMs.coerceAtLeast(0L)
+        currentPlaybackPositionMs.set(clampedPos)
+        val sourceCursor = maxOf(sourceDecodedCursorMs.get(), clampedPos)
+        val bufferAhead = (sourceCursor - clampedPos).coerceAtLeast(0L)
+        updateBuffer(bufferAhead, sourceCursor)
+    }
+
+    fun setPlaybackSpeed(speed: Float) {
+        val clamped = speed.coerceIn(0.5f, 3.0f)
+        currentPlaybackSpeed = clamped
+        pcmPlayer.setPlaybackSpeed(clamped)
+    }
+
+    fun pauseAudio() {
+        isPaused.set(true)
+        pcmPlayer.pause()
+    }
+
+    fun resumeAudio() {
+        isPaused.set(false)
+        pcmPlayer.play()
+    }
+
     fun updateBuffer(currentBufferAheadMs: Long, sourcePosMs: Long) {
         val speed = pacer.calculateSpeedMultiplier(currentBufferAheadMs)
-        _state.value = _state.value.copy(
-            sourcePositionMs = sourcePosMs,
-            bufferAheadMs = currentBufferAheadMs,
-            speedMultiplier = speed
-        )
+        _state.update {
+            it.copy(
+                sourcePositionMs = sourcePosMs,
+                bufferAheadMs = currentBufferAheadMs,
+                speedMultiplier = speed
+            )
+        }
     }
 
     fun updateSubtitles(sourceTranscript: String, translatedTranscript: String) {
-        _state.value = _state.value.copy(
-            currentSourceSubtitle = sourceTranscript,
-            currentTranslatedSubtitle = translatedTranscript
-        )
+        _state.update {
+            it.copy(
+                currentSourceSubtitle = sourceTranscript,
+                currentTranslatedSubtitle = translatedTranscript
+            )
+        }
     }
 
     fun stop() {
-        _state.value = _state.value.copy(isRunning = false)
+        isPaused.set(false)
+        cancelRunningJobs()
+        try {
+            sourceDecoder.release()
+        } catch (_: Throwable) {
+        }
+        try {
+            pcmPlayer.stop()
+        } catch (_: Throwable) {
+        }
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                liveTranslateClient.stop()
+            } catch (_: Throwable) {
+            }
+        }
+        _state.update { it.copy(isRunning = false) }
+    }
+
+    private fun cancelRunningJobs() {
+        collectorJob?.cancel()
+        collectorJob = null
+        pipelineJob?.cancel()
+        pipelineJob = null
+    }
+
+    companion object {
+        const val INPUT_SAMPLE_RATE = 16000
+        const val OUTPUT_SAMPLE_RATE = 24000
+        const val CHUNK_DURATION_MS = 100L
+        const val CHUNK_SIZE_BYTES = 3200
+        private const val PAUSE_POLL_MS = 50L
+
+        const val MISSING_API_KEY_MESSAGE =
+            "Gemini API key is missing. Add it in Settings to use Live AI Translation."
     }
 }
