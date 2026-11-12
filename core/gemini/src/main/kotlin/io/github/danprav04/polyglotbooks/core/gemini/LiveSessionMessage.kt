@@ -65,6 +65,7 @@ object LiveClientMessageSerializer : JsonContentPolymorphicSerializer<LiveClient
 data class SetupConfig(
     val model: String,
     val generationConfig: GenerationConfig? = null,
+    val systemInstruction: ContentTurn? = null,
     val sessionResumption: SessionResumptionConfig? = null,
     val contextWindowCompression: ContextWindowCompressionConfig? = null,
     val realtimeInputConfig: RealtimeInputConfig? = null
@@ -224,6 +225,24 @@ sealed interface LiveServerMessage {
     data class SetupCompleteMessage(
         val setupComplete: JsonObject? = null
     ) : LiveServerMessage
+
+    /**
+     * Error frame returned by the server when setup or generation fails.
+     */
+    @Serializable
+    @SerialName("error")
+    data class ErrorMessage(
+        val error: LiveErrorData
+    ) : LiveServerMessage
+
+    /**
+     * Token usage metadata frame returned by the server.
+     */
+    @Serializable
+    @SerialName("usageMetadata")
+    data class UsageMetadataMessage(
+        val usageMetadata: UsageMetadata? = null
+    ) : LiveServerMessage
 }
 
 /**
@@ -238,6 +257,8 @@ object LiveServerMessageSerializer : JsonContentPolymorphicSerializer<LiveServer
             "goAway" in jsonObject -> LiveServerMessage.GoAwayMessage.serializer()
             "sessionResumptionUpdate" in jsonObject -> LiveServerMessage.SessionResumptionUpdateMessage.serializer()
             "setupComplete" in jsonObject -> LiveServerMessage.SetupCompleteMessage.serializer()
+            "error" in jsonObject -> LiveServerMessage.ErrorMessage.serializer()
+            "usageMetadata" in jsonObject -> LiveServerMessage.UsageMetadataMessage.serializer()
             else -> throw SerializationException("Unknown LiveServerMessage envelope: $element")
         }
     }
@@ -287,4 +308,24 @@ data class SessionResumptionUpdateData(
     val resumable: Boolean = false,
     val newHandle: String? = null,
     val lastConsumedClientMessageIndex: Int? = null
+)
+
+/**
+ * Structured error payload returned by the Gemini Live server.
+ */
+@Serializable
+data class LiveErrorData(
+    val code: Int? = null,
+    val message: String? = null,
+    val status: String? = null
+)
+
+/**
+ * Token usage metadata reported by the Gemini Live server.
+ */
+@Serializable
+data class UsageMetadata(
+    val promptTokenCount: Int? = null,
+    val responseTokenCount: Int? = null,
+    val totalTokenCount: Int? = null
 )

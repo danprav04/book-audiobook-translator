@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -10,30 +11,37 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 /**
  * Production implementation of [LiveSession] using OkHttp WebSocket connecting to the Gemini Live API.
  */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class OkHttpLiveSession(
-    private val okHttpClient: OkHttpClient = OkHttpClient(),
+    private val okHttpClient: OkHttpClient = defaultOkHttpClient(),
     private val json: Json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
         explicitNulls = false
-    }
+    },
+    private val connectTimeoutMs: Long = 10_000L,
+    private val maxReconnectAttempts: Int = 2
 ) : LiveSession {
 
     private val TAG = "OkHttpLiveSession"
 
     private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(replay = 16, extraBufferCapacity = 64)
-    private val _failures = MutableSharedFlow<Throwable>(replay = 1)
+    private val _failures = MutableSharedFlow<Throwable>(replay = 1, extraBufferCapacity = 4)
 
     override val incomingMessages: Flow<LiveServerMessage> = flow {
         coroutineScope {
@@ -51,10 +59,38 @@ class OkHttpLiveSession(
         }
     }
 
+    @Volatile
     private var webSocket: WebSocket? = null
+
+    @Volatile
     private var _isConnected = false
     override val isConnected: Boolean
         get() = _isConnected
+
+    @Volatile
+    private var _isSetupComplete = false
+    val isSetupComplete: Boolean
+        get() = _isSetupComplete
+
+    @Volatile
+    private var _lastError: LiveErrorData? = null
+    val lastError: LiveErrorData?
+        get() = _lastError
+
+    @Volatile
+    private var openDeferred: CompletableDeferred<Unit>? = null
+
+    @Volatile
+    private var isManualDisconnect = false
+
+    @Volatile
+    private var hasEverOpened = false
+
+    @Volatile
+    private var reconnectAttempts = 0
+
+    @Volatile
+    private var activeConnectionId = 0L
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -67,6 +103,25 @@ class OkHttpLiveSession(
     override suspend fun connect(apiKey: String, setup: SetupConfig) {
         _incomingMessages.resetReplayCache()
         _failures.resetReplayCache()
+        _lastError = null
+        isManualDisconnect = false
+        hasEverOpened = false
+        reconnectAttempts = 0
+
+        val signal = startWebSocketInternal(apiKey, setup)
+        if (signal.isCompleted) {
+            signal.await()
+        } else if (connectTimeoutMs > 0) {
+            withTimeoutOrNull(connectTimeoutMs) {
+                signal.await()
+            }
+        }
+    }
+
+    private fun startWebSocketInternal(
+        apiKey: String,
+        setup: SetupConfig
+    ): CompletableDeferred<Unit> {
         currentApiKey = apiKey
         val finalSetup = if (currentResumptionHandle != null && setup.sessionResumption?.handle == null) {
             setup.copy(sessionResumption = SessionResumptionConfig(handle = currentResumptionHandle))
@@ -79,89 +134,208 @@ class OkHttpLiveSession(
         currentSetup = finalSetup
 
         val url = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
-        val request = okhttp3.Request.Builder().url(url).build()
+        val request = Request.Builder().url(url).build()
 
-        disconnectInternal()
+        closeCurrentSocketQuietly()
+        _isSetupComplete = false
+
+        val connectionId = ++activeConnectionId
+        val signal = CompletableDeferred<Unit>()
+        openDeferred = signal
 
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: okhttp3.Response) {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (connectionId != activeConnectionId) return
+                this@OkHttpLiveSession.webSocket = webSocket
                 _isConnected = true
-                Log.d(TAG, "WebSocket opened. Sending setup...")
+                hasEverOpened = true
+                logD("WebSocket opened. Sending setup...")
                 val setupMsg = LiveClientMessage.SetupMessage(finalSetup)
                 val jsonStr = json.encodeToString<LiveClientMessage>(setupMsg)
                 webSocket.send(jsonStr)
+                signal.complete(Unit)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                try {
-                    val serverMsg = json.decodeFromString<LiveServerMessage>(text)
-                    if (serverMsg is LiveServerMessage.SessionResumptionUpdateMessage) {
-                        val handle = serverMsg.sessionResumptionUpdate.newHandle
-                        if (!handle.isNullOrBlank()) {
-                            currentResumptionHandle = handle
-                            Log.d(TAG, "Tracked new session resumption handle: $handle")
-                        }
-                    }
-                    if (serverMsg is LiveServerMessage.GoAwayMessage) {
-                        Log.w(TAG, "Received GoAway message. Reconnecting...")
-                        scope.launch {
-                            reconnectWithResumption()
-                        }
-                    }
-                    if (!_incomingMessages.tryEmit(serverMsg)) {
-                        scope.launch {
-                            _incomingMessages.emit(serverMsg)
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse incoming server message: $text", e)
-                }
+                if (connectionId != activeConnectionId) return
+                handleIncomingJson(text)
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {}
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (connectionId != activeConnectionId) return
+                handleIncomingJson(bytes.utf8())
+            }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "WebSocket closing: $code / $reason")
+                if (connectionId != activeConnectionId) return
+                logD("WebSocket closing: $code / $reason")
                 _isConnected = false
-                if (code != 1000) {
-                    _failures.tryEmit(java.io.IOException("WebSocket closed unexpectedly: code=$code, reason=$reason"))
+                _isSetupComplete = false
+                try {
+                    webSocket.close(code, reason)
+                } catch (_: Throwable) {
+                }
+                if (code != 1000 && !isManualDisconnect) {
+                    val err = IOException("WebSocket closed unexpectedly: code=$code, reason=$reason")
+                    if (!signal.isCompleted) {
+                        signal.completeExceptionally(err)
+                    }
+                    handleUnexpectedDisconnect(err)
                 }
             }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
-                Log.e(TAG, "WebSocket failure", t)
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (connectionId != activeConnectionId) return
+                logE("WebSocket failure", t)
                 _isConnected = false
-                _failures.tryEmit(t)
+                _isSetupComplete = false
+                if (!signal.isCompleted) {
+                    signal.completeExceptionally(t)
+                }
+                if (!isManualDisconnect) {
+                    handleUnexpectedDisconnect(t)
+                }
             }
         })
+
+        return signal
+    }
+
+    private fun handleIncomingJson(text: String) {
+        if (text.isBlank()) return
+        try {
+            val serverMsg = json.decodeFromString<LiveServerMessage>(text)
+            when (serverMsg) {
+                is LiveServerMessage.SetupCompleteMessage -> {
+                    _isSetupComplete = true
+                    reconnectAttempts = 0
+                }
+                is LiveServerMessage.SessionResumptionUpdateMessage -> {
+                    val handle = serverMsg.sessionResumptionUpdate.newHandle
+                    if (!handle.isNullOrBlank()) {
+                        currentResumptionHandle = handle
+                        logD("Tracked new session resumption handle: $handle")
+                    }
+                }
+                is LiveServerMessage.ServerContentMessage -> {
+                    reconnectAttempts = 0
+                }
+                is LiveServerMessage.GoAwayMessage -> {
+                    logW("Received GoAway message. Reconnecting with session resumption...")
+                    reconnectAttempts = 0
+                    reconnectWithResumption()
+                }
+                is LiveServerMessage.ErrorMessage -> {
+                    _lastError = serverMsg.error
+                    logW("Received server ErrorMessage: ${serverMsg.error}")
+                }
+                is LiveServerMessage.UsageMetadataMessage -> {
+                    // Metadata frame; forwarded to collectors below.
+                }
+            }
+            if (!_incomingMessages.tryEmit(serverMsg)) {
+                scope.launch {
+                    _incomingMessages.emit(serverMsg)
+                }
+            }
+        } catch (e: Exception) {
+            logE("Failed to parse incoming server message: $text", e)
+        }
+    }
+
+    private fun handleUnexpectedDisconnect(cause: Throwable) {
+        val resumptionEnabled = currentSetup?.sessionResumption != null || currentResumptionHandle != null
+        val eligibleForReconnect = resumptionEnabled &&
+            (hasEverOpened || currentResumptionHandle != null) &&
+            reconnectAttempts < maxReconnectAttempts
+
+        if (eligibleForReconnect) {
+            reconnectAttempts++
+            logW("Attempting session resumption reconnect ($reconnectAttempts/$maxReconnectAttempts)...")
+            if (reconnectWithResumption()) {
+                return
+            }
+        }
+        _failures.tryEmit(cause)
     }
 
     override suspend fun send(message: LiveClientMessage) {
+        val pendingOpen = openDeferred
+        if (!_isConnected && pendingOpen != null && !pendingOpen.isCompleted && connectTimeoutMs > 0) {
+            withTimeoutOrNull(connectTimeoutMs) {
+                try {
+                    pendingOpen.await()
+                } catch (_: Throwable) {
+                }
+            }
+        }
         val jsonStr = json.encodeToString(message)
-        webSocket?.send(jsonStr) ?: Log.w(TAG, "Attempted to send message while WebSocket is null")
+        webSocket?.send(jsonStr) ?: logW("Attempted to send message while WebSocket is null")
     }
 
     override suspend fun disconnect() {
-        disconnectInternal()
+        isManualDisconnect = true
+        closeCurrentSocketQuietly()
     }
 
-    private fun disconnectInternal() {
-        webSocket?.close(1000, "Client disconnect")
+    private fun closeCurrentSocketQuietly() {
+        activeConnectionId++
+        val old = webSocket
         webSocket = null
         _isConnected = false
+        _isSetupComplete = false
+        try {
+            old?.close(1000, "Client disconnect")
+        } catch (_: Throwable) {
+        }
     }
 
-    private suspend fun reconnectWithResumption() {
-        val apiKey = currentApiKey ?: return
-        val setup = currentSetup ?: return
-        try {
-            disconnectInternal()
-            connect(apiKey, setup)
+    private fun reconnectWithResumption(): Boolean {
+        val apiKey = currentApiKey ?: return false
+        val setup = currentSetup ?: return false
+        return try {
+            startWebSocketInternal(apiKey, setup)
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Resumption reconnection failed, falling back to fresh session", e)
+            logE("Resumption reconnection failed, falling back to fresh session", e)
             currentResumptionHandle = null
-            connect(apiKey, setup.copy(sessionResumption = null))
+            try {
+                startWebSocketInternal(apiKey, setup.copy(sessionResumption = SessionResumptionConfig(handle = null)))
+                true
+            } catch (e2: Exception) {
+                logE("Fresh session reconnection also failed", e2)
+                false
+            }
         }
+    }
+
+    private fun logD(msg: String) {
+        try {
+            Log.d(TAG, msg)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun logW(msg: String) {
+        try {
+            Log.w(TAG, msg)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun logE(msg: String, t: Throwable) {
+        try {
+            Log.e(TAG, msg, t)
+        } catch (_: Throwable) {
+        }
+    }
+
+    companion object {
+        fun defaultOkHttpClient(): OkHttpClient =
+            OkHttpClient.Builder()
+                .pingInterval(20, TimeUnit.SECONDS)
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .build()
     }
 }
 
@@ -169,6 +343,22 @@ interface LiveSessionFactory {
     fun create(): LiveSession
 }
 
-class DefaultLiveSessionFactory : LiveSessionFactory {
-    override fun create(): LiveSession = OkHttpLiveSession()
+class DefaultLiveSessionFactory(
+    private val okHttpClient: OkHttpClient = OkHttpLiveSession.defaultOkHttpClient()
+) : LiveSessionFactory {
+    private val configuredClient: OkHttpClient by lazy {
+        try {
+            if (okHttpClient.pingIntervalMillis > 0) {
+                okHttpClient
+            } else {
+                okHttpClient.newBuilder()
+                    .pingInterval(20, TimeUnit.SECONDS)
+                    .build()
+            }
+        } catch (_: Throwable) {
+            okHttpClient
+        }
+    }
+
+    override fun create(): LiveSession = OkHttpLiveSession(okHttpClient = configuredClient)
 }

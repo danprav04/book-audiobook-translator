@@ -183,6 +183,37 @@ class LiveSessionMessageTest {
         assertTrue(setupCompleteMsg is LiveServerMessage.SetupCompleteMessage)
         val encodedSetupComplete = json.encodeToString<LiveServerMessage>(setupCompleteMsg)
         assertFalse(encodedSetupComplete.contains("\"type\""))
+
+        val errorJson = """{"error":{"code":400,"message":"Invalid argument: translationConfig","status":"INVALID_ARGUMENT"}}"""
+        val errorMsg = json.decodeFromString<LiveServerMessage>(errorJson)
+        assertTrue(errorMsg is LiveServerMessage.ErrorMessage)
+        val errData = (errorMsg as LiveServerMessage.ErrorMessage).error
+        assertEquals(400, errData.code)
+        assertEquals("Invalid argument: translationConfig", errData.message)
+        assertEquals("INVALID_ARGUMENT", errData.status)
+        val encodedError = json.encodeToString<LiveServerMessage>(errorMsg)
+        assertEquals(errorMsg, json.decodeFromString<LiveServerMessage>(encodedError))
+
+        val usageJson = """{"usageMetadata":{"promptTokenCount":12,"responseTokenCount":34,"totalTokenCount":46}}"""
+        val usageMsg = json.decodeFromString<LiveServerMessage>(usageJson)
+        assertTrue(usageMsg is LiveServerMessage.UsageMetadataMessage)
+        assertEquals(46, (usageMsg as LiveServerMessage.UsageMetadataMessage).usageMetadata?.totalTokenCount)
+    }
+
+    @Test
+    fun testSetupConfigSystemInstructionRoundTrip() {
+        val setupMsg = LiveClientMessage.SetupMessage(
+            setup = SetupConfig(
+                model = "models/gemini-3.8-live",
+                systemInstruction = ContentTurn(
+                    parts = listOf(Part(text = "Translate spoken audio into Russian (ru)."))
+                )
+            )
+        )
+        val encoded = json.encodeToString<LiveClientMessage>(setupMsg)
+        assertTrue(encoded.contains("\"systemInstruction\""))
+        val decoded = json.decodeFromString<LiveClientMessage>(encoded)
+        assertEquals(setupMsg, decoded)
     }
 
     @Test
