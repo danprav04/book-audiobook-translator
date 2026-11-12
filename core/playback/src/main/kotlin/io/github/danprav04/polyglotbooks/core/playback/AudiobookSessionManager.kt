@@ -81,14 +81,30 @@ data class AudiobookServiceState(
  */
 @Singleton
 class AudiobookSessionManager @Inject constructor(
-    private val bookDao: BookDao? = null,
-    private val chapterDao: ChapterDao? = null,
-    private val playbackStateDao: PlaybackStateDao? = null,
-    private val settingsRepository: SettingsRepository? = null,
-    private val liveTranslationBackend: LiveTranslationBackend = NoOpLiveTranslationBackend(),
-    @ApplicationScope private val applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
-    @ApplicationContext private val context: Context? = null
+    private val bookDao: BookDao?,
+    private val chapterDao: ChapterDao?,
+    private val playbackStateDao: PlaybackStateDao?,
+    private val settingsRepository: SettingsRepository?,
+    private val liveTranslationBackend: LiveTranslationBackend,
+    @ApplicationScope private val applicationScope: CoroutineScope,
+    @ApplicationContext private val context: Context?
 ) {
+    constructor(
+        bookDao: BookDao? = null,
+        chapterDao: ChapterDao? = null,
+        playbackStateDao: PlaybackStateDao? = null,
+        settingsRepository: SettingsRepository? = null,
+        liveTranslationBackend: LiveTranslationBackend = NoOpLiveTranslationBackend(),
+        applicationScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+    ) : this(
+        bookDao = bookDao,
+        chapterDao = chapterDao,
+        playbackStateDao = playbackStateDao,
+        settingsRepository = settingsRepository,
+        liveTranslationBackend = liveTranslationBackend,
+        applicationScope = applicationScope,
+        context = null
+    )
     private val _state = MutableStateFlow(AudiobookServiceState())
     val state: StateFlow<AudiobookServiceState> = _state.asStateFlow()
 
