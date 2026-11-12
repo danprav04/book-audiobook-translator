@@ -10,6 +10,7 @@ interface ReaderBridgeListener {
     fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String)
     fun onSelectionChanged(cfiRange: String, selectedText: String)
     fun onSearchResults(resultsJson: String)
+    fun onBookReady() {}
 }
 
 /**
@@ -36,5 +37,10 @@ class ReaderBridge(
     @JavascriptInterface
     fun postSearchResults(resultsJson: String) {
         listener?.onSearchResults(resultsJson)
+    }
+
+    @JavascriptInterface
+    fun onBookReady() {
+        listener?.onBookReady()
     }
 }

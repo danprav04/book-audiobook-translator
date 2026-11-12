@@ -8,11 +8,19 @@ import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
+import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
+import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import javax.inject.Inject
 
@@ -27,10 +35,13 @@ data class SearchResultItem(
 data class ReaderUiState(
     val bookId: String = "",
     val bookTitle: String = "Reader",
+    val bookFilePath: String = "",
     val chapters: List<ChapterEntity> = emptyList(),
     val currentChapterIndex: Int = 0,
     val currentCfi: String = "",
     val progress: Float = 0f,
+    val isStateRestored: Boolean = false,
+    val isBookReady: Boolean = false,
     val theme: ReaderTheme = ReaderTheme.LIGHT,
     val fontSizeSp: Int = 18,
     val fontFamily: String = "Sans-Serif",
@@ -53,33 +64,107 @@ data class ReaderUiState(
 class ReaderViewModel @Inject constructor(
     private val bookDao: BookDao,
     private val chapterDao: ChapterDao,
-    savedStateHandle: SavedStateHandle
+    savedStateHandle: SavedStateHandle,
+    private val playbackStateDao: PlaybackStateDao? = null,
+    private val settingsRepository: SettingsRepository? = null
 ) : ViewModel(), ReaderBridgeListener {
 
-    private val bookId: String = savedStateHandle.get<String>("bookId") ?: "sample_book_id"
+    private var bookId: String = savedStateHandle.get<String>("bookId") ?: "sample_book_id"
+    private var loadJob: Job? = null
+    private val saveMutex = Mutex()
 
     private val _uiState = MutableStateFlow(ReaderUiState(bookId = bookId))
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
     init {
-        loadBookAndChapters()
+        loadBookAndChapters(bookId)
     }
 
-    private fun loadBookAndChapters() {
-        viewModelScope.launch {
+    fun loadBookAndChapters(targetBookId: String = bookId) {
+        if (targetBookId.isBlank()) return
+        val switchingBook = _uiState.value.bookId != targetBookId
+        bookId = targetBookId
+        loadJob?.cancel()
+        _uiState.update { state ->
+            if (switchingBook) {
+                state.copy(
+                    bookId = targetBookId,
+                    bookTitle = "Reader",
+                    bookFilePath = "",
+                    chapters = emptyList(),
+                    currentChapterIndex = 0,
+                    currentCfi = "",
+                    progress = 0f,
+                    isStateRestored = false,
+                    isBookReady = false,
+                    errorMessage = null
+                )
+            } else {
+                state.copy(isStateRestored = false)
+            }
+        }
+
+        loadJob = viewModelScope.launch {
             try {
-                val book = bookDao.getBookById(bookId)
+                val book = bookDao.getBookById(targetBookId)
                 if (book != null) {
-                    _uiState.update { it.copy(bookTitle = book.title, errorMessage = null) }
+                    val savedState = playbackStateDao?.getPlaybackState(targetBookId)
+                    val restoredCfi = savedState?.lastCfi.orEmpty()
+                    val restoredProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
+                    val existingChapters = _uiState.value.chapters
+                    val restoredChapterIndex = resolveChapterIndex(
+                        chapters = existingChapters,
+                        cfi = restoredCfi,
+                        progress = restoredProgress,
+                        fallbackIndex = savedState?.chapterIndex ?: 0
+                    )
+                    _uiState.update {
+                        it.copy(
+                            bookId = targetBookId,
+                            bookTitle = book.title,
+                            bookFilePath = book.filePath,
+                            currentCfi = restoredCfi,
+                            progress = restoredProgress,
+                            currentChapterIndex = restoredChapterIndex,
+                            isStateRestored = true,
+                            errorMessage = null
+                        )
+                    }
+                    withContext(NonCancellable) {
+                        settingsRepository?.setLastOpenedBookId(targetBookId)
+                        bookDao.updateLastReadDate(targetBookId, System.currentTimeMillis())
+                    }
                 } else {
-                    _uiState.update { it.copy(errorMessage = "Book not found or unreadable: $bookId") }
+                    _uiState.update {
+                        it.copy(
+                            bookId = targetBookId,
+                            isStateRestored = true,
+                            errorMessage = "Book not found or unreadable: $targetBookId"
+                        )
+                    }
                 }
-                chapterDao.getChaptersForBook(bookId).collect { chapters ->
-                    _uiState.update { it.copy(chapters = chapters) }
+                chapterDao.getChaptersForBook(targetBookId).collect { chapters ->
+                    _uiState.update { state ->
+                        val resolvedChapter = resolveChapterIndex(
+                            chapters = chapters,
+                            cfi = state.currentCfi,
+                            progress = state.progress,
+                            fallbackIndex = state.currentChapterIndex
+                        )
+                        state.copy(
+                            chapters = chapters,
+                            currentChapterIndex = resolvedChapter
+                        )
+                    }
                 }
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
-                _uiState.update { it.copy(errorMessage = e.message ?: "Failed to load book: $bookId") }
+                if (e is CancellationException) throw e
+                _uiState.update {
+                    it.copy(
+                        isStateRestored = true,
+                        errorMessage = e.message ?: "Failed to load book: $targetBookId"
+                    )
+                }
             }
         }
     }
@@ -157,20 +242,116 @@ class ReaderViewModel @Inject constructor(
     }
 
     fun saveProgress(cfi: String, progress: Float) {
-        _uiState.update { it.copy(currentCfi = cfi, progress = progress) }
-        viewModelScope.launch {
-            val book = bookDao.getBookById(bookId)
-            if (book != null) {
-                bookDao.updateBook(book.copy(lastReadDate = System.currentTimeMillis()))
+        saveProgressInternal(cfi, progress, chapterTitle = "")
+    }
+
+    /**
+     * Flushes the currently restored/active reading position to durable storage.
+     * Skips writes if initial state has not finished loading or no position is set yet.
+     */
+    fun flushProgress() {
+        val state = _uiState.value
+        if (!state.isStateRestored || state.bookId.isBlank()) return
+        if (state.currentCfi.isBlank() && state.progress <= 0f) return
+        persistProgress(state.bookId, state.currentCfi, state.progress)
+    }
+
+    fun resetBookReady() {
+        _uiState.update { it.copy(isBookReady = false) }
+    }
+
+    private fun saveProgressInternal(cfi: String, progress: Float, chapterTitle: String) {
+        val clampedProgress = progress.coerceIn(0f, 1f)
+        val targetBookId = bookId
+        _uiState.update { state ->
+            val chapterIndex = resolveChapterIndex(
+                chapters = state.chapters,
+                cfi = cfi,
+                progress = clampedProgress,
+                chapterTitle = chapterTitle,
+                fallbackIndex = state.currentChapterIndex
+            )
+            state.copy(
+                currentCfi = cfi,
+                progress = clampedProgress,
+                currentChapterIndex = chapterIndex
+            )
+        }
+        if (targetBookId.isNotBlank()) {
+            persistProgress(targetBookId, cfi, clampedProgress)
+        }
+    }
+
+    private fun persistProgress(targetBookId: String, cfi: String, progress: Float) {
+        // Detach parent Job via NonCancellable so abrupt UI/ViewModel teardown does not abort SQLite writes.
+        viewModelScope.launch(NonCancellable) {
+            try {
+                saveMutex.withLock {
+                    val latestState = _uiState.value
+                    val cfiToSave = if (latestState.bookId == targetBookId) latestState.currentCfi else cfi
+                    val progressToSave = if (latestState.bookId == targetBookId) latestState.progress else progress
+                    val now = System.currentTimeMillis()
+                    playbackStateDao?.saveReaderProgress(
+                        bookId = targetBookId,
+                        lastCfi = cfiToSave.ifBlank { null },
+                        readingProgress = progressToSave,
+                        updatedAt = now
+                    )
+                    bookDao.updateLastReadDate(targetBookId, now)
+                }
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
             }
         }
+    }
+
+    private fun resolveChapterIndex(
+        chapters: List<ChapterEntity>,
+        cfi: String,
+        progress: Float,
+        chapterTitle: String = "",
+        fallbackIndex: Int = 0
+    ): Int {
+        if (chapters.isEmpty()) return fallbackIndex.coerceAtLeast(0)
+        if (cfi.isNotBlank()) {
+            val exactIndex = chapters.indexOfFirst { !it.cfiRange.isNullOrBlank() && it.cfiRange == cfi }
+            if (exactIndex >= 0) return exactIndex
+
+            val prefixMatch = chapters.mapIndexedNotNull { index, chapter ->
+                val range = chapter.cfiRange?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+                val base = range.removeSuffix(")")
+                if (cfi.startsWith("$base!") || cfi.startsWith("$base/")) {
+                    index to range.length
+                } else {
+                    null
+                }
+            }.maxByOrNull { it.second }
+            if (prefixMatch != null) return prefixMatch.first
+        }
+        if (chapterTitle.isNotBlank()) {
+            val titleIndex = chapters.indexOfFirst { it.title.equals(chapterTitle.trim(), ignoreCase = true) }
+            if (titleIndex >= 0) return titleIndex
+        }
+        if (progress > 0f) {
+            return (progress * chapters.size).toInt().coerceIn(0, chapters.size - 1)
+        }
+        return fallbackIndex.coerceIn(0, chapters.size - 1)
+    }
+
+    override fun onCleared() {
+        flushProgress()
+        super.onCleared()
     }
 
     // ReaderBridgeListener callbacks
     override fun onParagraphsExtracted(chapterIndex: Int, paragraphsJson: String) {}
 
     override fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String) {
-        saveProgress(cfi, fraction)
+        saveProgressInternal(cfi, fraction, chapterTitle)
+    }
+
+    override fun onBookReady() {
+        _uiState.update { it.copy(isBookReady = true) }
     }
 
     override fun onSelectionChanged(cfiRange: String, selectedText: String) {}

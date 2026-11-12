@@ -7,6 +7,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
@@ -17,6 +18,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import org.json.JSONObject
 
 @SuppressLint("JavascriptInterface")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -28,8 +33,57 @@ fun ReaderScreen(
     viewModel: ReaderViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsState()
-    val readerBridge = remember { ReaderBridge(viewModel) }
+    val readerBridge = remember(viewModel) { ReaderBridge(viewModel) }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var isWebViewPageFinished by remember { mutableStateOf(false) }
+    var hasOpenedBookInWebView by remember(bookId) { mutableStateOf(false) }
+    var hasRestoredInitialCfi by remember(bookId) { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    LaunchedEffect(bookId) {
+        if (bookId.isNotBlank() && viewModel.uiState.value.bookId != bookId) {
+            viewModel.loadBookAndChapters(bookId)
+        }
+    }
+
+    // Open book in WebView once both the HTML bridge and persisted Room state are ready.
+    LaunchedEffect(isWebViewPageFinished, uiState.isStateRestored, webViewInstance, bookId) {
+        val webView = webViewInstance
+        if (webView != null && isWebViewPageFinished && uiState.isStateRestored && !hasOpenedBookInWebView) {
+            hasOpenedBookInWebView = true
+            viewModel.resetBookReady()
+            val jsBookUri = JSONObject.quote(uiState.bookFilePath)
+            webView.evaluateJavascript("window.FoliateBridge?.openBook($jsBookUri);", null)
+        }
+    }
+
+    // Restore saved CFI position after the book reports ready inside the WebView.
+    LaunchedEffect(isWebViewPageFinished, uiState.isBookReady, uiState.isStateRestored, webViewInstance, bookId) {
+        val webView = webViewInstance
+        if (webView != null && isWebViewPageFinished && uiState.isBookReady && uiState.isStateRestored && !hasRestoredInitialCfi) {
+            hasRestoredInitialCfi = true
+            val savedCfi = uiState.currentCfi
+            if (savedCfi.isNotBlank()) {
+                val jsSavedCfi = JSONObject.quote(savedCfi)
+                webView.evaluateJavascript("window.FoliateBridge?.goToCfi($jsSavedCfi, false);", null)
+            }
+        }
+    }
+
+    // Flush reading position on pause/stop and when navigating away from the reader.
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                webViewInstance?.evaluateJavascript("window.FoliateBridge?.flushPosition?.();", null)
+                viewModel.flushProgress()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.flushProgress()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -119,31 +173,32 @@ fun ReaderScreen(
                         @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        webViewClient = WebViewClient()
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                isWebViewPageFinished = true
+                            }
+                        }
                         addJavascriptInterface(readerBridge, "AndroidReaderBridge")
                         loadUrl("file:///android_asset/reader/index.html")
                         webViewInstance = this
                     }
                 },
                 update = { webView ->
+                    if (!isWebViewPageFinished) return@AndroidView
                     val themeName = uiState.theme.name.lowercase()
                     val fontSize = uiState.fontSizeSp
                     webView.evaluateJavascript("window.FoliateBridge?.setTheme('$themeName', $fontSize, null);", null)
 
                     if (uiState.bilingualTranslations.isNotEmpty()) {
-                        val jsonMap = StringBuilder("{")
-                        uiState.bilingualTranslations.entries.forEachIndexed { idx, entry ->
-                            if (idx > 0) jsonMap.append(",")
-                            jsonMap.append("\"${entry.key}\": \"${entry.value.replace("\"", "\\\"")}\"")
-                        }
-                        jsonMap.append("}")
+                        val jsonMap = JSONObject(uiState.bilingualTranslations).toString()
                         webView.evaluateJavascript("window.FoliateBridge?.setBilingualTranslations($jsonMap);", null)
                     } else {
                         webView.evaluateJavascript("window.FoliateBridge?.setBilingualTranslations({});", null)
                     }
 
                     uiState.highlightedCfi?.let { cfi ->
-                        webView.evaluateJavascript("window.FoliateBridge?.highlightCfi('$cfi');", null)
+                        webView.evaluateJavascript("window.FoliateBridge?.highlightCfi(${JSONObject.quote(cfi)});", null)
                     }
                 }
             )
@@ -163,7 +218,7 @@ fun ReaderScreen(
                                 value = uiState.searchQuery,
                                 onValueChange = { query ->
                                     viewModel.setSearchQuery(query)
-                                    webViewInstance?.evaluateJavascript("window.FoliateBridge?.searchInBook('$query');", null)
+                                    webViewInstance?.evaluateJavascript("window.FoliateBridge?.searchInBook(${JSONObject.quote(query)});", null)
                                 },
                                 label = { Text("Search in book") },
                                 modifier = Modifier.weight(1f),
@@ -181,7 +236,7 @@ fun ReaderScreen(
                                     supportingContent = { Text(result.cfi, style = MaterialTheme.typography.bodySmall) },
                                     modifier = Modifier.clickable {
                                         viewModel.highlightCfi(result.cfi)
-                                        webViewInstance?.evaluateJavascript("window.FoliateBridge?.goToCfi('${result.cfi}');", null)
+                                        webViewInstance?.evaluateJavascript("window.FoliateBridge?.goToCfi(${JSONObject.quote(result.cfi)});", null)
                                         viewModel.setSearchOpen(false)
                                     }
                                 )
@@ -212,12 +267,16 @@ fun ReaderScreen(
                         }
                         Spacer(modifier = Modifier.height(8.dp))
                         LazyColumn {
-                            items(uiState.chapters) { chapter ->
+                            itemsIndexed(uiState.chapters) { index, chapter ->
                                 ListItem(
                                     headlineContent = { Text(chapter.title) },
                                     modifier = Modifier.clickable {
-                                        viewModel.saveProgress(chapter.cfiRange ?: "", chapter.index.toFloat() / maxOf(1, uiState.chapters.size))
-                                        webViewInstance?.evaluateJavascript("window.FoliateBridge?.goToCfi('${chapter.cfiRange ?: ""}');", null)
+                                        val chapterCfi = chapter.cfiRange.orEmpty()
+                                        val chapterProgress = (index.toFloat() / maxOf(1, uiState.chapters.size)).coerceIn(0f, 1f)
+                                        viewModel.saveProgress(chapterCfi, chapterProgress)
+                                        if (chapterCfi.isNotBlank()) {
+                                            webViewInstance?.evaluateJavascript("window.FoliateBridge?.goToCfi(${JSONObject.quote(chapterCfi)}, false);", null)
+                                        }
                                         viewModel.setTocOpen(false)
                                     }
                                 )
