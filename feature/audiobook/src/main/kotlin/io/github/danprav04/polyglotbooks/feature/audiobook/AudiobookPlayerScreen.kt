@@ -25,8 +25,11 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 fun AudiobookPlayerScreen(
     bookId: String,
     onBackClick: () -> Unit = {},
-    viewModel: AudiobookPlayerViewModel = viewModel()
+    viewModel: AudiobookPlayerViewModel = androidx.hilt.navigation.compose.hiltViewModel()
 ) {
+    LaunchedEffect(bookId) {
+        viewModel.loadBook(bookId)
+    }
     val state by viewModel.uiState.collectAsState()
 
     Scaffold(
@@ -45,7 +48,7 @@ fun AudiobookPlayerScreen(
                     }
                     // Chapters button
                     IconButton(onClick = { viewModel.setChapterListSheetVisible(true) }) {
-                        Icon(Icons.Default.List, contentDescription = "Chapters")
+                        Icon(Icons.Default.Menu, contentDescription = "Chapters")
                     }
                     // AI Report button
                     IconButton(onClick = { viewModel.setAiReportDialogVisible(true) }) {

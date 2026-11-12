@@ -25,7 +25,11 @@ class DefaultChapterParser : ChapterParser {
         return when (format) {
             BookFormat.CUE -> CueSheetChapterParser().parseChapters(inputStream, format)
             BookFormat.M4B, BookFormat.MP3 -> {
-                val bytes = inputStream.readBytes()
+                // Read up to 8MB max to avoid OOM on large audiobook files
+                val maxRead = 8 * 1024 * 1024
+                val buffer = ByteArray(maxRead)
+                val readTotal = inputStream.read(buffer)
+                val bytes = if (readTotal > 0) buffer.copyOf(readTotal) else byteArrayOf()
                 if (format == BookFormat.M4B) {
                     Mp4ChapterParser().parseChapters(bytes)
                 } else {

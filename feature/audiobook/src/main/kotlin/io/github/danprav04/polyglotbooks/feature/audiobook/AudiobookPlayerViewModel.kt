@@ -1,15 +1,34 @@
 package io.github.danprav04.polyglotbooks.feature.audiobook
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import io.github.danprav04.polyglotbooks.core.data.db.BookDao
+import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import javax.inject.Inject
 
 data class Chapter(
     val index: Int,
     val title: String,
-    val durationMs: Long
+    val durationMs: Long,
+    val startMs: Long = 0L
 )
 
 data class Bookmark(
@@ -51,21 +70,118 @@ data class AudiobookPlayerUiState(
     val newBookmarkNote: String = ""
 )
 
-class AudiobookPlayerViewModel : ViewModel() {
+@HiltViewModel
+class AudiobookPlayerViewModel @Inject constructor(
+    private val bookDao: BookDao?,
+    private val chapterDao: ChapterDao?,
+    @ApplicationContext private val context: Context?
+) : ViewModel() {
+    constructor() : this(null, null, null)
     private val _uiState = MutableStateFlow(AudiobookPlayerUiState())
     val uiState: StateFlow<AudiobookPlayerUiState> = _uiState.asStateFlow()
 
+    private var exoPlayer: ExoPlayer? = null
+    private var positionJob: Job? = null
+    private var loadedBookId: String? = null
+
+    fun loadBook(bookId: String) {
+        if (bookDao == null || bookId.isBlank() || loadedBookId == bookId) return
+        loadedBookId = bookId
+        viewModelScope.launch {
+            val book = bookDao.getBookById(bookId) ?: return@launch
+            val dbChapters = chapterDao?.getChaptersForBook(bookId)?.firstOrNull() ?: emptyList()
+            val mappedChapters = if (dbChapters.isNotEmpty()) {
+                dbChapters.map { ch ->
+                    Chapter(
+                        index = ch.index,
+                        title = ch.title,
+                        durationMs = (ch.endMs - ch.startMs).coerceAtLeast(1000L),
+                        startMs = ch.startMs
+                    )
+                }
+            } else {
+                listOf(Chapter(0, book.title, 3600000L, 0L))
+            }
+            _uiState.value = _uiState.value.copy(
+                bookTitle = book.title,
+                author = book.author,
+                chapters = mappedChapters,
+                durationMs = mappedChapters.firstOrNull()?.durationMs ?: 3600000L,
+                currentPositionMs = 0L
+            )
+            setupPlayer(book.filePath)
+        }
+    }
+
+    private fun setupPlayer(filePath: String) {
+        val appContext = context ?: return
+        if (filePath.isBlank()) return
+        try {
+            exoPlayer?.release()
+            val player = ExoPlayer.Builder(appContext).build()
+            player.addListener(object : Player.Listener {
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    if (playbackState == Player.STATE_READY) {
+                        val realDuration = player.duration
+                        if (realDuration != C.TIME_UNSET && realDuration > 0L) {
+                            _uiState.value = _uiState.value.copy(durationMs = realDuration)
+                        }
+                    } else if (playbackState == Player.STATE_ENDED) {
+                        _uiState.value = _uiState.value.copy(isPlaying = false)
+                    }
+                }
+
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    _uiState.value = _uiState.value.copy(isPlaying = isPlaying)
+                }
+            })
+            player.setMediaItem(MediaItem.fromUri(Uri.parse(filePath)))
+            player.prepare()
+            exoPlayer = player
+            startPositionPolling()
+        } catch (_: Exception) {
+            // Keep UI functional even if URI cannot be opened
+        }
+    }
+
+    private fun startPositionPolling() {
+        positionJob?.cancel()
+        positionJob = viewModelScope.launch {
+            while (isActive) {
+                val player = exoPlayer
+                if (player != null) {
+                    val pos = player.currentPosition.coerceAtLeast(0L)
+                    val dur = player.duration.let { if (it != C.TIME_UNSET && it > 0L) it else _uiState.value.durationMs }
+                    if (pos != _uiState.value.currentPositionMs || dur != _uiState.value.durationMs) {
+                        _uiState.value = _uiState.value.copy(
+                            currentPositionMs = pos.coerceAtMost(dur),
+                            durationMs = dur
+                        )
+                    }
+                }
+                delay(500L)
+            }
+        }
+    }
+
     fun togglePlayPause() {
-        _uiState.value = _uiState.value.copy(isPlaying = !_uiState.value.isPlaying)
+        val player = exoPlayer
+        if (player != null) {
+            if (player.isPlaying) player.pause() else player.play()
+        } else {
+            _uiState.value = _uiState.value.copy(isPlaying = !_uiState.value.isPlaying)
+        }
     }
 
     fun seekBy(deltaMs: Long) {
         val newPos = (_uiState.value.currentPositionMs + deltaMs).coerceIn(0L, _uiState.value.durationMs)
+        exoPlayer?.seekTo(newPos)
         _uiState.value = _uiState.value.copy(currentPositionMs = newPos)
     }
 
     fun seekTo(positionMs: Long) {
         val newPos = positionMs.coerceIn(0L, _uiState.value.durationMs)
+        exoPlayer?.seekTo(newPos)
         _uiState.value = _uiState.value.copy(currentPositionMs = newPos)
     }
 
@@ -79,6 +195,7 @@ class AudiobookPlayerViewModel : ViewModel() {
 
     fun setPlaybackSpeed(speed: Float) {
         val clamped = speed.coerceIn(0.5f, 3.0f)
+        exoPlayer?.playbackParameters = PlaybackParameters(clamped)
         _uiState.value = _uiState.value.copy(playbackSpeed = clamped)
     }
 
@@ -138,12 +255,29 @@ class AudiobookPlayerViewModel : ViewModel() {
     fun selectChapter(index: Int) {
         val current = _uiState.value
         val chapter = current.chapters.getOrNull(index) ?: return
-        _uiState.value = current.copy(
-            currentChapterIndex = index,
-            durationMs = chapter.durationMs,
-            currentPositionMs = 0L,
-            showChapterListSheet = false
-        )
+        val player = exoPlayer
+        if (player != null) {
+            player.seekTo(chapter.startMs)
+            _uiState.value = current.copy(
+                currentChapterIndex = index,
+                currentPositionMs = chapter.startMs,
+                showChapterListSheet = false
+            )
+        } else {
+            _uiState.value = current.copy(
+                currentChapterIndex = index,
+                durationMs = chapter.durationMs,
+                currentPositionMs = 0L,
+                showChapterListSheet = false
+            )
+        }
+    }
+
+    override fun onCleared() {
+        positionJob?.cancel()
+        exoPlayer?.release()
+        exoPlayer = null
+        super.onCleared()
     }
 
     fun setSleepTimer(minutes: Int) {

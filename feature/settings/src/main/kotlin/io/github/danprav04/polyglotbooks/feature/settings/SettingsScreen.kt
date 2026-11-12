@@ -332,7 +332,10 @@ private fun ModelConfigurationSection(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
                         imageVector = Icons.Default.Tune,
                         contentDescription = null,
@@ -340,16 +343,19 @@ private fun ModelConfigurationSection(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Model per Role Configuration",
+                        text = "Model per Role",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                 }
 
-                TextButton(onClick = { viewModel.resetModelsToDefaults() }) {
+                TextButton(
+                    onClick = { viewModel.resetModelsToDefaults() },
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
                     Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Reset to defaults")
+                    Text("Reset defaults", maxLines = 1)
                 }
             }
 

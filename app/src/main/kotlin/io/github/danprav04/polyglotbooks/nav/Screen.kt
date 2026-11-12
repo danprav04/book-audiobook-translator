@@ -23,9 +23,10 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector?
     data object Onboarding : Screen("onboarding", "Welcome", Icons.Default.Info)
 
     companion object {
-        val bottomNavScreens = listOf(
-            Library,
-            Settings
-        )
+        val bottomNavScreens: List<Screen>
+            get() = listOf(
+                Library,
+                Settings
+            )
     }
 }

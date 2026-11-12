@@ -71,8 +71,21 @@ fun AppNavHost(
             modifier = Modifier.padding(innerPadding)
         ) {
             composable(Screen.Library.route) {
+                val libraryViewModel: io.github.danprav04.polyglotbooks.feature.library.LibraryViewModel = hiltViewModel()
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val filePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                    contract = androidx.activity.result.contract.ActivityResultContracts.OpenMultipleDocuments()
+                ) { uris ->
+                    if (uris.isNotEmpty()) {
+                        libraryViewModel.importUris(context, uris)
+                    }
+                }
+
                 LibraryScreen(
-                    viewModel = hiltViewModel(),
+                    viewModel = libraryViewModel,
+                    onImportFileClick = {
+                        filePickerLauncher.launch(arrayOf("*/*"))
+                    },
                     onOpenEbook = { bookId ->
                         navController.navigate(Screen.Reader.createRoute(bookId))
                     },

@@ -26,19 +26,13 @@ class SafLibraryImporter(
             }
 
             val fileName = queryFileName(context, uri) ?: uri.lastPathSegment ?: "unknown"
-            val rawBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
-            val format = FormatDetector.detect(rawBytes, fileName)
-
-            val effectiveBytes = if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
-                EbookFormatConverter.convertToEpub(
-                    rawBytes.inputStream(),
-                    format,
-                    title = fileName.substringBeforeLast('.'),
-                    author = "Unknown Author"
-                )
-            } else {
-                rawBytes
-            }
+            // Read at most 64KB for format detection to prevent OutOfMemoryError on large audiobooks/ebooks
+            val headerBuffer = ByteArray(64 * 1024)
+            val headerLen = context.contentResolver.openInputStream(uri)?.use { stream ->
+                stream.read(headerBuffer)
+            } ?: 0
+            val headerBytes = if (headerLen > 0) headerBuffer.copyOf(headerLen) else byteArrayOf()
+            val format = FormatDetector.detect(headerBytes, fileName)
 
             val effectiveFormat = if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
                 BookFormat.EPUB
@@ -46,14 +40,73 @@ class SafLibraryImporter(
                 format
             }
 
-            val bookModel = effectiveBytes.inputStream().use { stream ->
-                metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
-            }?.copy(filePath = uri.toString())
+            var audioDurationMs = 3600000L
+            val bookModel = if (format.isAudiobook) {
+                var title = fileName.substringBeforeLast('.')
+                var author = "Unknown Author"
+                try {
+                    val mmr = android.media.MediaMetadataRetriever()
+                    mmr.setDataSource(context, uri)
+                    mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_TITLE)
+                        ?.takeIf { it.isNotBlank() }?.let { title = it }
+                    (mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_AUTHOR)
+                        ?: mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST)
+                        ?: mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST))
+                        ?.takeIf { it.isNotBlank() }?.let { author = it }
+                    mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toLongOrNull()?.takeIf { it > 0L }?.let { audioDurationMs = it }
+                    mmr.release()
+                } catch (_: Exception) {
+                    // Fallback to filename metadata
+                }
+                io.github.danprav04.polyglotbooks.core.model.Book(
+                    id = uri.toString().hashCode().toString(),
+                    title = title,
+                    author = author,
+                    format = format.name,
+                    filePath = uri.toString(),
+                    isAudiobook = true
+                )
+            } else if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
+                val fullBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
+                val epubBytes = EbookFormatConverter.convertToEpub(
+                    fullBytes.inputStream(),
+                    format,
+                    title = fileName.substringBeforeLast('.'),
+                    author = "Unknown Author"
+                )
+                epubBytes.inputStream().use { stream ->
+                    metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
+                }?.copy(filePath = uri.toString())
+            } else {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
+                }?.copy(filePath = uri.toString())
+            }
 
             if (bookModel != null) {
-                val chapters = effectiveBytes.inputStream().use { stream ->
-                    chapterParser.parseChapters(stream, effectiveFormat)
-                } ?: emptyList()
+                val parsedChapters = try {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        chapterParser.parseChapters(stream, effectiveFormat)
+                    } ?: emptyList()
+                } catch (e: Throwable) {
+                    emptyList()
+                }
+
+                val chapters = if (parsedChapters.isEmpty() && format.isAudiobook) {
+                    listOf(
+                        io.github.danprav04.polyglotbooks.core.model.Chapter(
+                            id = "chap_0",
+                            bookId = bookModel.id,
+                            index = 0,
+                            title = bookModel.title,
+                            startMs = 0L,
+                            endMs = audioDurationMs
+                        )
+                    )
+                } else {
+                    parsedChapters
+                }
 
                 val bookEntity = BookEntity(
                     id = bookModel.id,

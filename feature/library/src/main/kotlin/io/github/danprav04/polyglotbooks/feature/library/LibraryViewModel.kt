@@ -1,5 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.library
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -26,6 +28,13 @@ class LibraryViewModel @Inject constructor(
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    fun importUris(context: Context, uris: List<Uri>) {
+        viewModelScope.launch {
+            val importer = SafLibraryImporter(context.applicationContext, bookDao)
+            importer.importUris(uris)
+        }
+    }
 
     fun deleteBook(bookId: String) {
         viewModelScope.launch {
