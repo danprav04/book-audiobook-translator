@@ -1,12 +1,15 @@
 package io.github.danprav04.polyglotbooks.feature.library
 
+import io.github.danprav04.polyglotbooks.core.data.CoverExtractor
 import io.github.danprav04.polyglotbooks.core.model.Chapter
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 import java.io.InputStreamReader
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 
 /**
  * Interface for parsing chapters out of ebook and audiobook containers.
@@ -18,6 +21,23 @@ interface ChapterParser {
 
 class DefaultChapterParser : ChapterParser {
     override suspend fun parseChapters(file: File, format: BookFormat): List<Chapter> {
+        if (format.isAudiobook) {
+            // Check companion .cue file
+            val cueFile = File(file.parentFile, "${file.nameWithoutExtension}.cue")
+            if (cueFile.exists() && cueFile.canRead()) {
+                val chapters = try {
+                    cueFile.inputStream().use { CueSheetChapterParser().parseChapters(it, BookFormat.CUE) }
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                if (chapters.isNotEmpty()) return chapters
+            }
+
+            if (format == BookFormat.M4B) {
+                val chapters = Mp4ChapterParser().parseChapters(file)
+                if (chapters.isNotEmpty()) return chapters
+            }
+        }
         return file.inputStream().use { parseChapters(it, format) }
     }
 
@@ -25,6 +45,11 @@ class DefaultChapterParser : ChapterParser {
         return when (format) {
             BookFormat.CUE -> CueSheetChapterParser().parseChapters(inputStream, format)
             BookFormat.M4B, BookFormat.MP3 -> {
+                if (format == BookFormat.M4B && inputStream is FileInputStream) {
+                    val channel = inputStream.channel
+                    val chapters = CoverExtractor.extractChapters(channel, channel.size())
+                    if (chapters.isNotEmpty()) return chapters
+                }
                 // Read up to 8MB max to avoid OOM on large audiobook files
                 val maxRead = 8 * 1024 * 1024
                 val buffer = ByteArray(maxRead)
@@ -162,59 +187,16 @@ class Id3ChapChapterParser {
 }
 
 class Mp4ChapterParser {
-    fun parseChapters(bytes: ByteArray): List<Chapter> {
-        val chapters = mutableListOf<Chapter>()
-        var i = 0
-        while (i < bytes.size - 8) {
-            if (bytes[i] == 'c'.code.toByte() &&
-                bytes[i+1] == 'h'.code.toByte() &&
-                bytes[i+2] == 'p'.code.toByte() &&
-                bytes[i+3] == 'l'.code.toByte()) {
-                
-                try {
-                    val dataStart = i + 4
-                    if (dataStart < bytes.size) {
-                        val count = bytes[dataStart + 4].toInt() and 0xFF
-                        var cursor = dataStart + 5
-                        for (idx in 0 until count) {
-                            if (cursor + 9 > bytes.size) break
-                            val startTime100ns = ByteBuffer.wrap(bytes, cursor, 8).order(ByteOrder.BIG_ENDIAN).long
-                            val startTimeMs = startTime100ns / 10000L
-                            val titleLen = bytes[cursor + 8].toInt() and 0xFF
-                            cursor += 9
-                            if (cursor + titleLen > bytes.size) break
-                            val title = String(bytes, cursor, titleLen, Charsets.UTF_8)
-                            cursor += titleLen
+    fun parseChapters(bytes: ByteArray, bookId: String = ""): List<Chapter> {
+        return CoverExtractor.extractChapters(bytes, bookId)
+    }
 
-                            val endTimeMs = if (idx > 0 && chapters.isNotEmpty()) {
-                                val prev = chapters.last()
-                                chapters[chapters.size - 1] = prev.copy(endMs = startTimeMs)
-                                startTimeMs + 60000L
-                            } else {
-                                startTimeMs + 60000L
-                            }
+    fun parseChapters(file: File, bookId: String = ""): List<Chapter> {
+        return CoverExtractor.extractChapters(file, bookId)
+    }
 
-                            chapters.add(
-                                Chapter(
-                                    id = "mp4_chap_$idx",
-                                    bookId = "",
-                                    index = idx,
-                                    title = title,
-                                    startMs = startTimeMs,
-                                    endMs = endTimeMs
-                                )
-                            )
-                        }
-                    }
-                    break
-                } catch (e: Exception) {
-                    i++
-                }
-            } else {
-                i++
-            }
-        }
-        return chapters
+    fun parseChapters(channel: FileChannel, fileSize: Long, bookId: String = ""): List<Chapter> {
+        return CoverExtractor.extractChapters(channel, fileSize, bookId)
     }
 }
 

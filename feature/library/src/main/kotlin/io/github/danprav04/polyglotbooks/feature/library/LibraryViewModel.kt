@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
+import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
@@ -19,7 +20,8 @@ enum class LibraryFilterTab {
 
 @HiltViewModel
 class LibraryViewModel @Inject constructor(
-    private val bookDao: BookDao
+    private val bookDao: BookDao,
+    private val chapterDao: ChapterDao
 ) : ViewModel() {
 
     val books: StateFlow<List<BookEntity>> = bookDao.getAllBooks()
@@ -31,7 +33,7 @@ class LibraryViewModel @Inject constructor(
 
     fun importUris(context: Context, uris: List<Uri>) {
         viewModelScope.launch {
-            val importer = SafLibraryImporter(context.applicationContext, bookDao)
+            val importer = SafLibraryImporter(context.applicationContext, bookDao, chapterDao)
             importer.importUris(uris)
         }
     }
