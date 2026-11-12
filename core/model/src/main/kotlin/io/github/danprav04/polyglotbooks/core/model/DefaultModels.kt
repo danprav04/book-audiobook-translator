@@ -8,10 +8,10 @@ object DefaultModels {
         ModelRole.LIVE_TRANSLATE to "gemini-3.5-live-translate-preview",
         ModelRole.TTS to "gemini-3.8-flash-tts",
         ModelRole.LIVE_NARRATION to "gemini-3.8-live",
-        ModelRole.TEXT_ANALYSIS to "gemini-3.8-flash",
-        ModelRole.TEXT_TRANSLATION to "gemini-3.8-flash",
+        ModelRole.TEXT_ANALYSIS to "gemini-3.5-flash-lite",
+        ModelRole.TEXT_TRANSLATION to "gemini-3.5-flash-lite",
         ModelRole.LIVE_TRANSCRIBE to "gemini-3.5-transcribe-live"
     )
 
-    fun get(role: ModelRole): String = map[role] ?: "gemini-3.8-flash"
+    fun get(role: ModelRole): String = map[role] ?: "gemini-3.5-flash-lite"
 }

@@ -107,7 +107,7 @@ The reader leverages the open-source **foliate-js** rendering engine running ins
   - `onPageTurned(cfi)`: Notifies Kotlin when the user manually navigates pages.
 
 ### Automated Character Casting (`CastingService`)
-Before narration begins, chapter text is analyzed by a text model (`gemini-3.8-flash`) using structured JSON output:
+Before narration begins, chapter text is analyzed by a text model (`gemini-3.5-flash-lite`) using structured JSON output:
 1. **Extraction**: Identifies characters, aliases, inferred gender, age, and voice traits.
 2. **Span Attribution**: Breaks paragraphs into line segments with speaker assignments (`speakerId` or `"narrator"`).
 3. **Validation & Normalization**:

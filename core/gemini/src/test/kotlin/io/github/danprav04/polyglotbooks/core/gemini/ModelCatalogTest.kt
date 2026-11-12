@@ -73,6 +73,6 @@ class ModelCatalogTest {
 
         val textModels = ModelCatalog.filterModelsForRole(response.models, ModelRole.TEXT_ANALYSIS)
         val names = textModels.map { it.name }
-        assertTrue(names.contains("models/gemini-3.8-flash"))
+        assertTrue(names.contains("models/gemini-3.5-flash-lite"))
     }
 }
