@@ -5,7 +5,6 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.DefaultMediaNotificationProvider
@@ -40,20 +39,18 @@ class PlaybackNotificationManager(private val context: Context) {
     }
 
     fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            try {
-                val name = "Polyglot Books Playback"
-                val description = "Controls and media status for Polyglot Books"
-                val importance = NotificationManager.IMPORTANCE_LOW
-                val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
-                    this.description = description
-                    setShowBadge(false)
-                }
-                val notificationManager =
-                    context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-                notificationManager?.createNotificationChannel(channel)
-            } catch (_: Throwable) {
+        try {
+            val name = "Polyglot Books Playback"
+            val description = "Controls and media status for Polyglot Books"
+            val importance = NotificationManager.IMPORTANCE_LOW
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                this.description = description
+                setShowBadge(false)
             }
+            val notificationManager =
+                context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            notificationManager?.createNotificationChannel(channel)
+        } catch (_: Throwable) {
         }
     }
 

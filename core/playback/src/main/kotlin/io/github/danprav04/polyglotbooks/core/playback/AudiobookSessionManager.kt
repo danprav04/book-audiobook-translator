@@ -3,12 +3,14 @@ package io.github.danprav04.polyglotbooks.core.playback
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import androidx.annotation.OptIn
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.danprav04.polyglotbooks.core.data.CoverExtractor
@@ -80,6 +82,7 @@ data class AudiobookServiceState(
  * rewind (> 60s explicit pause), periodic 2000ms checkpoints, and non-cancellable flushes.
  */
 @Singleton
+@OptIn(UnstableApi::class)
 class AudiobookSessionManager @Inject constructor(
     private val bookDao: BookDao?,
     private val chapterDao: ChapterDao?,
@@ -243,6 +246,8 @@ class AudiobookSessionManager @Inject constructor(
                     attachedService?.updateStreamingLocks()
                     flushProgressNow()
                 }
+
+                else -> Unit
             }
         }
 
