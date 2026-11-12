@@ -1,0 +1,32 @@
+# Gradle & Android build outputs
+.gradle/
+.kotlin/
+**/build/
+local.properties
+
+# Android Studio / IntelliJ IDEA
+*.iml
+.idea/
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Keystores & secrets
+*.jks
+*.keystore
+keystore.properties
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+
+# Agent coordination scratch
+.agents/
+PROJECT.md

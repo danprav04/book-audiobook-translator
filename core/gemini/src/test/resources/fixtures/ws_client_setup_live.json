@@ -1,0 +1,16 @@
+{
+  "setup": {
+    "model": "models/gemini-3.8-live",
+    "generationConfig": {
+      "responseModalities": [
+        "AUDIO"
+      ],
+      "inputAudioTranscription": {},
+      "outputAudioTranscription": {}
+    },
+    "sessionResumption": {},
+    "contextWindowCompression": {
+      "slidingWindow": {}
+    }
+  }
+}

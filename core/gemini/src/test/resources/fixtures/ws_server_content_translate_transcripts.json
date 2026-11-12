@@ -1,0 +1,24 @@
+{
+  "serverContent": {
+    "modelTurn": {
+      "parts": [
+        {
+          "inlineData": {
+            "mimeType": "audio/pcm;rate=24000",
+            "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
+          }
+        }
+      ]
+    },
+    "inputTranscription": {
+      "text": "Hello world, this is a test.",
+      "languageCode": "en"
+    },
+    "outputTranscription": {
+      "text": "Cześć świecie, to jest test.",
+      "languageCode": "pl"
+    },
+    "turnComplete": true,
+    "interrupted": false
+  }
+}

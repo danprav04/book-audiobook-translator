@@ -1,0 +1,67 @@
+name: AI-Generated Content Report
+description: Report unexpected, inaccurate, offensive, or policy-violating AI translation or narration
+title: "[AI Report]: "
+labels: ["ai-safety", "policy-compliance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### Google Play AI-Generated Content Policy Compliance Report
+        Polyglot Books uses generative AI (via Google Gemini) for live speech translation and character narration. In accordance with Google Play's AI-Generated Content Policy, users can flag inappropriate, offensive, or inaccurate outputs. Maintainers review reports to update system prompts, add safety filtering guidelines, or report upstream model hallucinations.
+        
+        **Important:** DO NOT include your Gemini API key in this report.
+  - type: dropdown
+    id: feature_type
+    attributes:
+      label: Which AI Feature Produced This Output?
+      options:
+        - Audiobook Live Translation (Speech-to-Speech)
+        - Ebook Multi-Voice Narration (TTS)
+        - Character Casting & Emotion Detection
+        - Chapter Text Translation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: issue_category
+    attributes:
+      label: Category of Concern
+      options:
+        - Offensive, Hate Speech, or Harassment
+        - Hallucination / Completely fabricated text
+        - Severe translation inaccuracy / Inversion of meaning
+        - Inappropriate character voice assignment or tone
+        - Privacy / Sensitive content exposure
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: model_used
+    attributes:
+      label: Configured Model ID
+      description: Found in Settings -> Model Configuration (e.g. gemini-3.5-live-translate-preview).
+      placeholder: e.g. gemini-3.5-live-translate-preview
+    validations:
+      required: true
+  - type: input
+    id: languages
+    attributes:
+      label: Source & Target Languages (if applicable)
+      placeholder: "e.g. Source: German, Target: English"
+    validations:
+      required: false
+  - type: textarea
+    id: description
+    attributes:
+      label: Description of the Issue
+      description: Describe what the original book content was and what the AI generated.
+      placeholder: What did the model output, and why is it problematic?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Sample Context / Safe Excerpt
+      description: Please share a short, non-sensitive excerpt that reproduces this behavior.
+    validations:
+      required: false

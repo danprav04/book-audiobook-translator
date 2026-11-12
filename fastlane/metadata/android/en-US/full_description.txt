@@ -1,0 +1,32 @@
+Polyglot Books is the ultimate privacy-first audiobook player and ebook reader for book lovers, language learners, and avid readers worldwide.
+
+Experience books in any language without language barriers using your own Google Gemini API key (Bring Your Own Key - BYOK). Polyglot Books connects directly from your device to Google Gemini, with zero middleman servers, zero advertising, and zero user tracking.
+
+KEY FEATURES:
+
+🎧 LIVE AUDIOBOOK TRANSLATION
+- Listen to foreign-language audiobooks translated on the fly into 70+ languages.
+- Real-time streaming powered by Google's Gemini Live Translation API.
+- Intelligent look-ahead buffering ensures uninterrupted, buffer-free listening.
+- Smart local caching: replaying or scrubbing back costs zero extra API tokens.
+- Dual live subtitles: view original speech transcripts alongside real-time translated text.
+- Audio ducking: choose between hearing pure translated audio or softly hearing the original narrator underneath at 15% volume.
+
+📖 CHARACTER-CAST EBOOK READER
+- Read your favorite books in EPUB, MOBI, AZW3, PDF, FB2, and text formats.
+- Beautiful, responsive reading engine powered by foliate-js.
+- Automated AI character casting: our intelligent analyzer detects characters, gender, and emotion per chapter to assign distinct, fitting voices to each persona.
+- Pluggable speech synthesis: choose between ultra-natural Gemini Flash TTS, Gemini Live speech, or offline Android System TTS.
+- Synchronized reading: karaoke-style sentence highlighting moves with the narration.
+
+🔒 100% PRIVACY & BRING YOUR OWN KEY (BYOK)
+- No subscriptions or paywalls. Use your personal free or paid Gemini API key from Google AI Studio.
+- Secure on-device encryption: your API key is encrypted using Google Tink AEAD and the hardware-backed Android Keystore.
+- Complete data isolation: no third-party analytics SDKs, no telemetry, and 100% F-Droid compatible open-source architecture.
+
+SUPPORTED FORMATS:
+- Audiobooks: M4B, M4A, AAC, MP3, OGG, OPUS, FLAC, WAV
+- Ebooks: EPUB (2 & 3), MOBI, AZW3 (KF8), FB2, CBZ, PDF, TXT, Markdown, HTML, RTF
+
+Polyglot Books is open-source software licensed under GPL-3.0.
+Source code: https://github.com/danprav04/book-audiobook-translator

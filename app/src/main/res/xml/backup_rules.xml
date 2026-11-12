@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <exclude domain="sharedpref" path="polyglot_key_prefs.xml" />
+    <exclude domain="file" path="secure_gemini_api_key.enc" />
+    <exclude domain="file" path="polyglot_settings.preferences_pb" />
+</full-backup-content>

@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CastingResponse",
+  "type": "object",
+  "required": ["characters", "lines"],
+  "properties": {
+    "characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "gender", "age", "voiceTraits"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for the character, e.g. c1, c2, or narrator"
+          },
+          "name": {
+            "type": "string",
+            "description": "Full name of the character"
+          },
+          "aliases": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Alternative names or nicknames used in the text"
+          },
+          "gender": {
+            "type": "string",
+            "description": "Character gender (e.g. female, male, non-binary, unknown)"
+          },
+          "age": {
+            "type": "string",
+            "description": "Character age or life stage (e.g. child, young adult, adult, elderly)"
+          },
+          "voiceTraits": {
+            "type": "string",
+            "description": "Vocal qualities (e.g. bright, witty, deep, raspy, calm)"
+          }
+        }
+      }
+    },
+    "lines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["para", "start", "end", "speaker"],
+        "properties": {
+          "para": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0-indexed paragraph index within the chapter"
+          },
+          "start": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0-indexed character start offset (inclusive) within paragraph text"
+          },
+          "end": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "0-indexed character end offset (exclusive) within paragraph text"
+          },
+          "speaker": {
+            "type": "string",
+            "description": "Character ID matching a character in characters list, or 'narrator'"
+          },
+          "style": {
+            "type": ["string", "null"],
+            "description": "Emotional delivery style, e.g. 'calm, wry', 'teasing, amused', or null"
+          }
+        }
+      }
+    }
+  }
+}

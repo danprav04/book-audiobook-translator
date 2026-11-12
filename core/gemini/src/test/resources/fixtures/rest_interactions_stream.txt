@@ -1,0 +1,5 @@
+event: step.delta
+data: {"event_type":"step.delta","delta":{"type":"audio","data":"UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="}}
+
+event: step.completed
+data: {"event_type":"step.completed"}

@@ -1,0 +1,87 @@
+{
+  "models": [
+    {
+      "name": "models/gemini-3.5-live-translate-preview",
+      "baseModelId": "gemini-3.5-live-translate-preview",
+      "version": "001",
+      "displayName": "Gemini 3.5 Live Translate Preview",
+      "description": "Low-latency audio-to-audio live translation model",
+      "inputTokenLimit": 131072,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": [
+        "bidiGenerateContent"
+      ],
+      "temperature": 1.0,
+      "maxTemperature": 2.0,
+      "topP": 0.95,
+      "topK": 40
+    },
+    {
+      "name": "models/gemini-3.8-flash-tts",
+      "baseModelId": "gemini-3.8-flash-tts",
+      "version": "001",
+      "displayName": "Gemini 3.8 Flash TTS",
+      "description": "Flagship creative text-to-speech model",
+      "inputTokenLimit": 8192,
+      "outputTokenLimit": 16384,
+      "supportedGenerationMethods": [
+        "generateContent",
+        "interactions"
+      ],
+      "temperature": 1.0,
+      "maxTemperature": 2.0,
+      "topP": 0.95,
+      "topK": 40
+    },
+    {
+      "name": "models/gemini-3.8-live",
+      "baseModelId": "gemini-3.8-live",
+      "version": "001",
+      "displayName": "Gemini 3.8 Live",
+      "description": "Low-latency bidirectional audio dialog model",
+      "inputTokenLimit": 131072,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": [
+        "bidiGenerateContent"
+      ],
+      "temperature": 1.0,
+      "maxTemperature": 2.0,
+      "topP": 0.95,
+      "topK": 40
+    },
+    {
+      "name": "models/gemini-3.8-flash",
+      "baseModelId": "gemini-3.8-flash",
+      "version": "001",
+      "displayName": "Gemini 3.8 Flash",
+      "description": "Fast and versatile multimodal intelligence model",
+      "inputTokenLimit": 1048576,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": [
+        "generateContent",
+        "countTokens"
+      ],
+      "temperature": 1.0,
+      "maxTemperature": 2.0,
+      "topP": 0.95,
+      "topK": 40
+    },
+    {
+      "name": "models/gemini-3.5-transcribe-live",
+      "baseModelId": "gemini-3.5-transcribe-live",
+      "version": "001",
+      "displayName": "Gemini 3.5 Transcribe Live",
+      "description": "Real-time speech-to-text live transcription model",
+      "inputTokenLimit": 131072,
+      "outputTokenLimit": 65536,
+      "supportedGenerationMethods": [
+        "bidiGenerateContent"
+      ],
+      "temperature": 1.0,
+      "maxTemperature": 2.0,
+      "topP": 0.95,
+      "topK": 40
+    }
+  ],
+  "nextPageToken": ""
+}

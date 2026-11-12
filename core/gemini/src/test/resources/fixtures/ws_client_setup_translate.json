@@ -1,0 +1,22 @@
+{
+  "setup": {
+    "model": "models/gemini-3.5-live-translate-preview",
+    "generationConfig": {
+      "responseModalities": [
+        "AUDIO"
+      ],
+      "inputAudioTranscription": {},
+      "outputAudioTranscription": {},
+      "translationConfig": {
+        "targetLanguageCode": "pl",
+        "echoTargetLanguage": true
+      }
+    },
+    "sessionResumption": {
+      "handle": "session_handle_abc123"
+    },
+    "contextWindowCompression": {
+      "slidingWindow": {}
+    }
+  }
+}

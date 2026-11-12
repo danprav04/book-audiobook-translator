@@ -1,0 +1,7 @@
+{
+  "sessionResumptionUpdate": {
+    "newHandle": "session_handle_xyz789_resumed",
+    "resumable": true,
+    "lastConsumedClientMessageIndex": 42
+  }
+}

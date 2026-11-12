@@ -1,0 +1,50 @@
+{
+  "characters": [
+    {
+      "id": "c1",
+      "name": "Elizabeth Bennet",
+      "aliases": ["Lizzy", "Miss Bennet"],
+      "gender": "female",
+      "age": "young adult",
+      "voiceTraits": "bright, witty, lively"
+    },
+    {
+      "id": "c2",
+      "name": "Mr. Darcy",
+      "aliases": ["Fitzwilliam Darcy", "Darcy"],
+      "gender": "male",
+      "age": "adult",
+      "voiceTraits": "deep, reserved, aristocratic"
+    }
+  ],
+  "lines": [
+    {
+      "para": 0,
+      "start": 0,
+      "end": 48,
+      "speaker": "narrator",
+      "style": "calm, wry"
+    },
+    {
+      "para": 0,
+      "start": 49,
+      "end": 97,
+      "speaker": "c1",
+      "style": "teasing, amused"
+    },
+    {
+      "para": 1,
+      "start": 0,
+      "end": 64,
+      "speaker": "c2",
+      "style": "stiff, measured"
+    },
+    {
+      "para": 1,
+      "start": 65,
+      "end": 120,
+      "speaker": "narrator",
+      "style": "observant"
+    }
+  ]
+}

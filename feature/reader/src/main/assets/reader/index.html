@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Polyglot Books Foliate Reader</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #fdfdfd;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #reader-container {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      box-sizing: border-box;
+      padding: 24px;
+      color: #333333;
+    }
+    .highlight-active {
+      background-color: rgba(255, 235, 59, 0.45);
+      border-radius: 2px;
+    }
+  </style>
+</head>
+<body>
+  <div id="reader-container">
+    <h2>Polyglot Books Reader</h2>
+    <p>Foliate-js reader host initialized.</p>
+  </div>
+  <script src="foliate-bridge.js"></script>
+</body>
+</html>

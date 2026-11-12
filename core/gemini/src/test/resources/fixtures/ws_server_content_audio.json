@@ -1,0 +1,16 @@
+{
+  "serverContent": {
+    "modelTurn": {
+      "parts": [
+        {
+          "inlineData": {
+            "mimeType": "audio/pcm;rate=24000",
+            "data": "UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="
+          }
+        }
+      ]
+    },
+    "turnComplete": false,
+    "interrupted": false
+  }
+}
