@@ -9,6 +9,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
@@ -85,7 +86,8 @@ data class AudiobookPlayerUiState(
     val showLanguageDropdown: Boolean = false,
     val coverBitmap: android.graphics.Bitmap? = null,
     val coverUri: String? = null,
-    val newBookmarkNote: String = ""
+    val newBookmarkNote: String = "",
+    val errorMessage: String? = null
 )
 
 @HiltViewModel
@@ -222,9 +224,17 @@ class AudiobookPlayerViewModel @Inject constructor(
 
     fun loadBook(bookId: String) {
         if (bookDao == null || bookId.isBlank() || loadedBookId == bookId) return
-        loadedBookId = bookId
         viewModelScope.launch {
-            val book = bookDao.getBookById(bookId) ?: return@launch
+            val book = bookDao.getBookById(bookId)
+            if (book == null) {
+                loadedBookId = null
+                _uiState.value = _uiState.value.copy(
+                    bookId = bookId,
+                    errorMessage = "Book not found: $bookId"
+                )
+                return@launch
+            }
+            loadedBookId = bookId
             val dbChapters = chapterDao?.getChaptersForBook(bookId)?.firstOrNull() ?: emptyList()
             val mappedChapters = if (dbChapters.isNotEmpty()) {
                 dbChapters.map { ch ->
@@ -271,7 +281,8 @@ class AudiobookPlayerViewModel @Inject constructor(
                 durationMs = mappedChapters.firstOrNull()?.durationMs ?: 3600000L,
                 currentPositionMs = 0L,
                 coverBitmap = coverBmp,
-                coverUri = coverPath
+                coverUri = coverPath,
+                errorMessage = null
             )
             updateSubtitlesForPosition(0L)
             setupPlayer(book.filePath)
@@ -335,14 +346,28 @@ class AudiobookPlayerViewModel @Inject constructor(
                         stopTts()
                     }
                 }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    _uiState.value = _uiState.value.copy(
+                        isPlaying = false,
+                        errorMessage = error.message ?: "Playback error: ${error.errorCodeName}"
+                    )
+                    stopTts()
+                    applyAudioDucking(false)
+                }
             })
             player.setMediaItem(MediaItem.fromUri(Uri.parse(filePath)))
             player.prepare()
             exoPlayer = player
             applyAudioDucking(isTtsSpeaking)
             startPositionPolling()
-        } catch (_: Exception) {
-            // Keep UI functional even if URI cannot be opened
+        } catch (e: Exception) {
+            _uiState.value = _uiState.value.copy(
+                isPlaying = false,
+                errorMessage = e.message ?: "Failed to initialize player"
+            )
+            stopTts()
+            applyAudioDucking(false)
         }
     }
 
