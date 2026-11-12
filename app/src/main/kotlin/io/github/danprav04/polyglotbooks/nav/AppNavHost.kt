@@ -72,10 +72,11 @@ fun AppNavHost(
         ) {
             composable(Screen.Library.route) {
                 LibraryScreen(
-                    onBookClick = { bookId ->
+                    viewModel = hiltViewModel(),
+                    onOpenEbook = { bookId ->
                         navController.navigate(Screen.Reader.createRoute(bookId))
                     },
-                    onAudiobookClick = { bookId ->
+                    onOpenAudiobook = { bookId ->
                         navController.navigate(Screen.AudiobookPlayer.createRoute(bookId))
                     }
                 )
@@ -116,10 +117,13 @@ fun AppNavHost(
             }
 
             composable(Screen.Onboarding.route) {
-                // Onboarding screen placeholder routing back to Library
                 LibraryScreen(
-                    onBookClick = { bookId ->
+                    viewModel = hiltViewModel(),
+                    onOpenEbook = { bookId ->
                         navController.navigate(Screen.Reader.createRoute(bookId))
+                    },
+                    onOpenAudiobook = { bookId ->
+                        navController.navigate(Screen.AudiobookPlayer.createRoute(bookId))
                     }
                 )
             }
