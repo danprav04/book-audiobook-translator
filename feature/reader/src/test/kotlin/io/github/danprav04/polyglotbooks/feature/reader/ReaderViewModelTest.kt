@@ -40,6 +40,7 @@ class FakeBookDao : BookDao {
     override suspend fun updateBook(book: BookEntity) { this.book = book }
     override suspend fun deleteBook(book: BookEntity) {}
     override suspend fun deleteBookById(id: String) {}
+    override suspend fun insertChapters(chapters: List<ChapterEntity>) {}
 }
 
 class FakeChapterDao : ChapterDao {
@@ -130,5 +131,21 @@ class ReaderViewModelTest {
         viewModel.toggleBilingualMode()
         assertTrue(viewModel.uiState.value.isBilingualEnabled)
         assertTrue(viewModel.uiState.value.bilingualTranslations.isNotEmpty())
+    }
+
+    @Test
+    fun testInvalidOrUnreadableBookSurfacesErrorState() = runTest {
+        val bookDao = FakeBookDao()
+        val chapterDao = FakeChapterDao()
+        // Non-existent book ID
+        val savedStateHandle = SavedStateHandle(mapOf("bookId" to "missing_book_999"))
+
+        val viewModel = ReaderViewModel(bookDao, chapterDao, savedStateHandle)
+        val state = viewModel.uiState.value
+        org.junit.Assert.assertNotNull(state.errorMessage)
+        assertTrue(state.errorMessage!!.contains("missing_book_999"))
+
+        viewModel.clearError()
+        org.junit.Assert.assertNull(viewModel.uiState.value.errorMessage)
     }
 }

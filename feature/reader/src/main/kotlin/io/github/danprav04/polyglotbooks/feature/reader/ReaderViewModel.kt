@@ -45,7 +45,8 @@ data class ReaderUiState(
     val targetLanguage: String = "Spanish",
     val bilingualTranslations: Map<String, String> = emptyMap(),
     val isReportDialogOpen: Boolean = false,
-    val highlightedCfi: String? = null
+    val highlightedCfi: String? = null,
+    val errorMessage: String? = null
 )
 
 @HiltViewModel
@@ -66,14 +67,25 @@ class ReaderViewModel @Inject constructor(
 
     private fun loadBookAndChapters() {
         viewModelScope.launch {
-            val book = bookDao.getBookById(bookId)
-            if (book != null) {
-                _uiState.update { it.copy(bookTitle = book.title) }
-            }
-            chapterDao.getChaptersForBook(bookId).collect { chapters ->
-                _uiState.update { it.copy(chapters = chapters) }
+            try {
+                val book = bookDao.getBookById(bookId)
+                if (book != null) {
+                    _uiState.update { it.copy(bookTitle = book.title, errorMessage = null) }
+                } else {
+                    _uiState.update { it.copy(errorMessage = "Book not found or unreadable: $bookId") }
+                }
+                chapterDao.getChaptersForBook(bookId).collect { chapters ->
+                    _uiState.update { it.copy(chapters = chapters) }
+                }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                _uiState.update { it.copy(errorMessage = e.message ?: "Failed to load book: $bookId") }
             }
         }
+    }
+
+    fun clearError() {
+        _uiState.update { it.copy(errorMessage = null) }
     }
 
     fun setTheme(theme: ReaderTheme) {
