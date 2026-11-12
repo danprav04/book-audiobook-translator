@@ -34,9 +34,14 @@ interface BookDao {
     @Query("DELETE FROM books WHERE id = :id")
     suspend fun deleteBookById(id: String)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertChapters(chapters: List<ChapterEntity>)
+
     @androidx.room.Transaction
     suspend fun insertBookWithChapters(book: BookEntity, chapters: List<ChapterEntity>) {
         insertBook(book)
-        // Insert chapters via ChapterDao or directly if needed
+        if (chapters.isNotEmpty()) {
+            insertChapters(chapters)
+        }
     }
 }
