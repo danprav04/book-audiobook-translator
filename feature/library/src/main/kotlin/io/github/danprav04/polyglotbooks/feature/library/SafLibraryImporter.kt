@@ -2,9 +2,12 @@ package io.github.danprav04.polyglotbooks.feature.library
 
 import android.content.Context
 import android.net.Uri
+import io.github.danprav04.polyglotbooks.core.data.CoverExtractor
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
+import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
+import io.github.danprav04.polyglotbooks.core.model.Chapter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
@@ -12,6 +15,7 @@ import java.io.InputStream
 class SafLibraryImporter(
     private val context: Context,
     private val bookDao: BookDao,
+    private val chapterDao: ChapterDao? = null,
     private val chapterParser: ChapterParser = DefaultChapterParser(),
     private val metadataExtractor: MetadataExtractor = DefaultMetadataExtractor()
 ) {
@@ -41,6 +45,7 @@ class SafLibraryImporter(
             }
 
             var audioDurationMs = 3600000L
+            var extractedCoverPath: String? = null
             val bookModel = if (format.isAudiobook) {
                 var title = fileName.substringBeforeLast('.')
                 var author = "Unknown Author"
@@ -59,12 +64,18 @@ class SafLibraryImporter(
                 } catch (_: Exception) {
                     // Fallback to filename metadata
                 }
+
+                extractedCoverPath = CoverExtractor.extractCover(
+                    context, uri, uri.toString().hashCode().toString()
+                )
+
                 io.github.danprav04.polyglotbooks.core.model.Book(
                     id = uri.toString().hashCode().toString(),
                     title = title,
                     author = author,
                     format = format.name,
                     filePath = uri.toString(),
+                    coverUri = extractedCoverPath,
                     isAudiobook = true
                 )
             } else if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
@@ -85,17 +96,21 @@ class SafLibraryImporter(
             }
 
             if (bookModel != null) {
-                val parsedChapters = try {
-                    context.contentResolver.openInputStream(uri)?.use { stream ->
-                        chapterParser.parseChapters(stream, effectiveFormat)
-                    } ?: emptyList()
-                } catch (e: Throwable) {
-                    emptyList()
+                val parsedChapters = if (format.isAudiobook) {
+                    extractChapters(context, uri, bookModel.id, audioDurationMs)
+                } else {
+                    try {
+                        context.contentResolver.openInputStream(uri)?.use { stream ->
+                            chapterParser.parseChapters(stream, effectiveFormat)
+                        } ?: emptyList()
+                    } catch (e: Throwable) {
+                        emptyList()
+                    }
                 }
 
                 val chapters = if (parsedChapters.isEmpty() && format.isAudiobook) {
                     listOf(
-                        io.github.danprav04.polyglotbooks.core.model.Chapter(
+                        Chapter(
                             id = "chap_0",
                             bookId = bookModel.id,
                             index = 0,
@@ -114,7 +129,7 @@ class SafLibraryImporter(
                     author = bookModel.author,
                     format = bookModel.format,
                     filePath = bookModel.filePath,
-                    coverUri = null,
+                    coverUri = bookModel.coverUri ?: extractedCoverPath,
                     addedDate = System.currentTimeMillis(),
                     lastReadDate = System.currentTimeMillis(),
                     isAudiobook = bookModel.isAudiobook
@@ -133,12 +148,62 @@ class SafLibraryImporter(
                     )
                 }
 
+                if (chapterEntities.isNotEmpty()) {
+                    chapterDao?.insertChapters(chapterEntities)
+                }
                 bookDao.insertBookWithChapters(bookEntity, chapterEntities)
                 importedBookIds.add(bookModel.id)
             }
         }
         importedBookIds
     }
+
+    suspend fun extractChapters(
+        context: Context,
+        uri: Uri,
+        bookId: String,
+        audioDurationMs: Long = 0L
+    ): List<Chapter> = withContext(Dispatchers.IO) {
+        // 1. Check companion .cue file
+        val cueChapters = CoverExtractor.findCompanionCueChapters(context, uri, bookId)
+        if (cueChapters.isNotEmpty()) {
+            return@withContext cueChapters
+        }
+
+        // 2. Extract embedded M4B chapters (Nero chpl v0/v1 or QuickTime text track)
+        val embeddedChapters = CoverExtractor.extractChapters(context, uri, bookId)
+        if (embeddedChapters.isNotEmpty()) {
+            if (audioDurationMs > 0L) {
+                val last = embeddedChapters.last()
+                if (last.endMs < audioDurationMs) {
+                    val updated = embeddedChapters.toMutableList()
+                    updated[updated.size - 1] = last.copy(endMs = audioDurationMs)
+                    return@withContext updated
+                }
+            }
+            return@withContext embeddedChapters
+        }
+
+        // 3. Fallback to stream parsing via ChapterParser (e.g. ID3 CHAP frames)
+        val streamChapters = try {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                chapterParser.parseChapters(stream, BookFormat.M4B)
+            } ?: emptyList()
+        } catch (_: Exception) {
+            emptyList()
+        }
+        if (streamChapters.isNotEmpty()) {
+            return@withContext streamChapters
+        }
+
+        emptyList()
+    }
+
+    suspend fun extractChapters(
+        uri: Uri,
+        bookId: String,
+        audioDurationMs: Long = 0L
+    ): List<Chapter> = extractChapters(context, uri, bookId, audioDurationMs)
 
     private fun queryFileName(context: Context, uri: Uri): String? {
         var name: String? = null
