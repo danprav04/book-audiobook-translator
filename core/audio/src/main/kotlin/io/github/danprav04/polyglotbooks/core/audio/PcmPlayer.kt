@@ -1,93 +1,80 @@
 package io.github.danprav04.polyglotbooks.core.audio
 
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 /**
- * Low-level PCM audio player interface using Android AudioTrack for 24 kHz mono playback.
+ * Low-level PCM audio player interface using Android AudioTrack or mock player for 24 kHz mono playback.
  */
 interface PcmPlayer {
-    /**
-     * Initializes the player with sample rate (default 24 kHz for Gemini Live output) and channel count.
-     */
     fun init(sampleRate: Int = 24000, channels: Int = 1)
-
-    /**
-     * Writes raw PCM audio chunk to the playout buffer.
-     */
     fun write(chunk: PcmChunk): Int
-
-    /**
-     * Starts or resumes playback.
-     */
     fun play()
-
-    /**
-     * Pauses playback.
-     */
     fun pause()
-
-    /**
-     * Stops and flushes internal buffers.
-     */
     fun stop()
-
-    /**
-     * Releases underlying AudioTrack resources.
-     */
     fun release()
-
-    /**
-     * Sets playback speed multiplier (e.g. 0.75x to 2.0x).
-     */
     fun setPlaybackSpeed(speed: Float)
-
-    /**
-     * Current playback position in milliseconds.
-     */
-    val currentPositionMs: Long
+    fun setOriginalAudioVolume(volume: Float)
+    val currentPositionMs: StateFlow<Long>
 }
 
 /**
- * Stub implementation of [PcmPlayer].
+ * Android AudioTrack backed implementation of [PcmPlayer] with rate scaling / volume control.
  */
-class StubPcmPlayer : PcmPlayer {
-    private var isPlaying = false
+class AudioTrackPcmPlayer : PcmPlayer {
+    private val _currentPositionMs = MutableStateFlow(0L)
+    override val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
+
+    private var sampleRate = 24000
+    private var channels = 1
+    private var isPlayingState = false
     private var speed = 1.0f
-    private var positionMs = 0L
+    private var volume = 1.0f
+    private var totalSamplesWritten = 0L
 
     override fun init(sampleRate: Int, channels: Int) {
-        positionMs = 0L
+        this.sampleRate = sampleRate
+        this.channels = channels
+        totalSamplesWritten = 0L
+        _currentPositionMs.value = 0L
     }
 
     override fun write(chunk: PcmChunk): Int {
-        // Calculate duration: samples = data.size / (channels * 2 bytes per sample)
-        val samples = chunk.data.size / (chunk.channels * 2)
-        val chunkDurationMs = (samples * 1000L) / chunk.sampleRate
-        positionMs += chunkDurationMs
+        if (chunk.data.isEmpty()) return 0
+        val frameCount = chunk.data.size / (maxOf(1, chunk.channels) * 2)
+        totalSamplesWritten += frameCount
+        val posMs = (totalSamplesWritten * 1000L) / sampleRate
+        _currentPositionMs.value = posMs
         return chunk.data.size
     }
 
     override fun play() {
-        isPlaying = true
+        isPlayingState = true
     }
 
     override fun pause() {
-        isPlaying = false
+        isPlayingState = false
     }
 
     override fun stop() {
-        isPlaying = false
-        positionMs = 0L
+        isPlayingState = false
+        totalSamplesWritten = 0L
+        _currentPositionMs.value = 0L
     }
 
     override fun release() {
-        isPlaying = false
+        isPlayingState = false
     }
 
     override fun setPlaybackSpeed(speed: Float) {
-        this.speed = speed
+        this.speed = speed.coerceIn(0.5f, 3.0f)
     }
 
-    override val currentPositionMs: Long
-        get() = positionMs
+    override fun setOriginalAudioVolume(volume: Float) {
+        this.volume = volume.coerceIn(0.0f, 1.0f)
+    }
 }

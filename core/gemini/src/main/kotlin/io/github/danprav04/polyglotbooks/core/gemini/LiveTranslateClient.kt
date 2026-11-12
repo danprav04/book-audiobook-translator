@@ -3,9 +3,14 @@ package io.github.danprav04.polyglotbooks.core.gemini
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
 
 /**
  * Result data from a live translation turn.
@@ -33,16 +38,19 @@ interface LiveTranslateClient {
 }
 
 /**
- * Stub implementation of [LiveTranslateClient].
+ * Production implementation of [LiveTranslateClient] wrapping [LiveSession] and [LiveSessionFactory].
  */
-class StubLiveTranslateClient(
-    private val liveSession: LiveSession = StubLiveSession()
+class DefaultLiveTranslateClient(
+    private val sessionFactory: LiveSessionFactory = DefaultLiveSessionFactory()
 ) : LiveTranslateClient {
+
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var liveSession: LiveSession? = null
 
     private val _translationStream = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 64)
     override val translationStream: Flow<TranslationOutput> = _translationStream.asSharedFlow()
 
-    private var running = false
+    private var isRunning = false
 
     override suspend fun start(
         apiKey: String,
@@ -50,22 +58,43 @@ class StubLiveTranslateClient(
         echoTargetLanguage: Boolean,
         model: String
     ) {
+        val session = sessionFactory.create()
+        liveSession = session
+
         val setup = SetupConfig(
             model = model,
             generationConfig = GenerationConfig(
                 responseModalities = listOf("AUDIO"),
+                inputAudioTranscription = JsonObject(emptyMap()),
+                outputAudioTranscription = JsonObject(emptyMap()),
                 translationConfig = TranslationConfig(
                     targetLanguageCode = targetLanguageCode,
                     echoTargetLanguage = echoTargetLanguage
                 )
+            ),
+            sessionResumption = SessionResumptionConfig(),
+            contextWindowCompression = ContextWindowCompressionConfig(
+                slidingWindow = JsonObject(emptyMap())
             )
         )
-        liveSession.connect(apiKey, setup)
-        running = true
+
+        scope.launch {
+            session.incomingMessages.collect { serverMsg ->
+                val output = parseServerMessage(serverMsg)
+                if (output != null) {
+                    _translationStream.emit(output)
+                }
+            }
+        }
+
+        session.connect(apiKey, setup)
+        isRunning = true
     }
 
     override suspend fun sendAudio(chunk: PcmChunk) {
-        if (!running) return
+        val session = liveSession ?: return
+        if (!session.isConnected) return
+
         val base64 = android.util.Base64.encodeToString(chunk.data, android.util.Base64.NO_WRAP)
         val msg = LiveClientMessage.RealtimeInputMessage(
             RealtimeInputData(
@@ -75,11 +104,54 @@ class StubLiveTranslateClient(
                 )
             )
         )
-        liveSession.send(msg)
+        session.send(msg)
     }
 
     override suspend fun stop() {
-        running = false
-        liveSession.disconnect()
+        isRunning = false
+        liveSession?.disconnect()
+        liveSession = null
+    }
+
+    private fun parseServerMessage(serverMsg: LiveServerMessage): TranslationOutput? {
+        return when (serverMsg) {
+            is LiveServerMessage.ServerContentMessage -> {
+                val content = serverMsg.serverContent
+                var pcmChunk: PcmChunk? = null
+
+                content.modelTurn?.parts?.forEach { part ->
+                    part.inlineData?.let { blob ->
+                        if (blob.mimeType.startsWith("audio/")) {
+                            try {
+                                val decodedBytes = android.util.Base64.decode(blob.data, android.util.Base64.DEFAULT)
+                                pcmChunk = PcmChunk(
+                                    data = decodedBytes,
+                                    sampleRate = 24000,
+                                    channels = 1
+                                )
+                            } catch (e: Exception) {
+                                // Ignore decode error
+                            }
+                        }
+                    }
+                }
+
+                val sourceText = content.inputTranscription?.text ?: content.interimInputTranscription?.text
+                val targetText = content.outputTranscription?.text
+                val isComplete = content.turnComplete == true || content.generationComplete == true
+
+                if (pcmChunk != null || sourceText != null || targetText != null || isComplete) {
+                    TranslationOutput(
+                        audioChunk = pcmChunk,
+                        sourceTranscript = sourceText,
+                        targetTranscript = targetText,
+                        isTurnComplete = isComplete
+                    )
+                } else {
+                    null
+                }
+            }
+            else -> null
+        }
     }
 }
