@@ -86,4 +86,44 @@ class AudiobookPlayerViewModelTest {
         viewModel.toggleLiveTranslation()
         assertFalse(viewModel.uiState.value.isLiveTranslationActive)
     }
+
+    @Test
+    fun testNonExistentBookLoadingAndRetry() = kotlinx.coroutines.test.runTest {
+        val fakeBookDao = object : io.github.danprav04.polyglotbooks.core.data.db.BookDao {
+            val books = mutableMapOf<String, io.github.danprav04.polyglotbooks.core.data.db.BookEntity>()
+            override fun getAllBooks() = kotlinx.coroutines.flow.flowOf(books.values.toList())
+            override suspend fun getBookById(id: String) = books[id]
+            override fun getBooksByType(isAudiobook: Boolean) = kotlinx.coroutines.flow.flowOf(emptyList<io.github.danprav04.polyglotbooks.core.data.db.BookEntity>())
+            override suspend fun insertBook(book: io.github.danprav04.polyglotbooks.core.data.db.BookEntity) { books[book.id] = book }
+            override suspend fun insertBooks(books: List<io.github.danprav04.polyglotbooks.core.data.db.BookEntity>) {}
+            override suspend fun updateBook(book: io.github.danprav04.polyglotbooks.core.data.db.BookEntity) { books[book.id] = book }
+            override suspend fun deleteBook(book: io.github.danprav04.polyglotbooks.core.data.db.BookEntity) {}
+            override suspend fun deleteBookById(id: String) {}
+            override suspend fun insertChapters(chapters: List<io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity>) {}
+        }
+
+        val viewModel = AudiobookPlayerViewModel(fakeBookDao, null, null, null)
+
+        // Try to load non-existent book
+        viewModel.loadBook("missing_book_id")
+        assertTrue(viewModel.uiState.value.errorMessage?.contains("missing_book_id") == true)
+
+        // Now add the book and retry loading it - it must succeed rather than being permanently locked out
+        val book = io.github.danprav04.polyglotbooks.core.data.db.BookEntity(
+            id = "missing_book_id",
+            title = "Found Book",
+            author = "Author",
+            format = "M4B",
+            filePath = "",
+            coverUri = null,
+            addedDate = 0L,
+            lastReadDate = 0L,
+            isAudiobook = true
+        )
+        fakeBookDao.insertBook(book)
+
+        viewModel.loadBook("missing_book_id")
+        assertEquals("Found Book", viewModel.uiState.value.bookTitle)
+        org.junit.Assert.assertNull(viewModel.uiState.value.errorMessage)
+    }
 }
