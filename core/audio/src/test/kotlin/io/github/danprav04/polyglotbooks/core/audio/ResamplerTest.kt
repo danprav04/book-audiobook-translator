@@ -61,4 +61,18 @@ class ResamplerTest {
         assertEquals(1, result.channels)
         assertTrue(result.data.size <= 6)
     }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testResampleZeroTargetSampleRateThrows() {
+        val input = PcmChunk(ByteArray(4), sampleRate = 16000, channels = 1)
+        val resampler = LinearInterpolationResampler()
+        resampler.resample(input, targetSampleRate = 0)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testResampleNegativeTargetSampleRateThrows() {
+        val input = PcmChunk(ByteArray(4), sampleRate = 16000, channels = 1)
+        val resampler = LinearInterpolationResampler()
+        resampler.resample(input, targetSampleRate = -8000)
+    }
 }

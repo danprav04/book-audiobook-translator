@@ -74,4 +74,26 @@ class SecureKeyStoreTest {
 
         assertNull(keyStore.getApiKey())
     }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testSaveEmptyApiKeyThrows() = runTest {
+        keyStore.saveApiKey("")
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun testSaveBlankApiKeyThrows() = runTest {
+        keyStore.saveApiKey("   \t\n")
+    }
+
+    @Test
+    fun testBlankDecryptedKeyReturnsNull() = runTest {
+        // Manually encrypt blank bytes to simulate legacy or corrupt file storing blank key
+        val blankBytes = "   ".toByteArray(Charsets.UTF_8)
+        val ciphertext = fakeAead.encrypt(blankBytes, "polyglot_books_gemini_key".toByteArray(Charsets.UTF_8))
+        val encodedCiphertext = java.util.Base64.getEncoder().encodeToString(ciphertext)
+        val file = File(mockContext.filesDir, "secure_gemini_api_key.enc")
+        file.writeText(encodedCiphertext)
+
+        assertNull(keyStore.getApiKey())
+    }
 }
