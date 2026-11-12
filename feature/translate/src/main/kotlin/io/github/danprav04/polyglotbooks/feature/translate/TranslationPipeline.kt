@@ -28,6 +28,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -78,8 +80,14 @@ class TranslationPipeline(
     val state: StateFlow<TranslationPipelineState> = _state.asStateFlow()
 
     private val cleanupScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val lifecycleLock = Any()
+    private val clientMutex = Mutex()
+    private val pipelineGeneration = AtomicLong(0L)
     private var pipelineJob: Job? = null
     private var collectorJob: Job? = null
+
+    @Volatile
+    private var hasActiveClientSession = false
 
     private val currentPlaybackPositionMs = AtomicLong(0L)
     private val sourceDecodedCursorMs = AtomicLong(0L)
@@ -118,49 +126,68 @@ class TranslationPipeline(
         startPositionMs: Long = 0L,
         playbackSpeed: Float = 1.0f
     ) {
-        cancelRunningJobs()
+        val runGen: Long
+        val initialPosMs = startPositionMs.coerceAtLeast(0L)
+        val shouldStopStaleClient: Boolean
+        synchronized(lifecycleLock) {
+            runGen = pipelineGeneration.incrementAndGet()
+            cancelRunningJobsLocked()
+
+            if (apiKey.isNullOrBlank()) {
+                _state.value = _state.value.copy(
+                    isRunning = false,
+                    sourcePositionMs = startPositionMs,
+                    bufferAheadMs = 0L,
+                    errorMessage = MISSING_API_KEY_MESSAGE
+                )
+                shouldStopStaleClient = hasActiveClientSession
+            } else {
+                shouldStopStaleClient = false
+                currentPlaybackPositionMs.set(initialPosMs)
+                sourceDecodedCursorMs.set(initialPosMs)
+                receivedTranslatedDurationMs.set(0L)
+                isPaused.set(false)
+                currentPlaybackSpeed = playbackSpeed.coerceIn(0.5f, 3.0f)
+
+                resampler.reset()
+                chunker.reset()
+                pcmPlayer.init(sampleRate = OUTPUT_SAMPLE_RATE, channels = 1)
+                pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
+                pcmPlayer.play()
+
+                _state.value = TranslationPipelineState(
+                    isRunning = true,
+                    sourcePositionMs = initialPosMs,
+                    bufferAheadMs = 0L,
+                    speedMultiplier = pacer.calculateSpeedMultiplier(0L),
+                    currentSourceSubtitle = "",
+                    currentTranslatedSubtitle = "",
+                    errorMessage = null
+                )
+            }
+        }
 
         if (apiKey.isNullOrBlank()) {
-            _state.value = _state.value.copy(
-                isRunning = false,
-                sourcePositionMs = startPositionMs,
-                bufferAheadMs = 0L,
-                errorMessage = MISSING_API_KEY_MESSAGE
-            )
+            if (shouldStopStaleClient) {
+                scheduleClientStop(runGen)
+            }
             return
         }
 
-        val initialPosMs = startPositionMs.coerceAtLeast(0L)
-        currentPlaybackPositionMs.set(initialPosMs)
-        sourceDecodedCursorMs.set(initialPosMs)
-        receivedTranslatedDurationMs.set(0L)
-        isPaused.set(false)
-        currentPlaybackSpeed = playbackSpeed.coerceIn(0.5f, 3.0f)
-
-        resampler.reset()
-        chunker.reset()
-        pcmPlayer.init(sampleRate = OUTPUT_SAMPLE_RATE, channels = 1)
-        pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
-        pcmPlayer.play()
-
-        _state.value = TranslationPipelineState(
-            isRunning = true,
-            sourcePositionMs = initialPosMs,
-            bufferAheadMs = 0L,
-            speedMultiplier = pacer.calculateSpeedMultiplier(0L),
-            currentSourceSubtitle = "",
-            currentTranslatedSubtitle = "",
-            errorMessage = null
-        )
-
-        pipelineJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+        val job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            val thisPipelineJob = coroutineContext[Job]
+            val abortedByError = AtomicBoolean(false)
+            val readyToCollect = AtomicBoolean(false)
             try {
+                if (pipelineGeneration.get() != runGen) return@launch
+
                 // 1. Check cache first
                 val decodeStartMs = playCachedSegmentsIfAvailable(
                     bookId = bookId,
                     targetLanguageCode = targetLanguage.code,
                     fromMs = initialPosMs
                 )
+                if (pipelineGeneration.get() != runGen) return@launch
                 sourceDecodedCursorMs.set(decodeStartMs)
 
                 // 2. Collect incoming translated audio + transcripts from LiveTranslateClient
@@ -169,12 +196,34 @@ class TranslationPipeline(
                 val turnBuffer = ByteArrayOutputStream()
                 var turnStartSourceMs = decodeStartMs
 
-                collectorJob = launch(Dispatchers.Unconfined) {
+                val newCollectorJob = launch(Dispatchers.Unconfined) {
                     liveTranslateClient.translationStream.collect { output ->
+                        if (!readyToCollect.get() ||
+                            pipelineGeneration.get() != runGen ||
+                            abortedByError.get()
+                        ) {
+                            return@collect
+                        }
+
                         if (!output.errorMessage.isNullOrBlank()) {
+                            abortedByError.set(true)
                             _state.update {
-                                it.copy(errorMessage = output.errorMessage)
+                                it.copy(
+                                    isRunning = false,
+                                    errorMessage = output.errorMessage
+                                )
                             }
+                            try {
+                                sourceDecoder.release()
+                            } catch (_: Throwable) {
+                            }
+                            try {
+                                pcmPlayer.stop()
+                            } catch (_: Throwable) {
+                            }
+                            scheduleClientStop(runGen)
+                            thisPipelineJob?.cancel()
+                            return@collect
                         }
 
                         val newSource = output.sourceTranscript?.takeIf { it.isNotBlank() }
@@ -235,16 +284,39 @@ class TranslationPipeline(
                     }
                 }
 
-                // 3. Connect LiveTranslateClient session
-                liveTranslateClient.start(
-                    apiKey = apiKey,
-                    targetLanguageCode = targetLanguage.code,
-                    echoTargetLanguage = echoTargetLanguage,
-                    model = modelId
-                )
+                val attachedCollector = synchronized(lifecycleLock) {
+                    if (pipelineGeneration.get() == runGen) {
+                        collectorJob = newCollectorJob
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!attachedCollector) {
+                    newCollectorJob.cancel()
+                    return@launch
+                }
+
+                // 3. Connect LiveTranslateClient session (serialized with async stop() cleanup)
+                readyToCollect.set(true)
+                clientMutex.withLock {
+                    if (pipelineGeneration.get() == runGen && !abortedByError.get()) {
+                        hasActiveClientSession = true
+                        liveTranslateClient.start(
+                            apiKey = apiKey,
+                            targetLanguageCode = targetLanguage.code,
+                            echoTargetLanguage = echoTargetLanguage,
+                            model = modelId
+                        )
+                    }
+                }
+                if (pipelineGeneration.get() != runGen || abortedByError.get()) return@launch
 
                 // 4. Decode source audio -> resample to 16 kHz mono -> chunk 100 ms (3200 B) -> pace -> send
                 sourceDecoder.decode(filePath = filePath, startPositionMs = decodeStartMs).collect { decodedChunk ->
+                    if (pipelineGeneration.get() != runGen || abortedByError.get()) {
+                        throw CancellationException("Pipeline stopped")
+                    }
                     while (isPaused.get()) {
                         delay(PAUSE_POLL_MS)
                     }
@@ -256,6 +328,9 @@ class TranslationPipeline(
                     )
                     val frames = chunker.addBytes(resampled.data)
                     for (frame in frames) {
+                        if (pipelineGeneration.get() != runGen || abortedByError.get()) {
+                            throw CancellationException("Pipeline stopped")
+                        }
                         while (isPaused.get()) {
                             delay(PAUSE_POLL_MS)
                         }
@@ -275,6 +350,9 @@ class TranslationPipeline(
                             }
                         }
 
+                        if (pipelineGeneration.get() != runGen || abortedByError.get()) {
+                            throw CancellationException("Pipeline stopped")
+                        }
                         liveTranslateClient.sendAudio(
                             PcmChunk(
                                 data = frame,
@@ -286,9 +364,14 @@ class TranslationPipeline(
                     }
                 }
 
+                if (pipelineGeneration.get() != runGen || abortedByError.get()) return@launch
+
                 // Flush any remaining partial PCM bytes from the chunker
                 chunker.flush()?.let { remainder ->
-                    if (remainder.isNotEmpty()) {
+                    if (remainder.isNotEmpty() &&
+                        pipelineGeneration.get() == runGen &&
+                        !abortedByError.get()
+                    ) {
                         val remainderDurationMs = (remainder.size * 1000L) / (INPUT_SAMPLE_RATE * 2)
                         val frameStartMs = sourceDecodedCursorMs.get()
                         val frameEndMs = sourceDecodedCursorMs.addAndGet(remainderDurationMs)
@@ -308,12 +391,19 @@ class TranslationPipeline(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Throwable) {
-                _state.update {
-                    it.copy(
-                        isRunning = false,
-                        errorMessage = e.message ?: "Live translation pipeline failed"
-                    )
+                if (!abortedByError.get() && pipelineGeneration.get() == runGen) {
+                    _state.update {
+                        it.copy(
+                            isRunning = false,
+                            errorMessage = e.message ?: "Live translation pipeline failed"
+                        )
+                    }
                 }
+            }
+        }
+        synchronized(lifecycleLock) {
+            if (pipelineGeneration.get() == runGen && !job.isCompleted) {
+                pipelineJob = job
             }
         }
     }
@@ -422,26 +512,39 @@ class TranslationPipeline(
     }
 
     fun stop() {
-        isPaused.set(false)
-        cancelRunningJobs()
-        try {
-            sourceDecoder.release()
-        } catch (_: Throwable) {
-        }
-        try {
-            pcmPlayer.stop()
-        } catch (_: Throwable) {
-        }
-        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
+        val stopGen: Long
+        synchronized(lifecycleLock) {
+            stopGen = pipelineGeneration.incrementAndGet()
+            isPaused.set(false)
+            cancelRunningJobsLocked()
             try {
-                liveTranslateClient.stop()
+                sourceDecoder.release()
             } catch (_: Throwable) {
             }
+            try {
+                pcmPlayer.stop()
+            } catch (_: Throwable) {
+            }
+            _state.update { it.copy(isRunning = false) }
         }
-        _state.update { it.copy(isRunning = false) }
+        scheduleClientStop(stopGen)
     }
 
-    private fun cancelRunningJobs() {
+    private fun scheduleClientStop(targetGen: Long) {
+        cleanupScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            clientMutex.withLock {
+                if (pipelineGeneration.get() == targetGen) {
+                    hasActiveClientSession = false
+                    try {
+                        liveTranslateClient.stop()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+    }
+
+    private fun cancelRunningJobsLocked() {
         collectorJob?.cancel()
         collectorJob = null
         pipelineJob?.cancel()

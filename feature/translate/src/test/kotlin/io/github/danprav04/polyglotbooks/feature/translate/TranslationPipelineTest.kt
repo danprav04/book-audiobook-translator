@@ -12,18 +12,23 @@ import io.github.danprav04.polyglotbooks.core.gemini.LiveTranslateClient
 import io.github.danprav04.polyglotbooks.core.gemini.TranslationOutput
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class TranslationPipelineTest {
@@ -222,5 +227,152 @@ class TranslationPipelineTest {
         assertTrue(fakeDecoder.released)
         assertTrue(fakeClient.stopped)
         assertNotNull(fakeClient.startedModel)
+    }
+
+    @Test
+    fun testTerminalErrorMessageStopsDecodingAndSetsIsRunningFalse() = runTest {
+        val chunksDecoded = AtomicInteger(0)
+        val fakeDecoder = object : SourceDecoder {
+            var released = false
+            override fun decode(filePath: String, startPositionMs: Long, durationMs: Long): Flow<PcmChunk> = flow {
+                repeat(100) {
+                    chunksDecoded.incrementAndGet()
+                    emit(PcmChunk(ByteArray(3200) { 1 }, sampleRate = 16000, channels = 1, timestampMs = it * 100L))
+                    delay(20)
+                }
+            }
+
+            override fun release() {
+                released = true
+            }
+        }
+
+        val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
+        val sentChunks = AtomicInteger(0)
+        val fakeClient = object : LiveTranslateClient {
+            override val translationStream: Flow<TranslationOutput> = outputFlow.asSharedFlow()
+            override suspend fun start(
+                apiKey: String,
+                targetLanguageCode: String,
+                echoTargetLanguage: Boolean,
+                model: String
+            ) {}
+
+            override suspend fun sendAudio(chunk: PcmChunk) {
+                if (sentChunks.incrementAndGet() == 1) {
+                    outputFlow.emit(TranslationOutput(errorMessage = "WebSocket closed unexpectedly: code=1008"))
+                }
+            }
+
+            override suspend fun stop() {}
+        }
+
+        val realPlayer = AudioTrackPcmPlayer { _, _ -> null }
+        val pipeline = TranslationPipeline(
+            sourceDecoder = fakeDecoder,
+            resampler = StreamingLinearResampler(),
+            chunker = Chunker(3200),
+            pacer = Pacer(),
+            liveTranslateClient = fakeClient,
+            pcmPlayer = realPlayer,
+            enablePacingDelay = false
+        )
+
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "book-err",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.SPANISH,
+            apiKey = "valid-key"
+        )
+        advanceUntilIdle()
+
+        val state = pipeline.state.value
+        assertFalse(state.isRunning)
+        assertEquals("WebSocket closed unexpectedly: code=1008", state.errorMessage)
+        assertTrue(fakeDecoder.released)
+        assertTrue("Decoding must stop early after terminal errorMessage", chunksDecoded.get() < 10)
+    }
+
+    @Test
+    fun testRapidStopFollowedByStartDoesNotClobberNewSession() = runTest {
+        val fakeDecoder = object : SourceDecoder {
+            override fun decode(filePath: String, startPositionMs: Long, durationMs: Long): Flow<PcmChunk> = flow {}
+            override fun release() {}
+        }
+
+        val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
+        val stopGate = CompletableDeferred<Unit>()
+        val firstStopDone = CompletableDeferred<Unit>()
+        val events = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val fakeClient = object : LiveTranslateClient {
+            @Volatile
+            var active = false
+
+            override val translationStream: Flow<TranslationOutput> = outputFlow.asSharedFlow()
+            override suspend fun start(
+                apiKey: String,
+                targetLanguageCode: String,
+                echoTargetLanguage: Boolean,
+                model: String
+            ) {
+                events.add("start:$targetLanguageCode")
+                active = true
+            }
+
+            override suspend fun sendAudio(chunk: PcmChunk) {}
+
+            override suspend fun stop() {
+                events.add("stop:begin")
+                stopGate.await()
+                active = false
+                events.add("stop:end")
+                firstStopDone.complete(Unit)
+            }
+        }
+
+        val realPlayer = AudioTrackPcmPlayer { _, _ -> null }
+        val pipeline = TranslationPipeline(
+            sourceDecoder = fakeDecoder,
+            resampler = StreamingLinearResampler(),
+            chunker = Chunker(3200),
+            pacer = Pacer(),
+            liveTranslateClient = fakeClient,
+            pcmPlayer = realPlayer,
+            enablePacingDelay = false
+        )
+
+        // Start session 1
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "book-1",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.FRENCH,
+            apiKey = "valid-key"
+        )
+        assertTrue(fakeClient.active)
+
+        // Rapid stop() -> start() while stop() is suspended on cleanupScope
+        pipeline.stop()
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "book-1",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.GERMAN,
+            apiKey = "valid-key"
+        )
+
+        // Unblock async stop cleanup on Dispatchers.IO and wait for it to release clientMutex
+        stopGate.complete(Unit)
+        withContext(Dispatchers.Default) {
+            firstStopDone.await()
+        }
+        advanceUntilIdle()
+
+        // New session must not be stopped by older stop() cleanup
+        assertTrue(pipeline.state.value.isRunning)
+        assertTrue(fakeClient.active)
+        assertEquals(listOf("start:fr", "stop:begin", "stop:end", "start:de"), events.toList())
+        pipeline.stop()
     }
 }
