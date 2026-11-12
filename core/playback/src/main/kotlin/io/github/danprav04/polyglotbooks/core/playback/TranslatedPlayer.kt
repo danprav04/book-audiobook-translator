@@ -1,8 +1,5 @@
 package io.github.danprav04.polyglotbooks.core.playback
 
-import androidx.media3.common.PlaybackParameters
-import androidx.media3.common.Player
-
 /**
  * Controller interface for translated audiobook playback.
  * Coordinates playout of the translated audio stream while tracking the source audiobook timeline.
@@ -60,6 +57,12 @@ class StubTranslatedPlayer : TranslatedPlayer {
     private var _speed = 1.0f
     private var _duckLevel = 0.0f
 
+    val playbackSpeed: Float
+        get() = _speed
+
+    val duckLevel: Float
+        get() = _duckLevel
+
     override fun prepare(bookId: Long, targetLanguageCode: String) {
         _positionMs = 0L
         _durationMs = 3600_000L // 1 hour mock
@@ -75,15 +78,15 @@ class StubTranslatedPlayer : TranslatedPlayer {
     }
 
     override fun seekTo(positionMs: Long) {
-        _positionMs = positionMs
+        _positionMs = positionMs.coerceAtLeast(0L)
     }
 
     override fun setPlaybackSpeed(speed: Float) {
-        _speed = speed
+        _speed = speed.coerceIn(0.5f, 3.0f)
     }
 
     override fun setOriginalAudioDuckLevel(level: Float) {
-        _duckLevel = level
+        _duckLevel = level.coerceIn(0.0f, 1.0f)
     }
 
     override fun release() {
