@@ -7,12 +7,13 @@ import android.webkit.JavascriptInterface
  */
 interface ReaderBridgeListener {
     fun onParagraphsExtracted(chapterIndex: Int, paragraphsJson: String)
-    fun onPageTurned(cfi: String)
+    fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String)
     fun onSelectionChanged(cfiRange: String, selectedText: String)
+    fun onSearchResults(resultsJson: String)
 }
 
 /**
- * JavaScriptInterface exposed to WebView foliate host.
+ * JavaScriptInterface exposed to WebView foliate host (`AndroidReaderBridge`).
  */
 class ReaderBridge(
     private val listener: ReaderBridgeListener? = null
@@ -23,12 +24,17 @@ class ReaderBridge(
     }
 
     @JavascriptInterface
-    fun onPageTurn(cfi: String) {
-        listener?.onPageTurned(cfi)
+    fun onPageTurn(cfi: String, fraction: Float, chapterTitle: String) {
+        listener?.onPageTurned(cfi, fraction, chapterTitle)
     }
 
     @JavascriptInterface
     fun onSelection(cfiRange: String, text: String) {
         listener?.onSelectionChanged(cfiRange, text)
+    }
+
+    @JavascriptInterface
+    fun postSearchResults(resultsJson: String) {
+        listener?.onSearchResults(resultsJson)
     }
 }

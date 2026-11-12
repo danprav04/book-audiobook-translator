@@ -5,36 +5,73 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>Polyglot Books Foliate Reader</title>
   <style>
+    :root {
+      --bg-color: #fdfdfd;
+      --text-color: #333333;
+      --highlight-bg: rgba(255, 235, 59, 0.45);
+    }
+    body.theme-light {
+      --bg-color: #ffffff;
+      --text-color: #212121;
+      --highlight-bg: rgba(255, 235, 59, 0.45);
+    }
+    body.theme-sepia {
+      --bg-color: #f4ecd8;
+      --text-color: #5c4033;
+      --highlight-bg: rgba(218, 165, 32, 0.35);
+    }
+    body.theme-dark {
+      --bg-color: #121212;
+      --text-color: #e0e0e0;
+      --highlight-bg: rgba(255, 193, 7, 0.3);
+    }
+
     html, body {
       margin: 0;
       padding: 0;
       width: 100%;
       height: 100%;
-      overflow: hidden;
-      background-color: #fdfdfd;
+      background-color: var(--bg-color);
+      color: var(--text-color);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      transition: background-color 0.3s, color 0.3s;
     }
     #reader-container {
       width: 100%;
       height: 100%;
       display: flex;
       flex-direction: column;
-      justify-content: center;
-      align-items: center;
       box-sizing: border-box;
       padding: 24px;
-      color: #333333;
+      overflow-y: auto;
+    }
+    h2 {
+      margin-top: 0;
+      color: var(--text-color);
+    }
+    p {
+      line-height: 1.6;
+      margin-bottom: 16px;
     }
     .highlight-active {
-      background-color: rgba(255, 235, 59, 0.45);
-      border-radius: 2px;
+      background-color: var(--highlight-bg);
+      border-radius: 4px;
+      padding: 2px 4px;
+    }
+    .bilingual-translation {
+      color: #757575;
+      font-style: italic;
+      margin-top: 4px;
+      margin-bottom: 16px;
     }
   </style>
 </head>
-<body>
+<body class="theme-light">
   <div id="reader-container">
-    <h2>Polyglot Books Reader</h2>
-    <p>Foliate-js reader host initialized.</p>
+    <h2>Chapter 1: Introduction</h2>
+    <p data-cfi="epubcfi(/6/1!/4/2/1:0)" data-id="p_0">Welcome to Polyglot Books. This is an immersive ebook reader and audiobook translator designed for multi-language learners and literature enthusiasts.</p>
+    <p data-cfi="epubcfi(/6/1!/4/2/1:1)" data-id="p_1">With advanced AI narration engines like Gemini Flash TTS and real-time synchronization, you can follow along effortlessly.</p>
+    <p data-cfi="epubcfi(/6/1!/4/2/1:2)" data-id="p_2">Switch between Light, Sepia, and Dark themes, adjust font sizes, and view side-by-side translations instantly.</p>
   </div>
   <script src="foliate-bridge.js"></script>
 </body>

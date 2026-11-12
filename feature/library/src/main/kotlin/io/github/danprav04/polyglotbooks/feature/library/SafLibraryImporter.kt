@@ -26,15 +26,33 @@ class SafLibraryImporter(
             }
 
             val fileName = queryFileName(context, uri) ?: uri.lastPathSegment ?: "unknown"
-            val format = FormatDetector.detect(context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf(), fileName)
+            val rawBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
+            val format = FormatDetector.detect(rawBytes, fileName)
 
-            val bookModel = context.contentResolver.openInputStream(uri)?.use { stream ->
-                metadataExtractor.extractMetadata(stream, format, fileName)
+            val effectiveBytes = if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
+                EbookFormatConverter.convertToEpub(
+                    rawBytes.inputStream(),
+                    format,
+                    title = fileName.substringBeforeLast('.'),
+                    author = "Unknown Author"
+                )
+            } else {
+                rawBytes
+            }
+
+            val effectiveFormat = if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
+                BookFormat.EPUB
+            } else {
+                format
+            }
+
+            val bookModel = effectiveBytes.inputStream().use { stream ->
+                metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
             }?.copy(filePath = uri.toString())
 
             if (bookModel != null) {
-                val chapters = context.contentResolver.openInputStream(uri)?.use { stream ->
-                    chapterParser.parseChapters(stream, format)
+                val chapters = effectiveBytes.inputStream().use { stream ->
+                    chapterParser.parseChapters(stream, effectiveFormat)
                 } ?: emptyList()
 
                 val bookEntity = BookEntity(
