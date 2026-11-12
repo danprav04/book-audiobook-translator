@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.narration
 
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
@@ -24,13 +25,18 @@ class GeminiLiveEngine(
     override suspend fun voices(): List<VoiceInfo> = fallbackEngine.voices()
 
     override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
-        val outputText = transcriptProvider(request)
-        val similarity = calculateWordOverlapSimilarity(request.text, outputText)
+        try {
+            val outputText = transcriptProvider(request)
+            val similarity = calculateWordOverlapSimilarity(request.text, outputText)
 
-        if (similarity >= 0.75) {
-            val dummyData = ByteArray(4800) { 0 }
-            emit(PcmChunk(data = dummyData, sampleRate = 24000, channels = 1))
-        } else {
+            if (similarity >= 0.75) {
+                val dummyData = ByteArray(4800) { 0 }
+                emit(PcmChunk(data = dummyData, sampleRate = 24000, channels = 1))
+            } else {
+                emitAll(fallbackEngine.synthesize(request))
+            }
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
             emitAll(fallbackEngine.synthesize(request))
         }
     }

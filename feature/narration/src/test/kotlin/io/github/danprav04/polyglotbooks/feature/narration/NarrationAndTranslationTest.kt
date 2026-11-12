@@ -57,6 +57,29 @@ class NarrationAndTranslationTest {
     }
 
     @Test
+    fun `GeminiLiveEngine gracefully falls back to TTS engine when transcriptProvider throws an exception`() = runTest {
+        val fallbackMarker = ByteArray(16) { 99 }
+        val fakeFallback = object : NarrationEngine {
+            override val id = EngineId.GEMINI_TTS
+            override val capabilities = EngineCapabilities(true, true, true, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> =
+                flowOf(PcmChunk(fallbackMarker, 24000, 1))
+        }
+
+        val failingEngine = GeminiLiveEngine(
+            fallbackEngine = fakeFallback,
+            transcriptProvider = { throw java.io.IOException("WebSocket connection lost") }
+        )
+
+        val chunk = failingEngine.synthesize(
+            SynthesisRequest(text = "Any book sentence", voiceId = "Kore")
+        ).first()
+        assertEquals(16, chunk.data.size)
+        assertEquals(99.toByte(), chunk.data[0])
+    }
+
+    @Test
     fun `ChapterTranslator returns bilingual paragraph mapping and preserves lines`() = runTest {
         val translator = ChapterTranslator()
         val paragraphs = mapOf("p1" to "Hello world", "p2" to "Good morning")
