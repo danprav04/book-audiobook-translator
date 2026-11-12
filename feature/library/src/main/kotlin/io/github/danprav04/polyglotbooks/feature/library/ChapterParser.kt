@@ -23,7 +23,8 @@ class DefaultChapterParser : ChapterParser {
     override suspend fun parseChapters(file: File, format: BookFormat): List<Chapter> {
         if (format.isAudiobook) {
             // Check companion .cue file
-            val cueFile = File(file.parentFile, "${file.nameWithoutExtension}.cue")
+            val parent = file.parentFile
+            val cueFile = if (parent != null) File(parent, "${file.nameWithoutExtension}.cue") else File("${file.nameWithoutExtension}.cue")
             if (cueFile.exists() && cueFile.canRead()) {
                 val chapters = try {
                     cueFile.inputStream().use { CueSheetChapterParser().parseChapters(it, BookFormat.CUE) }
@@ -127,7 +128,7 @@ class Id3ChapChapterParser {
                 try {
                     val size = ByteBuffer.wrap(bytes, i + 4, 4).order(ByteOrder.BIG_ENDIAN).int
                     val frameDataStart = i + 10
-                    if (frameDataStart + size <= bytes.size) {
+                    if (size > 0 && frameDataStart + size <= bytes.size) {
                         var idx = frameDataStart
                         while (idx < frameDataStart + size && bytes[idx] != 0.toByte()) {
                             idx++
@@ -148,7 +149,7 @@ class Id3ChapChapterParser {
                                     bytes[subIdx+2] == 'T'.code.toByte() &&
                                     bytes[subIdx+3] == '2'.code.toByte()) {
                                     val subSize = ByteBuffer.wrap(bytes, subIdx + 4, 4).order(ByteOrder.BIG_ENDIAN).int
-                                    if (subIdx + 10 + subSize <= subDataEnd) {
+                                    if (subSize > 0 && subIdx + 10 + subSize <= subDataEnd) {
                                         val encoding = bytes[subIdx + 10]
                                         val textBytes = bytes.copyOfRange(subIdx + 11, subIdx + 10 + subSize)
                                         title = if (encoding == 1.toByte() || encoding == 2.toByte()) {
@@ -173,8 +174,10 @@ class Id3ChapChapterParser {
                                 )
                             )
                         }
+                        i += 10 + size
+                    } else {
+                        i++
                     }
-                    i += 10 + size
                 } catch (e: Exception) {
                     i++
                 }

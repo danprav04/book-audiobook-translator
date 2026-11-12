@@ -75,6 +75,40 @@ class ChapterParserTest {
     }
 
     @Test
+    fun testId3ChapParserCorruptedNonPositiveSizeDoesNotHang() {
+        val parser = Id3ChapChapterParser()
+        val frameId = "CHAP".toByteArray(Charsets.ISO_8859_1)
+        val flags = byteArrayOf(0, 0)
+
+        // Negative size (-10)
+        val negSizeBytes = ByteBuffer.allocate(4).putInt(-10).array()
+        val corruptBytes1 = frameId + negSizeBytes + flags + ByteArray(20)
+        val chapters1 = parser.parseChapters(corruptBytes1)
+        assertEquals(0, chapters1.size)
+
+        // Zero size (0)
+        val zeroSizeBytes = ByteBuffer.allocate(4).putInt(0).array()
+        val corruptBytes2 = frameId + zeroSizeBytes + flags + ByteArray(20)
+        val chapters2 = parser.parseChapters(corruptBytes2)
+        assertEquals(0, chapters2.size)
+    }
+
+    @Test
+    fun testDefaultChapterParserWithNullParent() = kotlinx.coroutines.test.runTest {
+        val parser = DefaultChapterParser()
+        // File in current directory with null parentFile
+        val orphanFile = java.io.File("orphan_test_${System.currentTimeMillis()}.m4b")
+        orphanFile.writeBytes(ByteArray(0))
+        try {
+            org.junit.Assert.assertNull(orphanFile.parentFile)
+            val chapters = parser.parseChapters(orphanFile, BookFormat.M4B)
+            assertEquals(0, chapters.size)
+        } finally {
+            orphanFile.delete()
+        }
+    }
+
+    @Test
     fun testMp4ChapterParser() {
         val count = 1
         val startTime100ns = 20000000L
