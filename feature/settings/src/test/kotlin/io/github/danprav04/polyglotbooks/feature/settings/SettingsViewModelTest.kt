@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.settings
 
 import app.cash.turbine.test
+import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
@@ -44,6 +45,7 @@ class SettingsViewModelTest {
     private val cacheLimitBytesFlow = MutableStateFlow(1024L * 1024L * 1024L)
     private val duckLevelFlow = MutableStateFlow(0.15f)
     private val echoTargetLanguageFlow = MutableStateFlow(false)
+    private val featureUsageStatsFlow = MutableStateFlow(FeatureUsageStats())
 
     @Before
     fun setUp() {
@@ -56,6 +58,7 @@ class SettingsViewModelTest {
             coEvery { cacheLimitBytes } returns cacheLimitBytesFlow
             coEvery { duckLevel } returns duckLevelFlow
             coEvery { echoTargetLanguage } returns echoTargetLanguageFlow
+            coEvery { featureUsageStats } returns featureUsageStatsFlow
         }
 
         secureKeyStore = mockk(relaxed = true) {

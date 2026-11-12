@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.narration
 
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
 
 /**
@@ -9,7 +10,8 @@ import kotlinx.coroutines.flow.flow
  * and transcript similarity check, falling back to GeminiTtsEngine if paraphrased.
  */
 class GeminiLiveEngine(
-    private val fallbackEngine: NarrationEngine = GeminiTtsEngine()
+    private val fallbackEngine: NarrationEngine = GeminiTtsEngine(),
+    private val transcriptProvider: (SynthesisRequest) -> String = { it.text }
 ) : NarrationEngine {
     override val id: EngineId = EngineId.GEMINI_LIVE
     override val capabilities: EngineCapabilities = EngineCapabilities(
@@ -22,21 +24,15 @@ class GeminiLiveEngine(
     override suspend fun voices(): List<VoiceInfo> = fallbackEngine.voices()
 
     override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
-        // Simulate live synthesis and verify verbatim output
-        val simulatedOutputText = request.text
-        val similarity = calculateWordOverlapSimilarity(request.text, simulatedOutputText)
+        val outputText = transcriptProvider(request)
+        val similarity = calculateWordOverlapSimilarity(request.text, outputText)
 
         if (similarity >= 0.75) {
             val dummyData = ByteArray(4800) { 0 }
             emit(PcmChunk(data = dummyData, sampleRate = 24000, channels = 1))
         } else {
-            // Fallback
             emitAll(fallbackEngine.synthesize(request))
         }
-    }
-
-    private fun emitAll(flow: Flow<PcmChunk>) = kotlinx.coroutines.flow.flow {
-        kotlinx.coroutines.flow.collect { emit(it) }
     }
 
     fun calculateWordOverlapSimilarity(source: String, output: String): Double {

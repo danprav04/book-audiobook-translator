@@ -164,21 +164,15 @@ class ReaderViewModel @Inject constructor(
     override fun onSelectionChanged(cfiRange: String, selectedText: String) {}
 
     override fun onSearchResults(resultsJson: String) {
-        try {
-            val jsonArray = JSONArray(resultsJson)
-            val list = mutableListOf<SearchResultItem>()
-            for (i in 0 until jsonArray.length()) {
-                val obj = jsonArray.getJSONObject(i)
-                list.add(
-                    SearchResultItem(
-                        cfi = obj.getString("cfi"),
-                        excerpt = obj.getString("excerpt")
-                    )
-                )
-            }
-            _uiState.update { it.copy(searchResults = list) }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        val objectRegex = Regex("""\{[^{}]*\}""")
+        val cfiRegex = Regex(""""cfi"\s*:\s*"([^"]*)"""")
+        val excerptRegex = Regex(""""excerpt"\s*:\s*"([^"]*)"""")
+        val list = objectRegex.findAll(resultsJson).mapNotNull { match ->
+            val obj = match.value
+            val cfi = cfiRegex.find(obj)?.groupValues?.get(1) ?: return@mapNotNull null
+            val excerpt = excerptRegex.find(obj)?.groupValues?.get(1) ?: ""
+            SearchResultItem(cfi = cfi, excerpt = excerpt)
+        }.toList()
+        _uiState.update { it.copy(searchResults = list) }
     }
 }

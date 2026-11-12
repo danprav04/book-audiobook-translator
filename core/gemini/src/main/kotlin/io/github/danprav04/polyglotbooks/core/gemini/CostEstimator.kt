@@ -3,7 +3,7 @@ package io.github.danprav04.polyglotbooks.core.gemini
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 
 /**
- * Calculates estimated token usage and dollar costs based on Google AI Studio pricing.
+ * Tracks feature usage and calculates estimated dollar costs based on Google AI Studio pricing.
  */
 object CostEstimator {
 
@@ -15,8 +15,10 @@ object CostEstimator {
 
     /**
      * Estimates cost in USD for a given duration in seconds for an audio model.
+     * If isFreeTier is true, cost is $0.00.
      */
-    fun estimateAudioCost(role: ModelRole, durationSeconds: Double): Double {
+    fun estimateAudioCost(role: ModelRole, durationSeconds: Double, isFreeTier: Boolean = false): Double {
+        if (isFreeTier) return 0.0
         val minutes = durationSeconds / 60.0
         return when (role) {
             ModelRole.LIVE_TRANSLATE -> minutes * LIVE_TRANSLATE_PRICE_PER_MINUTE
@@ -28,8 +30,10 @@ object CostEstimator {
 
     /**
      * Estimates cost in USD for text analysis / translation based on token counts.
+     * If isFreeTier is true, cost is $0.00.
      */
-    fun estimateTextCost(inputTokens: Long, outputTokens: Long): Double {
+    fun estimateTextCost(inputTokens: Long, outputTokens: Long, isFreeTier: Boolean = false): Double {
+        if (isFreeTier) return 0.0
         val inputCost = (inputTokens / 1_000_000.0) * FLASH_TEXT_INPUT_PRICE_PER_M_TOKENS
         val outputCost = (outputTokens / 1_000_000.0) * FLASH_TEXT_OUTPUT_PRICE_PER_M_TOKENS
         return inputCost + outputCost

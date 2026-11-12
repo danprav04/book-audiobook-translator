@@ -6,6 +6,9 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.util.UUID
 
+/**
+ * Raw data structures matching the LLM JSON schema.
+ */
 @Serializable
 data class RawCastingResponse(
     val characters: List<RawCharacter> = emptyList(),
@@ -31,13 +34,17 @@ data class RawLine(
     val style: String? = null
 )
 
+/**
+ * Normalized result of casting analysis.
+ */
 data class CastingResult(
     val characters: List<Character>,
     val lines: List<NarrationLine>
 )
 
 /**
- * CastingService coordinates character analysis and span validation.
+ * CastingService produces the structured prompt schema for LLM character attribution
+ * and validates/normalizes the JSON response against chapter paragraph texts.
  */
 class CastingService {
 
@@ -47,6 +54,9 @@ class CastingService {
         coerceInputValues = true
     }
 
+    /**
+     * Returns JSON schema describing expected character attribution output.
+     */
     fun getPromptJsonSchema(): String {
         return """
         {
@@ -94,52 +104,168 @@ class CastingService {
         bookId: String = "book-1",
         chapterId: String = "chap-1"
     ): CastingResult {
-        val raw = try {
-            json.decodeFromString<RawCastingResponse>(jsonResponse)
-        } catch (e: Exception) {
-            RawCastingResponse()
+        val result = validateAndNormalize(
+            rawJson = jsonResponse,
+            paragraphTexts = paragraphs,
+            bookId = bookId,
+            chapterId = chapterId
+        )
+        if (existingCharacters.isEmpty()) return result
+        val existingByName = existingCharacters.associateBy { it.name.lowercase() }
+        val mergedChars = result.characters.map { c ->
+            val existing = existingByName[c.name.lowercase()]
+            if (existing != null) c.copy(assignedVoiceId = existing.assignedVoiceId) else c
+        }
+        return result.copy(characters = mergedChars)
+    }
+
+    /**
+     * Parses rawJson and validates/normalizes it against chapter paragraphs.
+     * Guarantees:
+     * 1. 0 <= start < end <= paragraph.length
+     * 2. Non-overlapping spans within paragraph
+     * 3. Gaps between spans (and before first / after last) are auto-filled with speaker = "narrator"
+     * 4. Unknown character IDs fall back to "narrator"
+     * 5. If JSON is invalid or parsing fails, safe fallback: all paragraphs read by "narrator"
+     */
+    fun validateAndNormalize(
+        rawJson: String,
+        paragraphTexts: List<String>,
+        bookId: String = "book-default",
+        chapterId: String = "chap-default"
+    ): CastingResult {
+        val parsed = try {
+            json.decodeFromString<RawCastingResponse>(rawJson)
+        } catch (_: Exception) {
+            return createFullNarratorFallback(paragraphTexts, bookId, chapterId)
         }
 
-        val existingMap = existingCharacters.associateBy { it.name.lowercase() }
-        val characters = raw.characters.map { rc ->
-            val existing = existingMap[rc.name.lowercase()]
+        val characterMap = parsed.characters.associateBy { it.id }
+        val finalCharacters = parsed.characters.map { raw ->
             Character(
-                id = existing?.id ?: rc.id.ifEmpty { "char-${UUID.randomUUID()}" },
+                id = raw.id,
                 bookId = bookId,
-                name = rc.name,
-                aliases = rc.aliases,
-                gender = rc.gender,
-                age = rc.age,
-                voiceTraits = rc.voiceTraits,
-                assignedVoiceId = existing?.assignedVoiceId
+                name = raw.name,
+                aliases = raw.aliases,
+                gender = raw.gender,
+                age = raw.age,
+                voiceTraits = raw.voiceTraits
             )
         }
 
-        val charIds = characters.map { it.id }.toSet() + "narrator"
+        val normalizedLines = mutableListOf<NarrationLine>()
 
-        val validLines = mutableListOf<NarrationLine>()
-        for (rl in raw.lines) {
-            if (rl.para !in paragraphs.indices) continue
-            val textLen = paragraphs[rl.para].length
-            if (rl.start < 0 || rl.end > textLen || rl.start >= rl.end) continue
+        // Group valid lines by paragraph index
+        val linesByPara = parsed.lines
+            .filter { it.para in paragraphTexts.indices }
+            .groupBy { it.para }
 
-            // Ensure non-overlapping or validate span boundaries per paragraph
-            val speaker = if (charIds.contains(rl.speaker)) rl.speaker else "narrator"
+        for (paraIndex in paragraphTexts.indices) {
+            val text = paragraphTexts[paraIndex]
+            val textLength = text.length
+            if (textLength == 0) continue
 
-            validLines.add(
-                NarrationLine(
-                    id = "line-${UUID.randomUUID()}",
-                    chapterId = chapterId,
-                    paraIndex = rl.para,
-                    startOffset = rl.start,
-                    endOffset = rl.end,
-                    speakerId = speaker,
-                    style = rl.style,
-                    cfi = "epubcfi(/6/4!/4/2/1:${rl.start})"
+            val rawLinesForPara = linesByPara[paraIndex] ?: emptyList()
+
+            // Filter bounds: 0 <= start < end <= textLength
+            val validSpans = rawLinesForPara
+                .filter { it.start in 0 until textLength && it.end in (it.start + 1)..textLength }
+                .sortedBy { it.start }
+
+            // Resolve overlapping spans by advancing start or clipping
+            val nonOverlappingSpans = mutableListOf<RawLine>()
+            var currentPos = 0
+
+            for (span in validSpans) {
+                if (span.end <= currentPos) {
+                    continue
+                }
+                val adjustedStart = maxOf(span.start, currentPos)
+                if (adjustedStart < span.end) {
+                    val resolvedSpeaker = if (span.speaker == "narrator" || characterMap.containsKey(span.speaker)) {
+                        span.speaker
+                    } else {
+                        "narrator"
+                    }
+                    nonOverlappingSpans.add(
+                        span.copy(
+                            start = adjustedStart,
+                            end = span.end,
+                            speaker = resolvedSpeaker
+                        )
+                    )
+                    currentPos = span.end
+                }
+            }
+
+            // Fill gaps with narrator
+            var cursor = 0
+            for (span in nonOverlappingSpans) {
+                if (span.start > cursor) {
+                    normalizedLines.add(
+                        NarrationLine(
+                            id = UUID.randomUUID().toString(),
+                            chapterId = chapterId,
+                            paraIndex = paraIndex,
+                            startOffset = cursor,
+                            endOffset = span.start,
+                            speakerId = "narrator",
+                            style = null
+                        )
+                    )
+                }
+                normalizedLines.add(
+                    NarrationLine(
+                        id = UUID.randomUUID().toString(),
+                        chapterId = chapterId,
+                        paraIndex = paraIndex,
+                        startOffset = span.start,
+                        endOffset = span.end,
+                        speakerId = span.speaker,
+                        style = span.style
+                    )
                 )
-            )
+                cursor = span.end
+            }
+
+            if (cursor < textLength) {
+                normalizedLines.add(
+                    NarrationLine(
+                        id = UUID.randomUUID().toString(),
+                        chapterId = chapterId,
+                        paraIndex = paraIndex,
+                        startOffset = cursor,
+                        endOffset = textLength,
+                        speakerId = "narrator",
+                        style = null
+                    )
+                )
+            }
         }
 
-        return CastingResult(characters, validLines)
+        return CastingResult(
+            characters = finalCharacters,
+            lines = normalizedLines
+        )
+    }
+
+    private fun createFullNarratorFallback(
+        paragraphTexts: List<String>,
+        bookId: String,
+        chapterId: String
+    ): CastingResult {
+        val lines = paragraphTexts.mapIndexedNotNull { index, text ->
+            if (text.isEmpty()) null
+            else NarrationLine(
+                id = UUID.randomUUID().toString(),
+                chapterId = chapterId,
+                paraIndex = index,
+                startOffset = 0,
+                endOffset = text.length,
+                speakerId = "narrator",
+                style = null
+            )
+        }
+        return CastingResult(characters = emptyList(), lines = lines)
     }
 }

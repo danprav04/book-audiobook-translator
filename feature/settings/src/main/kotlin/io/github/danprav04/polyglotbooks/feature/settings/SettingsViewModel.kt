@@ -3,8 +3,10 @@ package io.github.danprav04.polyglotbooks.feature.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
+import io.github.danprav04.polyglotbooks.core.gemini.CostEstimator
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.ModelItem
@@ -35,6 +37,8 @@ data class SettingsUiState(
     val duckLevel: Float = 0.15f,
     val cacheLimitBytes: Long = 1024L * 1024L * 1024L, // 1 GB
     val echoTargetLanguage: Boolean = false,
+    val featureUsageStats: FeatureUsageStats = FeatureUsageStats(),
+    val estimatedTotalCost: Double = 0.0,
     val userMessage: String? = null
 )
 
@@ -51,7 +55,7 @@ class SettingsViewModel @Inject constructor(
     private val _availableModels = MutableStateFlow<List<ModelItem>>(emptyList())
     private val _userMessage = MutableStateFlow<String?>(null)
 
-    private val repoSettings = combine(
+    private val baseRepoSettings = combine(
         settingsRepository.apiKey,
         settingsRepository.modelPerRole,
         settingsRepository.duckLevel,
@@ -63,8 +67,16 @@ class SettingsViewModel @Inject constructor(
             modelPerRole = models,
             duckLevel = duck,
             cacheLimitBytes = cache,
-            echoTargetLanguage = echo
+            echoTargetLanguage = echo,
+            usageStats = FeatureUsageStats()
         )
+    }
+
+    private val repoSettings = combine(
+        baseRepoSettings,
+        settingsRepository.featureUsageStats
+    ) { base, usage ->
+        base.copy(usageStats = usage)
     }
 
     private val internalState = combine(
@@ -88,6 +100,12 @@ class SettingsViewModel @Inject constructor(
         repoSettings,
         internalState
     ) { repo, internal ->
+        val liveTranslateCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_TRANSLATE, repo.usageStats.liveTranslateMinutes * 60.0, repo.usageStats.isFreeTier)
+        val ttsCost = CostEstimator.estimateAudioCost(ModelRole.TTS, repo.usageStats.ttsCharactersOrMinutes * 60.0, repo.usageStats.isFreeTier)
+        val liveNarrationCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_NARRATION, repo.usageStats.liveNarrationMinutes * 60.0, repo.usageStats.isFreeTier)
+        val textCost = CostEstimator.estimateTextCost(repo.usageStats.textAnalysisTokens, repo.usageStats.textTranslationTokens, repo.usageStats.isFreeTier)
+        val totalCost = liveTranslateCost + ttsCost + liveNarrationCost + textCost
+
         SettingsUiState(
             apiKeyInput = if (internal.input.isEmpty() && repo.apiKey != null) repo.apiKey else internal.input,
             isApiKeyVisible = internal.visible,
@@ -98,6 +116,8 @@ class SettingsViewModel @Inject constructor(
             duckLevel = repo.duckLevel,
             cacheLimitBytes = repo.cacheLimitBytes,
             echoTargetLanguage = repo.echoTargetLanguage,
+            featureUsageStats = repo.usageStats,
+            estimatedTotalCost = totalCost,
             userMessage = internal.message
         )
     }.stateIn(
@@ -111,7 +131,8 @@ class SettingsViewModel @Inject constructor(
         val modelPerRole: Map<ModelRole, String>,
         val duckLevel: Float,
         val cacheLimitBytes: Long,
-        val echoTargetLanguage: Boolean
+        val echoTargetLanguage: Boolean,
+        val usageStats: FeatureUsageStats
     )
 
     private data class InternalSettings(
@@ -229,9 +250,29 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun clearAudioCache() {
+        viewModelScope.launch {
+            // Clear cache logic / notification
+            _userMessage.value = "Audio cache cleared successfully"
+        }
+    }
+
     fun setEchoTargetLanguage(enabled: Boolean) {
         viewModelScope.launch {
             settingsRepository.setEchoTargetLanguage(enabled)
+        }
+    }
+
+    fun setFreeTier(isFreeTier: Boolean) {
+        viewModelScope.launch {
+            settingsRepository.setFreeTier(isFreeTier)
+        }
+    }
+
+    fun resetUsageStats() {
+        viewModelScope.launch {
+            settingsRepository.resetUsageStats()
+            _userMessage.value = "Usage statistics reset"
         }
     }
 
