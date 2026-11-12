@@ -27,6 +27,7 @@ interface SettingsRepository {
     val duckLevel: Flow<Float>
     val echoTargetLanguage: Flow<Boolean>
     val featureUsageStats: Flow<FeatureUsageStats>
+    val lastOpenedBookId: Flow<String?>
 
     suspend fun saveApiKey(key: String)
     suspend fun clearApiKey()
@@ -37,6 +38,7 @@ interface SettingsRepository {
     suspend fun setDuckLevel(level: Float)
     suspend fun setEchoTargetLanguage(echo: Boolean)
     suspend fun setFreeTier(isFreeTier: Boolean)
+    suspend fun setLastOpenedBookId(bookId: String?)
     suspend fun recordUsage(
         liveTranslateMinutesDelta: Double = 0.0,
         ttsMinutesDelta: Double = 0.0,

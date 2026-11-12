@@ -13,8 +13,10 @@ import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
 
 /**
  * Concrete Jetpack DataStore backed implementation of [SettingsRepository].
@@ -24,9 +26,11 @@ class DataStoreSettingsRepository(
     private val secureKeyStore: SecureKeyStore
 ) : SettingsRepository {
 
-    override val apiKey: Flow<String?> = flow {
-        emit(secureKeyStore.getApiKey())
-    }
+    private val apiKeyVersion = MutableStateFlow(0L)
+
+    override val apiKey: Flow<String?> = apiKeyVersion
+        .map { secureKeyStore.getApiKey() }
+        .distinctUntilChanged()
 
     override val modelPerRole: Flow<Map<ModelRole, String>> = dataStore.data.map { preferences ->
         ModelRole.values().associateWith { role ->
@@ -62,12 +66,18 @@ class DataStoreSettingsRepository(
         )
     }
 
+    override val lastOpenedBookId: Flow<String?> = dataStore.data.map { preferences ->
+        preferences[KEY_LAST_OPENED_BOOK_ID]?.takeIf { it.isNotBlank() }
+    }
+
     override suspend fun saveApiKey(key: String) {
         secureKeyStore.saveApiKey(key)
+        apiKeyVersion.update { it + 1L }
     }
 
     override suspend fun clearApiKey() {
         secureKeyStore.deleteApiKey()
+        apiKeyVersion.update { it + 1L }
     }
 
     override suspend fun setModel(role: ModelRole, modelId: String) {
@@ -114,6 +124,16 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override suspend fun setLastOpenedBookId(bookId: String?) {
+        dataStore.edit { preferences ->
+            if (bookId.isNullOrBlank()) {
+                preferences.remove(KEY_LAST_OPENED_BOOK_ID)
+            } else {
+                preferences[KEY_LAST_OPENED_BOOK_ID] = bookId
+            }
+        }
+    }
+
     override suspend fun recordUsage(
         liveTranslateMinutesDelta: Double,
         ttsMinutesDelta: Double,
@@ -152,6 +172,7 @@ class DataStoreSettingsRepository(
         val KEY_DUCK_LEVEL = floatPreferencesKey("duck_level")
         val KEY_ECHO_TARGET_LANGUAGE = booleanPreferencesKey("echo_target_language")
         val KEY_IS_FREE_TIER = booleanPreferencesKey("is_free_tier")
+        val KEY_LAST_OPENED_BOOK_ID = stringPreferencesKey("last_opened_book_id")
 
         val KEY_USAGE_LIVE_TRANSLATE = doublePreferencesKey("usage_live_translate_minutes")
         val KEY_USAGE_TTS = doublePreferencesKey("usage_tts_minutes")

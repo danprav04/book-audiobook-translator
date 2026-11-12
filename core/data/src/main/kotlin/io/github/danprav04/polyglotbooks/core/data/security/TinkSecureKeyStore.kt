@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.core.data.security
 
 import android.content.Context
+import android.util.Log
 import com.google.crypto.tink.Aead
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -31,6 +32,7 @@ class TinkSecureKeyStore(
             val key = String(decryptedBytes, Charsets.UTF_8).trim()
             if (key.isBlank()) null else key
         } catch (e: Exception) {
+            Log.w(TAG, "Failed to decrypt stored API key (${e.javaClass.simpleName})")
             null
         }
     }
@@ -50,6 +52,7 @@ class TinkSecureKeyStore(
     }
 
     companion object {
+        private const val TAG = "TinkSecureKeyStore"
         private const val KEY_FILE_NAME = "secure_gemini_api_key.enc"
         private val ASSOCIATED_DATA = "polyglot_books_gemini_key".toByteArray(Charsets.UTF_8)
     }

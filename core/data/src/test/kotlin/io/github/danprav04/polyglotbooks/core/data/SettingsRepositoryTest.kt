@@ -18,6 +18,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -156,5 +157,54 @@ class SettingsRepositoryTest {
 
         repository.clearApiKey()
         coVerify { secureKeyStore.deleteApiKey() }
+    }
+
+    @Test
+    fun testApiKeyFlowReactsToSaveAndClear() = runTest {
+        val backingStore = object : SecureKeyStore {
+            private var stored: String? = null
+            override suspend fun getApiKey(): String? = stored
+            override suspend fun saveApiKey(key: String) {
+                require(key.isNotBlank()) { "API key must not be blank" }
+                stored = key.trim()
+            }
+            override suspend fun deleteApiKey() {
+                stored = null
+            }
+        }
+        val reactiveRepo = DataStoreSettingsRepository(dataStore, backingStore)
+
+        reactiveRepo.apiKey.test {
+            assertNull(awaitItem())
+
+            reactiveRepo.saveApiKey("AIzaSyFirstKey")
+            assertEquals("AIzaSyFirstKey", awaitItem())
+
+            reactiveRepo.saveApiKey("AIzaSySecondKey")
+            assertEquals("AIzaSySecondKey", awaitItem())
+
+            reactiveRepo.clearApiKey()
+            assertNull(awaitItem())
+
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
+    @Test
+    fun testLastOpenedBookIdFlow() = runTest {
+        repository.lastOpenedBookId.test {
+            assertNull(awaitItem())
+
+            repository.setLastOpenedBookId("book-123")
+            assertEquals("book-123", awaitItem())
+
+            repository.setLastOpenedBookId("book-456")
+            assertEquals("book-456", awaitItem())
+
+            repository.setLastOpenedBookId(null)
+            assertNull(awaitItem())
+
+            cancelAndIgnoreRemainingEvents()
+        }
     }
 }
