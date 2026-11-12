@@ -44,4 +44,12 @@ interface BookDao {
             insertChapters(chapters)
         }
     }
+
+    @androidx.room.Transaction
+    suspend fun updateLastReadDate(bookId: String, timestamp: Long = System.currentTimeMillis()) {
+        val book = getBookById(bookId)
+        if (book != null) {
+            updateBook(book.copy(lastReadDate = timestamp))
+        }
+    }
 }
