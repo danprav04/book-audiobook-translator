@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.core.gemini
 
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -32,16 +33,24 @@ class LiveSessionMessageTest {
         val genConfig = message.setup.generationConfig
         assertNotNull(genConfig)
         assertEquals(listOf("AUDIO"), genConfig?.responseModalities)
-        assertNotNull(genConfig?.inputAudioTranscription)
-        assertNotNull(genConfig?.outputAudioTranscription)
+        assertNotNull(message.setup.inputAudioTranscription)
+        assertNotNull(message.setup.outputAudioTranscription)
         assertEquals("pl", genConfig?.translationConfig?.targetLanguageCode)
         assertEquals(true, genConfig?.translationConfig?.echoTargetLanguage)
 
         assertEquals("session_handle_abc123", message.setup.sessionResumption?.handle)
         assertNotNull(message.setup.contextWindowCompression?.slidingWindow)
 
-        // Verify round-trip encoding
+        // Verify round-trip encoding places transcription fields at top-level setup, never in generationConfig
         val encoded = json.encodeToString(LiveClientMessage.SetupMessage.serializer(), message)
+        val rootObj = json.parseToJsonElement(encoded).jsonObject
+        val setupObj = rootObj["setup"]!!.jsonObject
+        val genObj = setupObj["generationConfig"]!!.jsonObject
+        assertTrue("inputAudioTranscription must be top-level on setup", "inputAudioTranscription" in setupObj)
+        assertTrue("outputAudioTranscription must be top-level on setup", "outputAudioTranscription" in setupObj)
+        assertFalse("inputAudioTranscription must not be inside generationConfig", "inputAudioTranscription" in genObj)
+        assertFalse("outputAudioTranscription must not be inside generationConfig", "outputAudioTranscription" in genObj)
+
         val decodedAgain = json.decodeFromString<LiveClientMessage.SetupMessage>(encoded)
         assertEquals(message, decodedAgain)
     }
@@ -53,7 +62,17 @@ class LiveSessionMessageTest {
 
         assertEquals("models/gemini-3.8-live", message.setup.model)
         assertEquals(listOf("AUDIO"), message.setup.generationConfig?.responseModalities)
+        assertNotNull(message.setup.inputAudioTranscription)
+        assertNotNull(message.setup.outputAudioTranscription)
         assertNotNull(message.setup.sessionResumption)
+
+        val encoded = json.encodeToString(LiveClientMessage.SetupMessage.serializer(), message)
+        val setupObj = json.parseToJsonElement(encoded).jsonObject["setup"]!!.jsonObject
+        val genObj = setupObj["generationConfig"]!!.jsonObject
+        assertTrue("inputAudioTranscription" in setupObj)
+        assertTrue("outputAudioTranscription" in setupObj)
+        assertFalse("inputAudioTranscription" in genObj)
+        assertFalse("outputAudioTranscription" in genObj)
     }
 
     @Test

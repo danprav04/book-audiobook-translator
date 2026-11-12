@@ -189,8 +189,14 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideLiveTranslateClient(liveSessionFactory: LiveSessionFactory): LiveTranslateClient {
-        return DefaultLiveTranslateClient(liveSessionFactory)
+    fun provideLiveTranslateClient(
+        liveSessionFactory: LiveSessionFactory,
+        modelCatalogService: ModelCatalogService
+    ): LiveTranslateClient {
+        return DefaultLiveTranslateClient(
+            sessionFactory = liveSessionFactory,
+            modelCatalogService = modelCatalogService
+        )
     }
 
     @Provides

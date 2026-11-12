@@ -38,6 +38,9 @@ class OkHttpLiveSession(
     private val maxReconnectAttempts: Int = 2
 ) : LiveSession {
 
+    internal val client: OkHttpClient
+        get() = okHttpClient
+
     private val TAG = "OkHttpLiveSession"
 
     private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(replay = 16, extraBufferCapacity = 64)
@@ -169,6 +172,7 @@ class OkHttpLiveSession(
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (connectionId != activeConnectionId) return
                 logD("WebSocket closing: $code / $reason")
+                val setupWasComplete = _isSetupComplete
                 _isConnected = false
                 _isSetupComplete = false
                 try {
@@ -180,20 +184,46 @@ class OkHttpLiveSession(
                     if (!signal.isCompleted) {
                         signal.completeExceptionally(err)
                     }
-                    handleUnexpectedDisconnect(err)
+                    handleUnexpectedDisconnect(
+                        cause = err,
+                        setupWasComplete = setupWasComplete,
+                        closeCode = code
+                    )
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (connectionId != activeConnectionId) return
                 logE("WebSocket failure", t)
+                val setupWasComplete = _isSetupComplete
                 _isConnected = false
                 _isSetupComplete = false
+                val httpCode = try {
+                    response?.code
+                } catch (_: Throwable) {
+                    null
+                }
+                val failure = if (httpCode != null && httpCode >= 400 &&
+                    t.message?.contains(httpCode.toString()) != true
+                ) {
+                    val reason = try {
+                        response?.message.orEmpty()
+                    } catch (_: Throwable) {
+                        ""
+                    }
+                    IOException("WebSocket handshake failed (HTTP $httpCode $reason): ${t.message ?: "failure"}", t)
+                } else {
+                    t
+                }
                 if (!signal.isCompleted) {
-                    signal.completeExceptionally(t)
+                    signal.completeExceptionally(failure)
                 }
                 if (!isManualDisconnect) {
-                    handleUnexpectedDisconnect(t)
+                    handleUnexpectedDisconnect(
+                        cause = failure,
+                        setupWasComplete = setupWasComplete,
+                        httpStatusCode = httpCode
+                    )
                 }
             }
         })
@@ -243,9 +273,17 @@ class OkHttpLiveSession(
         }
     }
 
-    private fun handleUnexpectedDisconnect(cause: Throwable) {
+    private fun handleUnexpectedDisconnect(
+        cause: Throwable,
+        setupWasComplete: Boolean,
+        closeCode: Int? = null,
+        httpStatusCode: Int? = null
+    ) {
+        val permanentError = isPermanentDisconnectError(cause, closeCode, httpStatusCode)
         val resumptionEnabled = currentSetup?.sessionResumption != null || currentResumptionHandle != null
-        val eligibleForReconnect = resumptionEnabled &&
+        val eligibleForReconnect = setupWasComplete &&
+            !permanentError &&
+            resumptionEnabled &&
             (hasEverOpened || currentResumptionHandle != null) &&
             reconnectAttempts < maxReconnectAttempts
 
@@ -257,6 +295,21 @@ class OkHttpLiveSession(
             }
         }
         _failures.tryEmit(cause)
+    }
+
+    private fun isPermanentDisconnectError(
+        cause: Throwable,
+        closeCode: Int?,
+        httpStatusCode: Int?
+    ): Boolean {
+        if (closeCode != null && closeCode in PERMANENT_CLOSE_CODES) return true
+        if (httpStatusCode != null && httpStatusCode in PERMANENT_HTTP_CODES) return true
+
+        return generateSequence(cause) { it.cause }.any { throwable ->
+            val msg = throwable.message.orEmpty()
+            PERMANENT_CODE_IN_MESSAGE_REGEX.containsMatchIn(msg) ||
+                PERMANENT_HTTP_IN_MESSAGE_REGEX.containsMatchIn(msg)
+        }
     }
 
     override suspend fun send(message: LiveClientMessage) {
@@ -275,6 +328,9 @@ class OkHttpLiveSession(
 
     override suspend fun disconnect() {
         isManualDisconnect = true
+        val pendingOpen = openDeferred
+        openDeferred = null
+        pendingOpen?.cancel()
         closeCurrentSocketQuietly()
     }
 
@@ -331,6 +387,15 @@ class OkHttpLiveSession(
     }
 
     companion object {
+        private val PERMANENT_CLOSE_CODES = setOf(1003, 1007, 1008, 4400, 4401, 4403, 4404)
+        private val PERMANENT_HTTP_CODES = setOf(400, 401, 403, 404)
+        private val PERMANENT_CODE_IN_MESSAGE_REGEX = Regex(
+            """(?i)\b(?:code|close)\s*[=:]\s*(1003|1007|1008|4400|4401|4403|4404)\b|\bcode\s+(1003|1007|1008|4400|4401|4403|4404)\b"""
+        )
+        private val PERMANENT_HTTP_IN_MESSAGE_REGEX = Regex(
+            """(?i)(?:\bHTTP[\s/]*|was\s+['"]?)(400|401|403|404)\b"""
+        )
+
         fun defaultOkHttpClient(): OkHttpClient =
             OkHttpClient.Builder()
                 .pingInterval(20, TimeUnit.SECONDS)
@@ -346,14 +411,21 @@ interface LiveSessionFactory {
 class DefaultLiveSessionFactory(
     private val okHttpClient: OkHttpClient = OkHttpLiveSession.defaultOkHttpClient()
 ) : LiveSessionFactory {
-    private val configuredClient: OkHttpClient by lazy {
+    internal val configuredClient: OkHttpClient by lazy {
         try {
-            if (okHttpClient.pingIntervalMillis > 0) {
+            val needsPing = okHttpClient.pingIntervalMillis <= 0
+            val needsReadTimeout = okHttpClient.readTimeoutMillis != 0
+            if (!needsPing && !needsReadTimeout) {
                 okHttpClient
             } else {
-                okHttpClient.newBuilder()
-                    .pingInterval(20, TimeUnit.SECONDS)
-                    .build()
+                okHttpClient.newBuilder().apply {
+                    if (needsPing) {
+                        pingInterval(20, TimeUnit.SECONDS)
+                    }
+                    if (needsReadTimeout) {
+                        readTimeout(0, TimeUnit.MILLISECONDS)
+                    }
+                }.build()
             }
         } catch (_: Throwable) {
             okHttpClient

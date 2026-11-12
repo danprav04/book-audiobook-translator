@@ -5,13 +5,13 @@
       "responseModalities": [
         "AUDIO"
       ],
-      "inputAudioTranscription": {},
-      "outputAudioTranscription": {},
       "translationConfig": {
         "targetLanguageCode": "pl",
         "echoTargetLanguage": true
       }
     },
+    "inputAudioTranscription": {},
+    "outputAudioTranscription": {},
     "sessionResumption": {
       "handle": "session_handle_abc123"
     },

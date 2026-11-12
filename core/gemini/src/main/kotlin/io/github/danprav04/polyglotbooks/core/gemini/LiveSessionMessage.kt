@@ -66,6 +66,8 @@ data class SetupConfig(
     val model: String,
     val generationConfig: GenerationConfig? = null,
     val systemInstruction: ContentTurn? = null,
+    val inputAudioTranscription: JsonObject? = null,
+    val outputAudioTranscription: JsonObject? = null,
     val sessionResumption: SessionResumptionConfig? = null,
     val contextWindowCompression: ContextWindowCompressionConfig? = null,
     val realtimeInputConfig: RealtimeInputConfig? = null
@@ -77,8 +79,6 @@ data class SetupConfig(
 @Serializable
 data class GenerationConfig(
     val responseModalities: List<String>? = null,
-    val inputAudioTranscription: JsonObject? = null,
-    val outputAudioTranscription: JsonObject? = null,
     val translationConfig: TranslationConfig? = null,
     val speechConfig: SpeechConfig? = null,
     val temperature: Float? = null,

@@ -4,10 +4,10 @@
     "generationConfig": {
       "responseModalities": [
         "AUDIO"
-      ],
-      "inputAudioTranscription": {},
-      "outputAudioTranscription": {}
+      ]
     },
+    "inputAudioTranscription": {},
+    "outputAudioTranscription": {},
     "sessionResumption": {},
     "contextWindowCompression": {
       "slidingWindow": {}

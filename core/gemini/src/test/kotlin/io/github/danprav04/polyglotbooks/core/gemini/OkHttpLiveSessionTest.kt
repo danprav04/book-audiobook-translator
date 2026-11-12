@@ -22,6 +22,7 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 class OkHttpLiveSessionTest {
 
@@ -208,5 +209,146 @@ class OkHttpLiveSessionTest {
     fun testDefaultOkHttpClientConfiguresPingInterval() {
         val client = OkHttpLiveSession.defaultOkHttpClient()
         assertEquals(20_000, client.pingIntervalMillis)
+        assertEquals(0, client.readTimeoutMillis)
+    }
+
+    @Test
+    fun testDefaultLiveSessionFactoryForcesZeroReadTimeoutAndPingInterval() {
+        val appClient = OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS)
+            .build()
+
+        val factory = DefaultLiveSessionFactory(appClient)
+        assertEquals(0, factory.configuredClient.readTimeoutMillis)
+        assertEquals(20_000, factory.configuredClient.pingIntervalMillis)
+
+        val createdSession = factory.create() as OkHttpLiveSession
+        assertEquals(0, createdSession.client.readTimeoutMillis)
+        assertEquals(20_000, createdSession.client.pingIntervalMillis)
+
+        val noPingClient = OkHttpClient.Builder()
+            .readTimeout(15, TimeUnit.SECONDS)
+            .pingInterval(0, TimeUnit.SECONDS)
+            .build()
+        val factoryNoPing = DefaultLiveSessionFactory(noPingClient)
+        assertEquals(0, factoryNoPing.configuredClient.readTimeoutMillis)
+        assertEquals(20_000, factoryNoPing.configuredClient.pingIntervalMillis)
+    }
+
+    @Test
+    fun testNoAutoReconnectOn1007BeforeSetupComplete() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        val session = OkHttpLiveSession(mockClient, maxReconnectAttempts = 2)
+        val setup = SetupConfig(
+            model = "models/gemini-3.5-live-translate-preview",
+            sessionResumption = SessionResumptionConfig()
+        )
+        session.connect("fake-key", setup)
+        assertEquals(1, listeners.size)
+
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onClosing(
+            sockets[0],
+            1007,
+            "Invalid JSON payload received. Unknown name \"inputAudioTranscription\""
+        )
+
+        // Must fail fast without attempting any reconnect
+        assertEquals(1, listeners.size)
+        try {
+            session.incomingMessages.first()
+            fail("Expected IOException for 1007 close")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("code=1007"))
+        }
+    }
+
+    @Test
+    fun testNoAutoReconnectOn1008BeforeSetupComplete() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        val session = OkHttpLiveSession(mockClient, maxReconnectAttempts = 2)
+        val setup = SetupConfig(
+            model = "models/gemini-3.5-live-translate-preview",
+            sessionResumption = SessionResumptionConfig()
+        )
+        session.connect("fake-key", setup)
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onClosing(
+            sockets[0],
+            1008,
+            "models/gemini-3.5-live-translate-preview is not found for API version v1beta"
+        )
+
+        assertEquals(1, listeners.size)
+        try {
+            session.incomingMessages.first()
+            fail("Expected IOException for 1008 close")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("code=1008"))
+        }
+    }
+
+    @Test
+    fun testNoAutoReconnectOn1011BeforeSetupCompleteAndPermanentCloseAfterSetup() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        // Before setupComplete, even 1011 must not auto-reconnect
+        val session1 = OkHttpLiveSession(mockClient, maxReconnectAttempts = 2)
+        session1.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.8-live", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onClosing(sockets[0], 1011, "Closing before setupComplete")
+        assertEquals(1, listeners.size)
+        try {
+            session1.incomingMessages.first()
+            fail("Expected IOException")
+        } catch (_: IOException) {
+        }
+
+        // After setupComplete, permanent protocol/policy error (1008/4401) must still not auto-reconnect
+        val session2 = OkHttpLiveSession(mockClient, maxReconnectAttempts = 2)
+        session2.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.8-live", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[1].onOpen(sockets[1], mockk(relaxed = true))
+        listeners[1].onMessage(sockets[1], """{"setupComplete":{}}""")
+        assertTrue(session2.isSetupComplete)
+        listeners[1].onClosing(sockets[1], 4401, "Unauthorized")
+        assertEquals(2, listeners.size)
     }
 }
