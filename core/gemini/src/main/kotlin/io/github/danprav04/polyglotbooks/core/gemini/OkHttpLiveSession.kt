@@ -20,6 +20,7 @@ import okio.ByteString
 /**
  * Production implementation of [LiveSession] using OkHttp WebSocket connecting to the Gemini Live API.
  */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class OkHttpLiveSession(
     private val okHttpClient: OkHttpClient = OkHttpClient(),
     private val json: Json = Json {
@@ -31,7 +32,7 @@ class OkHttpLiveSession(
 
     private val TAG = "OkHttpLiveSession"
 
-    private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 64)
+    private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(replay = 16, extraBufferCapacity = 64)
     private val _failures = MutableSharedFlow<Throwable>(replay = 1)
 
     override val incomingMessages: Flow<LiveServerMessage> = flow {
@@ -64,6 +65,7 @@ class OkHttpLiveSession(
         private set
 
     override suspend fun connect(apiKey: String, setup: SetupConfig) {
+        _incomingMessages.resetReplayCache()
         _failures.resetReplayCache()
         currentApiKey = apiKey
         val finalSetup = if (currentResumptionHandle != null && setup.sessionResumption?.handle == null) {
@@ -106,8 +108,10 @@ class OkHttpLiveSession(
                             reconnectWithResumption()
                         }
                     }
-                    scope.launch {
-                        _incomingMessages.emit(serverMsg)
+                    if (!_incomingMessages.tryEmit(serverMsg)) {
+                        scope.launch {
+                            _incomingMessages.emit(serverMsg)
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to parse incoming server message: $text", e)

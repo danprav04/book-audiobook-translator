@@ -1,24 +1,44 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
+import android.util.Log
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.mockkStatic
 import io.mockk.slot
+import io.mockk.unmockkStatic
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
+import org.junit.Before
 import org.junit.Test
 import java.io.IOException
 
 class OkHttpLiveSessionTest {
+
+    @Before
+    fun setUp() {
+        mockkStatic(Log::class)
+        every { Log.d(any(), any()) } returns 0
+        every { Log.i(any(), any()) } returns 0
+        every { Log.w(any(), any<String>()) } returns 0
+        every { Log.e(any(), any()) } returns 0
+        every { Log.e(any(), any(), any()) } returns 0
+    }
+
+    @After
+    fun tearDown() {
+        unmockkStatic(Log::class)
+    }
 
     @Test
     fun testIncomingMessagesDeliveredSuccessfully() = runTest {
@@ -40,23 +60,16 @@ class OkHttpLiveSessionTest {
         listener.onOpen(mockWebSocket, mockResponse)
         assertTrue(session.isConnected)
 
-        // Launch collector for incoming messages
-        val received = mutableListOf<LiveServerMessage>()
-        val collectJob = launch {
-            session.incomingMessages.collect {
-                received.add(it)
-            }
-        }
-
         // Simulate incoming server message
-        val goAwayJson = """{"goAway":{"timeLeft":"45s"}}"""
-        listener.onMessage(mockWebSocket, goAwayJson)
+        val contentJson = """{"serverContent":{"turnComplete":true,"interrupted":false}}"""
+        listener.onMessage(mockWebSocket, contentJson)
 
-        assertEquals(1, received.size)
-        assertTrue(received[0] is LiveServerMessage.GoAwayMessage)
-        assertEquals("45s", (received[0] as LiveServerMessage.GoAwayMessage).goAway.timeLeft)
+        val receivedMessage = session.incomingMessages.first()
+        assertTrue(receivedMessage is LiveServerMessage.ServerContentMessage)
+        val content = (receivedMessage as LiveServerMessage.ServerContentMessage).serverContent
+        assertEquals(true, content.turnComplete)
+        assertEquals(false, content.interrupted)
 
-        collectJob.cancel()
         session.disconnect()
     }
 

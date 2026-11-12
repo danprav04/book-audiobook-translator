@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.translate
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
