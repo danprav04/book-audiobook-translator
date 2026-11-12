@@ -41,6 +41,9 @@ class DiskTranslatedCache(
         sourceEndMs: Long,
         pcmData: ByteArray
     ) {
+        if (!cacheDir.exists()) {
+            cacheDir.mkdirs()
+        }
         val fileName = "seg_${bookId}_${targetLanguage}_${sourceStartMs}_${sourceEndMs}.pcm"
         val segmentFile = File(cacheDir, fileName)
         FileOutputStream(segmentFile).use { it.write(pcmData) }
@@ -52,7 +55,7 @@ class DiskTranslatedCache(
             sourceStartMs = sourceStartMs,
             sourceEndMs = sourceEndMs,
             aacFilePath = segmentFile.absolutePath,
-            fileSizeBytes = pcmData.size.toLong(),
+            fileSizeBytes = segmentFile.length(),
             createdAt = System.currentTimeMillis()
         )
         cacheDao.insertSegment(entity)
@@ -60,7 +63,11 @@ class DiskTranslatedCache(
 
     override suspend fun getSegmentPcm(segment: TranslatedSegmentEntity): ByteArray? {
         val file = File(segment.aacFilePath)
-        return if (file.exists()) file.readBytes() else null
+        if (!file.exists()) return null
+        if (file.name.endsWith(".pcm", ignoreCase = true)) {
+            return file.readBytes()
+        }
+        return AudioSegmentIO.readAllPcmBytes(file) ?: file.readBytes()
     }
 
     override suspend fun evictToMaxBytes(maxBytes: Long) {
