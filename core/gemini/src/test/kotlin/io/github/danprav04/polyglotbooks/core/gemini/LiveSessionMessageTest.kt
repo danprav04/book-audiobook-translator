@@ -1,7 +1,9 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -146,5 +148,75 @@ class LiveSessionMessageTest {
         val encoded = json.encodeToString(LiveServerMessage.SessionResumptionUpdateMessage.serializer(), message)
         val decodedAgain = json.decodeFromString<LiveServerMessage.SessionResumptionUpdateMessage>(encoded)
         assertEquals(message, decodedAgain)
+    }
+
+    @Test
+    fun testPolymorphicServerMessageDeserialization() {
+        val audioJson = loadFixture("ws_server_content_audio.json")
+        val audioMsg = json.decodeFromString<LiveServerMessage>(audioJson)
+        assertTrue(audioMsg is LiveServerMessage.ServerContentMessage)
+        val encodedAudio = json.encodeToString<LiveServerMessage>(audioMsg)
+        assertFalse(encodedAudio.contains("\"type\""))
+        val decodedAudioAgain = json.decodeFromString<LiveServerMessage>(encodedAudio)
+        assertEquals(audioMsg, decodedAudioAgain)
+
+        val transcriptsJson = loadFixture("ws_server_content_translate_transcripts.json")
+        val transcriptsMsg = json.decodeFromString<LiveServerMessage>(transcriptsJson)
+        assertTrue(transcriptsMsg is LiveServerMessage.ServerContentMessage)
+
+        val goAwayJson = loadFixture("ws_server_go_away.json")
+        val goAwayMsg = json.decodeFromString<LiveServerMessage>(goAwayJson)
+        assertTrue(goAwayMsg is LiveServerMessage.GoAwayMessage)
+        val encodedGoAway = json.encodeToString<LiveServerMessage>(goAwayMsg)
+        assertFalse(encodedGoAway.contains("\"type\""))
+        assertEquals(goAwayMsg, json.decodeFromString<LiveServerMessage>(encodedGoAway))
+
+        val resumeJson = loadFixture("ws_server_session_resumption_update.json")
+        val resumeMsg = json.decodeFromString<LiveServerMessage>(resumeJson)
+        assertTrue(resumeMsg is LiveServerMessage.SessionResumptionUpdateMessage)
+        val encodedResume = json.encodeToString<LiveServerMessage>(resumeMsg)
+        assertFalse(encodedResume.contains("\"type\""))
+        assertEquals(resumeMsg, json.decodeFromString<LiveServerMessage>(encodedResume))
+
+        val setupCompleteJson = "{\"setupComplete\":{}}"
+        val setupCompleteMsg = json.decodeFromString<LiveServerMessage>(setupCompleteJson)
+        assertTrue(setupCompleteMsg is LiveServerMessage.SetupCompleteMessage)
+        val encodedSetupComplete = json.encodeToString<LiveServerMessage>(setupCompleteMsg)
+        assertFalse(encodedSetupComplete.contains("\"type\""))
+    }
+
+    @Test
+    fun testPolymorphicClientMessageSerializationAndDeserialization() {
+        val setupJson = loadFixture("ws_client_setup_translate.json")
+        val setupMsg = json.decodeFromString<LiveClientMessage>(setupJson)
+        assertTrue(setupMsg is LiveClientMessage.SetupMessage)
+
+        val encodedSetup = json.encodeToString<LiveClientMessage>(setupMsg)
+        assertFalse("Polymorphic encoding must not include 'type' discriminator", encodedSetup.contains("\"type\""))
+        assertTrue("Polymorphic encoding must have 'setup' root key", encodedSetup.contains("\"setup\""))
+        val decodedSetupAgain = json.decodeFromString<LiveClientMessage>(encodedSetup)
+        assertEquals(setupMsg, decodedSetupAgain)
+
+        val realtimeJson = loadFixture("ws_client_realtime_audio.json")
+        val realtimeMsg = json.decodeFromString<LiveClientMessage>(realtimeJson)
+        assertTrue(realtimeMsg is LiveClientMessage.RealtimeInputMessage)
+
+        val encodedRealtime = json.encodeToString<LiveClientMessage>(realtimeMsg)
+        assertFalse("Polymorphic encoding must not include 'type' discriminator", encodedRealtime.contains("\"type\""))
+        assertTrue("Polymorphic encoding must have 'realtimeInput' root key", encodedRealtime.contains("\"realtimeInput\""))
+        val decodedRealtimeAgain = json.decodeFromString<LiveClientMessage>(encodedRealtime)
+        assertEquals(realtimeMsg, decodedRealtimeAgain)
+
+        val clientContent = LiveClientMessage.ClientContentMessage(
+            clientContent = ClientContentData(
+                turns = listOf(ContentTurn(role = "user", parts = listOf(Part(text = "Hello!")))),
+                turnComplete = true
+            )
+        )
+        val encodedClientContent = json.encodeToString<LiveClientMessage>(clientContent)
+        assertFalse("Polymorphic encoding must not include 'type' discriminator", encodedClientContent.contains("\"type\""))
+        assertTrue("Polymorphic encoding must have 'clientContent' root key", encodedClientContent.contains("\"clientContent\""))
+        val decodedClientContent = json.decodeFromString<LiveClientMessage>(encodedClientContent)
+        assertEquals(clientContent, decodedClientContent)
     }
 }

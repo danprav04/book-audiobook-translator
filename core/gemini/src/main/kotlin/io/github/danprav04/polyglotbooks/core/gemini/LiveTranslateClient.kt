@@ -79,11 +79,16 @@ class DefaultLiveTranslateClient(
         )
 
         scope.launch {
-            session.incomingMessages.collect { serverMsg ->
-                val output = parseServerMessage(serverMsg)
-                if (output != null) {
-                    _translationStream.emit(output)
+            try {
+                session.incomingMessages.collect { serverMsg ->
+                    val output = parseServerMessage(serverMsg)
+                    if (output != null) {
+                        _translationStream.emit(output)
+                    }
                 }
+            } catch (e: Throwable) {
+                android.util.Log.e("LiveTranslateClient", "Live session incoming messages failed", e)
+                isRunning = false
             }
         }
 

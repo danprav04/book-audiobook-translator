@@ -1,13 +1,17 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
+import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.JsonContentPolymorphicSerializer
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
 /**
  * Top-level sealed interface for messages sent from the client to the Gemini Live WebSocket session.
  */
-@Serializable
+@Serializable(with = LiveClientMessageSerializer::class)
 sealed interface LiveClientMessage {
 
     /**
@@ -36,6 +40,22 @@ sealed interface LiveClientMessage {
     data class ClientContentMessage(
         val clientContent: ClientContentData
     ) : LiveClientMessage
+}
+
+/**
+ * Custom polymorphic serializer for [LiveClientMessage] matching Gemini Live WebSocket protocol frames.
+ */
+object LiveClientMessageSerializer : JsonContentPolymorphicSerializer<LiveClientMessage>(LiveClientMessage::class) {
+    override fun selectDeserializer(element: JsonElement): DeserializationStrategy<LiveClientMessage> {
+        val jsonObject = element as? JsonObject
+            ?: throw SerializationException("LiveClientMessage must be a JSON object, but was: $element")
+        return when {
+            "setup" in jsonObject -> LiveClientMessage.SetupMessage.serializer()
+            "realtimeInput" in jsonObject -> LiveClientMessage.RealtimeInputMessage.serializer()
+            "clientContent" in jsonObject -> LiveClientMessage.ClientContentMessage.serializer()
+            else -> throw SerializationException("Unknown LiveClientMessage envelope: $element")
+        }
+    }
 }
 
 /**
@@ -166,7 +186,7 @@ data class Part(
 /**
  * Top-level sealed interface for messages received from the Gemini Live WebSocket session.
  */
-@Serializable
+@Serializable(with = LiveServerMessageSerializer::class)
 sealed interface LiveServerMessage {
 
     /**
@@ -204,6 +224,23 @@ sealed interface LiveServerMessage {
     data class SetupCompleteMessage(
         val setupComplete: JsonObject? = null
     ) : LiveServerMessage
+}
+
+/**
+ * Custom polymorphic serializer for [LiveServerMessage] matching Gemini Live WebSocket protocol frames.
+ */
+object LiveServerMessageSerializer : JsonContentPolymorphicSerializer<LiveServerMessage>(LiveServerMessage::class) {
+    override fun selectDeserializer(element: JsonElement): DeserializationStrategy<LiveServerMessage> {
+        val jsonObject = element as? JsonObject
+            ?: throw SerializationException("LiveServerMessage must be a JSON object, but was: $element")
+        return when {
+            "serverContent" in jsonObject -> LiveServerMessage.ServerContentMessage.serializer()
+            "goAway" in jsonObject -> LiveServerMessage.GoAwayMessage.serializer()
+            "sessionResumptionUpdate" in jsonObject -> LiveServerMessage.SessionResumptionUpdateMessage.serializer()
+            "setupComplete" in jsonObject -> LiveServerMessage.SetupCompleteMessage.serializer()
+            else -> throw SerializationException("Unknown LiveServerMessage envelope: $element")
+        }
+    }
 }
 
 /**

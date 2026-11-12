@@ -4,9 +4,11 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -30,7 +32,23 @@ class OkHttpLiveSession(
     private val TAG = "OkHttpLiveSession"
 
     private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 64)
-    override val incomingMessages: Flow<LiveServerMessage> = _incomingMessages.asSharedFlow()
+    private val _failures = MutableSharedFlow<Throwable>(replay = 1)
+
+    override val incomingMessages: Flow<LiveServerMessage> = flow {
+        coroutineScope {
+            val failureJob = launch {
+                val error = _failures.first()
+                throw error
+            }
+            try {
+                _incomingMessages.collect { msg ->
+                    emit(msg)
+                }
+            } finally {
+                failureJob.cancel()
+            }
+        }
+    }
 
     private var webSocket: WebSocket? = null
     private var _isConnected = false
@@ -46,6 +64,7 @@ class OkHttpLiveSession(
         private set
 
     override suspend fun connect(apiKey: String, setup: SetupConfig) {
+        _failures.resetReplayCache()
         currentApiKey = apiKey
         val finalSetup = if (currentResumptionHandle != null && setup.sessionResumption?.handle == null) {
             setup.copy(sessionResumption = SessionResumptionConfig(handle = currentResumptionHandle))
@@ -100,11 +119,15 @@ class OkHttpLiveSession(
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.d(TAG, "WebSocket closing: $code / $reason")
                 _isConnected = false
+                if (code != 1000) {
+                    _failures.tryEmit(java.io.IOException("WebSocket closed unexpectedly: code=$code, reason=$reason"))
+                }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: okhttp3.Response?) {
                 Log.e(TAG, "WebSocket failure", t)
                 _isConnected = false
+                _failures.tryEmit(t)
             }
         })
     }
