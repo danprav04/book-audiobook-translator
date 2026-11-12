@@ -7,11 +7,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeDown
 import androidx.compose.material.icons.automirrored.filled.VolumeMute
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -25,6 +28,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import java.io.File
 
@@ -36,15 +42,27 @@ fun AudiobookPlayerScreen(
     viewModel: AudiobookPlayerViewModel = androidx.hilt.navigation.compose.hiltViewModel()
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     LaunchedEffect(bookId) {
         viewModel.loadBook(bookId)
     }
-    LaunchedEffect(context) {
-        viewModel.initTts(context)
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                viewModel.flushProgress()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.flushProgress()
+        }
     }
+
     val state by viewModel.uiState.collectAsState()
 
-    // 1. Cover Art in Player: Load it via remember(state.coverUri, state.bookId) from state.coverUri or context.filesDir/covers/{bookId}.jpg using BitmapFactory.decodeFile
     val coverBitmap = remember(state.coverUri, state.bookId) {
         val bId = state.bookId.ifBlank { bookId }
         val uriFile = state.coverUri?.let { File(it) }
@@ -65,10 +83,14 @@ fun AudiobookPlayerScreen(
         } ?: state.coverBitmap
     }
 
+    val displayTitle = state.bookTitle.ifBlank { "Audiobook" }
+    val displayAuthor = state.author.ifBlank { "Unknown Author" }
+    val duckPercent = (state.duckLevel * 100).toInt().coerceIn(0, 100)
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(state.bookTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = { Text(displayTitle, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
                     IconButton(onClick = onBackClick) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
@@ -99,323 +121,425 @@ fun AudiobookPlayerScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Book cover / Header area
             Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(top = 8.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                if (coverBitmap != null) {
-                    Image(
-                        bitmap = coverBitmap.asImageBitmap(),
-                        contentDescription = state.bookTitle,
+                if (state.isLoading) {
+                    LinearProgressIndicator(
                         modifier = Modifier
-                            .size(130.dp)
-                            .clip(RoundedCornerShape(16.dp)),
-                        contentScale = ContentScale.Crop
+                            .fillMaxWidth()
+                            .padding(top = 4.dp)
                     )
-                } else {
-                    Box(
+                }
+
+                // Dismissible Error Banner
+                if (!state.errorMessage.isNullOrBlank()) {
+                    Card(
                         modifier = Modifier
-                            .size(130.dp)
-                            .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(16.dp)),
-                        contentAlignment = Alignment.Center
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.errorContainer
+                        )
                     ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Headphones,
-                                contentDescription = null,
-                                modifier = Modifier.size(44.dp),
-                                tint = MaterialTheme.colorScheme.onPrimaryContainer
+                                imageVector = Icons.Default.ErrorOutline,
+                                contentDescription = "Error",
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(20.dp)
                             )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "Audiobook",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                                text = state.errorMessage ?: "",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.weight(1f)
                             )
+                            IconButton(
+                                onClick = { viewModel.clearError() },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = "Dismiss error",
+                                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = state.bookTitle,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = state.author,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
 
-            // Dual Subtitles Panel
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-            ) {
-                Column(modifier = Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "ORIGINAL (${state.sourceLanguage.displayName})",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary
+                // Book cover / Header area
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(top = 4.dp)
+                ) {
+                    if (coverBitmap != null) {
+                        Image(
+                            bitmap = coverBitmap.asImageBitmap(),
+                            contentDescription = displayTitle,
+                            modifier = Modifier
+                                .size(130.dp)
+                                .clip(RoundedCornerShape(16.dp)),
+                            contentScale = ContentScale.Crop
                         )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "Live Translation",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                            Switch(
-                                checked = state.isLiveTranslationActive,
-                                onCheckedChange = { viewModel.toggleLiveTranslation() },
-                                modifier = Modifier.scale(0.7f)
-                            )
-                        }
-                    }
-                    Text(
-                        text = state.sourceSubtitle,
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "TRANSLATED (${state.targetLanguage.displayName})",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.secondary
-                        )
-                        Box {
-                            TextButton(
-                                onClick = { viewModel.setLanguageDropdownVisible(true) },
-                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .size(130.dp)
+                                .background(MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(16.dp)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
                             ) {
-                                Text(
-                                    text = state.targetLanguage.displayName,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    fontWeight = FontWeight.Bold
-                                )
                                 Icon(
-                                    imageVector = Icons.Default.ArrowDropDown,
-                                    contentDescription = "Select Target Language",
-                                    modifier = Modifier.size(16.dp)
+                                    imageVector = Icons.Default.Headphones,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(44.dp),
+                                    tint = MaterialTheme.colorScheme.onPrimaryContainer
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Audiobook",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer
                                 )
                             }
-                            DropdownMenu(
-                                expanded = state.showLanguageDropdown,
-                                onDismissRequest = { viewModel.setLanguageDropdownVisible(false) }
-                            ) {
-                                listOf(
-                                    LanguageCode.RUSSIAN,
-                                    LanguageCode.ENGLISH,
-                                    LanguageCode.HEBREW,
-                                    LanguageCode.SPANISH,
-                                    LanguageCode.FRENCH,
-                                    LanguageCode.GERMAN,
-                                    LanguageCode.JAPANESE,
-                                    LanguageCode.CHINESE_SIMPLIFIED
-                                ).forEach { lang ->
-                                    DropdownMenuItem(
-                                        text = { Text(lang.displayName) },
-                                        onClick = {
-                                            viewModel.setTargetLanguage(lang)
-                                        }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = displayTitle,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = displayAuthor,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                // Dual Subtitles & Live AI Translation Panel
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "ORIGINAL (${state.sourceLanguage.displayName})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Live AI Translation",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                                Switch(
+                                    checked = state.isLiveTranslationActive,
+                                    onCheckedChange = { viewModel.toggleLiveTranslation() },
+                                    modifier = Modifier.scale(0.7f)
+                                )
+                            }
+                        }
+                        Text(
+                            text = state.sourceSubtitle.ifBlank {
+                                if (state.isLiveTranslationActive && state.isPlaying) {
+                                    "Streaming source audio to Gemini Live..."
+                                } else {
+                                    "Source transcript appears here during Live AI translation."
+                                }
+                            },
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text(
+                                    text = "TRANSLATED (${state.targetLanguage.displayName})",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                                val statusText = when {
+                                    !state.isLiveTranslationActive -> "Status: Off (Playing original audio)"
+                                    !state.errorMessage.isNullOrBlank() -> "Status: Paused / Error — see notice above"
+                                    state.bufferAheadMs > 0L -> String.format(
+                                        "Look-ahead buffer: %.1fs ahead",
+                                        state.bufferAheadMs / 1000.0
                                     )
+                                    state.isPlaying -> "Status: Active (Buffering Gemini Live stream...)"
+                                    else -> "Status: Ready (Look-ahead buffer: 0.0s)"
+                                }
+                                Text(
+                                    text = statusText,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Box {
+                                TextButton(
+                                    onClick = { viewModel.setLanguageDropdownVisible(true) },
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                                ) {
+                                    Text(
+                                        text = state.targetLanguage.displayName,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Icon(
+                                        imageVector = Icons.Default.ArrowDropDown,
+                                        contentDescription = "Select Target Language",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                                DropdownMenu(
+                                    expanded = state.showLanguageDropdown,
+                                    onDismissRequest = { viewModel.setLanguageDropdownVisible(false) }
+                                ) {
+                                    LanguageCode.SUPPORTED_LIVE_LANGUAGES.forEach { lang ->
+                                        DropdownMenuItem(
+                                            text = { Text(lang.displayName) },
+                                            onClick = {
+                                                viewModel.setTargetLanguage(lang)
+                                            }
+                                        )
+                                    }
                                 }
                             }
                         }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = when {
+                                !state.isLiveTranslationActive -> "(Live AI Translation Disabled — Original Audio Active)"
+                                state.translatedSubtitle.isNotBlank() -> state.translatedSubtitle
+                                state.isPlaying -> "Translating speech into ${state.targetLanguage.displayName}..."
+                                else -> "Press Play to start real-time AI audio translation."
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
-                    Text(
-                        text = if (state.isLiveTranslationActive) state.translatedSubtitle else "(Translation Muted)",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
                 }
-            }
 
-            // Chapter UI & Scrubber (Requirement 4)
-            val currentChapter = state.chapters.getOrNull(state.currentChapterIndex)
-            val chapterTitle = currentChapter?.title ?: "Chapter ${state.currentChapterIndex + 1}"
-            val chapterCount = state.chapters.size.coerceAtLeast(1)
-            val chapterNumText = "Chapter ${state.currentChapterIndex + 1} of $chapterCount"
-            val chapterStartMs = currentChapter?.startMs ?: 0L
-            val chapterDurationMs = (currentChapter?.durationMs ?: state.durationMs).coerceAtLeast(1000L)
-            val elapsedInChapterMs = (state.currentPositionMs - chapterStartMs).coerceIn(0L, chapterDurationMs)
+                // Chapter UI & Scrubber
+                val currentChapter = state.chapters.getOrNull(state.currentChapterIndex)
+                val chapterTitle = currentChapter?.title ?: "Chapter ${state.currentChapterIndex + 1}"
+                val chapterCount = state.chapters.size.coerceAtLeast(1)
+                val chapterNumText = "Chapter ${state.currentChapterIndex + 1} of $chapterCount"
+                val chapterStartMs = currentChapter?.startMs ?: 0L
+                val chapterDurationMs = (currentChapter?.durationMs ?: state.durationMs).coerceAtLeast(1000L)
+                val elapsedInChapterMs = (state.currentPositionMs - chapterStartMs).coerceIn(0L, chapterDurationMs)
 
-            Column(modifier = Modifier.fillMaxWidth()) {
-                // Chapter Title & "Chapter X of Y"
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { viewModel.setChapterListSheetVisible(true) },
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = chapterTitle,
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = chapterNumText,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.secondary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+
+                    Slider(
+                        value = elapsedInChapterMs.toFloat(),
+                        onValueChange = { newElapsed ->
+                            viewModel.seekTo(chapterStartMs + newElapsed.toLong())
+                        },
+                        valueRange = 0f..chapterDurationMs.toFloat()
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = formatTime(elapsedInChapterMs),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        Text(
+                            text = "Speed: ${state.playbackSpeed}x",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = formatTime(chapterDurationMs),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    val totalProgress = if (state.durationMs > 0L) {
+                        (state.currentPositionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
+                    } else 0f
+                    LinearProgressIndicator(
+                        progress = { totalProgress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(2.dp)),
+                        color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f),
+                        trackColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "Total Book: ${formatTime(state.currentPositionMs)} / ${formatTime(state.durationMs)}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "${(totalProgress * 100).toInt()}%",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                // Secondary Controls Row (Speed, Sleep Timer, Add Bookmark)
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { viewModel.setChapterListSheetVisible(true) },
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = chapterTitle,
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f, fill = false)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = chapterNumText,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.secondary,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-
-                // Chapter progress slider
-                Slider(
-                    value = elapsedInChapterMs.toFloat(),
-                    onValueChange = { newElapsed ->
-                        viewModel.seekTo(chapterStartMs + newElapsed.toLong())
-                    },
-                    valueRange = 0f..chapterDurationMs.toFloat()
-                )
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = formatTime(elapsedInChapterMs),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                    Text(
-                        text = "Speed: ${state.playbackSpeed}x",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = formatTime(chapterDurationMs),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-                }
-
-                // Total book progress secondary text / indicator
-                Spacer(modifier = Modifier.height(4.dp))
-                val totalProgress = if (state.durationMs > 0L) {
-                    (state.currentPositionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
-                } else 0f
-                LinearProgressIndicator(
-                    progress = { totalProgress },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(4.dp)
-                        .clip(RoundedCornerShape(2.dp)),
-                    color = MaterialTheme.colorScheme.secondary.copy(alpha = 0.7f),
-                    trackColor = MaterialTheme.colorScheme.surfaceVariant
-                )
-                Spacer(modifier = Modifier.height(2.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = "Total Book: ${formatTime(state.currentPositionMs)} / ${formatTime(state.durationMs)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        text = "${(totalProgress * 100).toInt()}%",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            // Secondary Controls Row (Speed, Sleep Timer, Add Bookmark)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                // Speed Picker Button
-                OutlinedButton(onClick = {
-                    val nextSpeed = when (state.playbackSpeed) {
-                        1.0f -> 1.25f
-                        1.25f -> 1.5f
-                        1.5f -> 2.0f
-                        2.0f -> 0.5f
-                        0.5f -> 0.75f
-                        else -> 1.0f
+                    OutlinedButton(onClick = {
+                        val nextSpeed = when (state.playbackSpeed) {
+                            1.0f -> 1.25f
+                            1.25f -> 1.5f
+                            1.5f -> 2.0f
+                            2.0f -> 0.5f
+                            0.5f -> 0.75f
+                            else -> 1.0f
+                        }
+                        viewModel.setPlaybackSpeed(nextSpeed)
+                    }) {
+                        Text("${state.playbackSpeed}x")
                     }
-                    viewModel.setPlaybackSpeed(nextSpeed)
-                }) {
-                    Text("${state.playbackSpeed}x")
+
+                    OutlinedButton(onClick = { viewModel.setSleepTimerDialogVisible(true) }) {
+                        Icon(Icons.Default.Timer, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            if (state.sleepTimerMinutesRemaining > 0) {
+                                "${state.sleepTimerMinutesRemaining}m"
+                            } else {
+                                "Sleep"
+                            }
+                        )
+                    }
+
+                    OutlinedButton(onClick = { viewModel.setAddBookmarkDialogVisible(true) }) {
+                        Icon(Icons.Default.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Bookmark")
+                    }
                 }
 
-                // Sleep Timer Button
-                OutlinedButton(onClick = { viewModel.setSleepTimerDialogVisible(true) }) {
-                    Icon(Icons.Default.Timer, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(if (state.isSleepTimerRunning) "${state.sleepTimerOptionMinutes}m" else "Sleep")
-                }
-
-                // Add Bookmark Button
-                OutlinedButton(onClick = { viewModel.setAddBookmarkDialogVisible(true) }) {
-                    Icon(Icons.Default.BookmarkAdd, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("Bookmark")
-                }
-            }
-
-            // Ducking toggle row
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = if (state.isDuckingEnabled) Icons.AutoMirrored.Filled.VolumeDown else Icons.AutoMirrored.Filled.VolumeMute,
-                        contentDescription = null
+                // Ducking / Mute toggle row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = when {
+                                !state.isLiveTranslationActive -> Icons.AutoMirrored.Filled.VolumeUp
+                                state.isDuckingEnabled -> Icons.AutoMirrored.Filled.VolumeDown
+                                else -> Icons.AutoMirrored.Filled.VolumeMute
+                            },
+                            contentDescription = null
+                        )
+                        Column(modifier = Modifier.padding(start = 8.dp)) {
+                            Text(
+                                text = when {
+                                    !state.isLiveTranslationActive -> "Original Audio: Full Volume (100%)"
+                                    state.isDuckingEnabled -> "Original Audio: Ducked ($duckPercent%)"
+                                    else -> "Original Audio: Muted (0%)"
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = when {
+                                    !state.isLiveTranslationActive -> "Live AI Translation is off"
+                                    state.isDuckingEnabled -> "Original audiobook plays softly under translated AI voice"
+                                    else -> "Only translated AI voice is audible (toggle to duck original at $duckPercent%)"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                    Switch(
+                        checked = state.isDuckingEnabled,
+                        onCheckedChange = { viewModel.toggleDucking() }
                     )
-                    Text(
-                        text = if (state.isDuckingEnabled) "Original Ducked (15%)" else "Original Muted",
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(start = 8.dp)
-                    )
                 }
-                Switch(
-                    checked = state.isDuckingEnabled,
-                    onCheckedChange = { viewModel.toggleDucking() }
-                )
             }
 
             // Transport Controls (Previous Chapter, Rewind 15s, Play/Pause, Forward 15s, Next Chapter)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 20.dp),
+                    .padding(top = 8.dp, bottom = 16.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Previous Chapter button
                 IconButton(onClick = { viewModel.previousChapter() }) {
                     Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Chapter")
                 }
-                // Rewind 15s
                 IconButton(onClick = { viewModel.seekBy(-15000L) }) {
                     Icon(Icons.Default.FastRewind, contentDescription = "Rewind 15s")
                 }
-                // Play / Pause
                 IconButton(
                     onClick = { viewModel.togglePlayPause() },
                     modifier = Modifier
@@ -428,11 +552,9 @@ fun AudiobookPlayerScreen(
                         tint = MaterialTheme.colorScheme.onPrimary
                     )
                 }
-                // Forward 15s
                 IconButton(onClick = { viewModel.seekBy(15000L) }) {
                     Icon(Icons.Default.FastForward, contentDescription = "Forward 15s")
                 }
-                // Next Chapter button
                 IconButton(onClick = { viewModel.nextChapter() }) {
                     Icon(Icons.Default.SkipNext, contentDescription = "Next Chapter")
                 }
@@ -515,7 +637,7 @@ fun AudiobookPlayerScreen(
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Column {
+                                    Column(modifier = Modifier.weight(1f)) {
                                         Text(bm.title, fontWeight = FontWeight.SemiBold)
                                         Text(formatTime(bm.positionMs), style = MaterialTheme.typography.bodySmall)
                                     }
@@ -570,13 +692,19 @@ fun AudiobookPlayerScreen(
                 title = { Text("Sleep Timer") },
                 text = {
                     Column {
-                        val options = listOf(0, 15, 30, 45, 60)
+                        val options = listOf(0, 15, 30, 45, 60, -1)
                         options.forEach { mins ->
                             TextButton(
                                 onClick = { viewModel.setSleepTimer(mins) },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text(if (mins == 0) "Off" else "$mins minutes")
+                                Text(
+                                    when (mins) {
+                                        0 -> "Off"
+                                        -1 -> "End of chapter"
+                                        else -> "$mins minutes"
+                                    }
+                                )
                             }
                         }
                     }
@@ -592,19 +720,39 @@ fun AudiobookPlayerScreen(
         if (state.showAiReportDialog) {
             AlertDialog(
                 onDismissRequest = { viewModel.setAiReportDialogVisible(false) },
-                title = { Text("AI Output Report") },
+                title = { Text("Live AI Translation Status") },
                 text = {
-                    Column {
-                        Text("Google Play AI-Content Compliance Info:", fontWeight = FontWeight.Bold)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("• Audio translation generated via Neural AI Speech synthesis.")
-                        Text("• Dual subtitle transcript transcribed with automated speech recognition models.")
-                        Text("• All AI content is reviewed and verified in accordance with platform policies.")
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Gemini Live Audio-to-Audio Pipeline:", fontWeight = FontWeight.Bold)
+                        Text(
+                            "• Mode: ${if (state.isLiveTranslationActive) "Live AI Speech-to-Speech Active" else "Disabled (Original Audiobook Audio)"}"
+                        )
+                        Text(
+                            "• Target Language: ${state.targetLanguage.displayName} (${state.targetLanguage.code})"
+                        )
+                        Text(
+                            "• Look-Ahead Buffer: ${String.format("%.1fs", state.bufferAheadMs / 1000.0)}"
+                        )
+                        Text(
+                            "• Original Audio Mix: ${
+                                when {
+                                    !state.isLiveTranslationActive -> "100% (Full Volume)"
+                                    state.isDuckingEnabled -> "Ducked to $duckPercent%"
+                                    else -> "Muted (0%)"
+                                }
+                            }"
+                        )
+                        if (!state.errorMessage.isNullOrBlank()) {
+                            Text(
+                                "• Last Error: ${state.errorMessage}",
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
                     }
                 },
                 confirmButton = {
                     Button(onClick = { viewModel.setAiReportDialogVisible(false) }) {
-                        Text("Acknowledge")
+                        Text("Close")
                     }
                 }
             )

@@ -36,6 +36,7 @@ dependencies {
     implementation(project(":core:playback"))
     implementation(project(":feature:translate"))
     implementation(libs.media3.exoplayer)
+    implementation(libs.media3.session)
     implementation(libs.media3.common)
 
     implementation(libs.androidx.core.ktx)
