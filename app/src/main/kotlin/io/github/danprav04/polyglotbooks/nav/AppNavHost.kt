@@ -81,10 +81,21 @@ fun AppNavHost(
                     }
                 }
 
+                val folderPickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                    contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
+                ) { treeUri ->
+                    if (treeUri != null) {
+                        libraryViewModel.importFolder(context, treeUri)
+                    }
+                }
+
                 LibraryScreen(
                     viewModel = libraryViewModel,
                     onImportFileClick = {
                         filePickerLauncher.launch(arrayOf("*/*"))
+                    },
+                    onImportFolderClick = {
+                        folderPickerLauncher.launch(null)
                     },
                     onOpenEbook = { bookId ->
                         navController.navigate(Screen.Reader.createRoute(bookId))

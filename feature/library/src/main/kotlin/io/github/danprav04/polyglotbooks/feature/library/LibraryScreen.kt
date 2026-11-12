@@ -21,6 +21,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoStories
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -52,11 +54,46 @@ import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 fun LibraryScreen(
     viewModel: LibraryViewModel = androidx.lifecycle.viewmodel.compose.viewModel(),
     onImportFileClick: () -> Unit = {},
+    onImportFolderClick: () -> Unit = {},
     onOpenAudiobook: (audiobookId: String) -> Unit = {},
     onOpenEbook: (ebookId: String) -> Unit = {}
 ) {
     val books by viewModel.books.collectAsState()
     var selectedTab by remember { mutableStateOf(LibraryFilterTab.ALL) }
+    var showImportChoice by remember { mutableStateOf(false) }
+
+    if (showImportChoice) {
+        AlertDialog(
+            onDismissRequest = { showImportChoice = false },
+            title = { Text("Import to Library") },
+            text = { Text("Choose whether to import individual files (or multi-select files) or select an entire audiobook folder.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showImportChoice = false
+                        onImportFolderClick()
+                    }
+                ) {
+                    Text("Import Folder")
+                }
+            },
+            dismissButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { showImportChoice = false }) {
+                        Text("Cancel")
+                    }
+                    Button(
+                        onClick = {
+                            showImportChoice = false
+                            onImportFileClick()
+                        }
+                    ) {
+                        Text("Import File(s)")
+                    }
+                }
+            }
+        )
+    }
 
     val filteredBooks = when (selectedTab) {
         LibraryFilterTab.ALL -> books
@@ -71,7 +108,7 @@ fun LibraryScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = onImportFileClick) {
+            FloatingActionButton(onClick = { showImportChoice = true }) {
                 Icon(Icons.Default.Add, contentDescription = "Import Book or Audiobook")
             }
         }
@@ -131,7 +168,7 @@ fun LibraryScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.height(24.dp))
-                        Button(onClick = onImportFileClick) {
+                        Button(onClick = { showImportChoice = true }) {
                             Text("Import Book / Audiobook")
                         }
                     }

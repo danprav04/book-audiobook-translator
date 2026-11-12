@@ -33,8 +33,60 @@ class LibraryViewModel @Inject constructor(
 
     fun importUris(context: Context, uris: List<Uri>) {
         viewModelScope.launch {
-            val importer = SafLibraryImporter(context.applicationContext, bookDao, chapterDao)
-            importer.importUris(uris)
+            try {
+                val importer = SafLibraryImporter(context.applicationContext, bookDao, chapterDao)
+                importer.importUris(uris)
+            } catch (e: Exception) {
+                android.util.Log.e("LibraryViewModel", "Error importing uris", e)
+            }
+        }
+    }
+
+    fun importFolder(context: Context, treeUri: Uri) {
+        viewModelScope.launch {
+            try {
+                val takeFlags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                context.contentResolver.takePersistableUriPermission(treeUri, takeFlags)
+
+                val docId = if (android.provider.DocumentsContract.isDocumentUri(context, treeUri)) {
+                    android.provider.DocumentsContract.getDocumentId(treeUri)
+                } else {
+                    android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+                }
+
+                val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+                val fileUris = mutableListOf<Uri>()
+
+                context.contentResolver.query(
+                    childrenUri,
+                    arrayOf(
+                        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
+                    ),
+                    null,
+                    null,
+                    null
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val mimeCol = cursor.getColumnIndex(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    while (cursor.moveToNext()) {
+                        val childDocId = cursor.getString(idCol)
+                        val mimeType = cursor.getString(mimeCol)
+                        // Ignore sub-directories, collect files
+                        if (mimeType != android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+                            val childUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, childDocId)
+                            fileUris.add(childUri)
+                        }
+                    }
+                }
+
+                if (fileUris.isNotEmpty()) {
+                    val importer = SafLibraryImporter(context.applicationContext, bookDao, chapterDao)
+                    importer.importUris(fileUris)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("LibraryViewModel", "Error importing folder tree", e)
+            }
         }
     }
 
