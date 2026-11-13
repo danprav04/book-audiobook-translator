@@ -166,6 +166,24 @@ object CoverExtractor {
         }
     }
 
+    fun extractDurationMs(context: Context, uri: Uri): Long {
+        val pfd = try {
+            context.contentResolver.openFileDescriptor(uri, "r")
+        } catch (_: Exception) {
+            null
+        } ?: return 0L
+
+        return pfd.use { descriptor ->
+            try {
+                val channel = FileInputStream(descriptor.fileDescriptor).channel
+                val moovData = findMoovBuffer(channel, channel.size()) ?: return@use 0L
+                parseMvhdDurationMs(moovData.first)
+            } catch (_: Exception) {
+                0L
+            }
+        }
+    }
+
     fun extractChapters(channel: FileChannel, fileSize: Long, bookId: String = ""): List<Chapter> {
         if (fileSize <= 0) return emptyList()
 
@@ -175,17 +193,19 @@ object CoverExtractor {
         val moovFileOffset = moovData?.second ?: 0L
 
         if (moovBuf != null) {
+            val mvhdDurationMs = parseMvhdDurationMs(moovBuf)
+
             // 1. Try Nero 'chpl' chapters
             val chplTag = byteArrayOf('c'.code.toByte(), 'h'.code.toByte(), 'p'.code.toByte(), 'l'.code.toByte())
             val chplIdx = indexOf(moovBuf, chplTag, 0, moovBuf.size)
             if (chplIdx != -1) {
                 val chapters = parseChpl(moovBuf, chplIdx, moovBuf.size, bookId)
-                if (chapters.isNotEmpty()) return chapters
+                if (chapters.isNotEmpty()) return applyTotalDurationToLastChapter(chapters, mvhdDurationMs)
             }
 
             // 2. Try QuickTime timed text track
             val qtChapters = parseQuickTimeTextTrack(moovBuf, moovFileOffset, channel, bookId)
-            if (qtChapters.isNotEmpty()) return qtChapters
+            if (qtChapters.isNotEmpty()) return applyTotalDurationToLastChapter(qtChapters, mvhdDurationMs)
         }
 
         return emptyList()
@@ -194,19 +214,67 @@ object CoverExtractor {
     fun extractChapters(bytes: ByteArray, bookId: String = ""): List<Chapter> {
         if (bytes.isEmpty()) return emptyList()
 
+        val mvhdDurationMs = parseMvhdDurationMs(bytes)
+
         // 1. Try Nero 'chpl' chapters
         val chplTag = byteArrayOf('c'.code.toByte(), 'h'.code.toByte(), 'p'.code.toByte(), 'l'.code.toByte())
         val chplIdx = indexOf(bytes, chplTag, 0, bytes.size)
         if (chplIdx != -1) {
             val chapters = parseChpl(bytes, chplIdx, bytes.size, bookId)
-            if (chapters.isNotEmpty()) return chapters
+            if (chapters.isNotEmpty()) return applyTotalDurationToLastChapter(chapters, mvhdDurationMs)
         }
 
         // 2. Try QuickTime timed text track from in-memory byte buffer
         val qtChapters = parseQuickTimeTextTrack(bytes, 0L, null, bookId)
-        if (qtChapters.isNotEmpty()) return qtChapters
+        if (qtChapters.isNotEmpty()) return applyTotalDurationToLastChapter(qtChapters, mvhdDurationMs)
 
         return emptyList()
+    }
+
+    private fun applyTotalDurationToLastChapter(
+        chapters: List<Chapter>,
+        totalDurationMs: Long
+    ): List<Chapter> {
+        if (chapters.isEmpty() || totalDurationMs <= 0L) return chapters
+        val last = chapters.last()
+        return if (totalDurationMs > last.startMs && last.endMs != totalDurationMs) {
+            chapters.dropLast(1) + last.copy(endMs = totalDurationMs)
+        } else {
+            chapters
+        }
+    }
+
+    fun parseMvhdDurationMs(bytes: ByteArray): Long {
+        if (bytes.size < 32) return 0L
+        val mvhdTag = byteArrayOf('m'.code.toByte(), 'v'.code.toByte(), 'h'.code.toByte(), 'd'.code.toByte())
+        var searchFrom = 4
+        while (searchFrom < bytes.size - 24) {
+            val tagIdx = indexOf(bytes, mvhdTag, searchFrom, bytes.size)
+            if (tagIdx == -1) break
+            searchFrom = tagIdx + 4
+
+            val versionPos = tagIdx + 4
+            if (versionPos >= bytes.size) break
+            val version = bytes[versionPos].toInt() and 0xFF
+            if (version == 0 && tagIdx + 24 <= bytes.size) {
+                val timescale = ByteBuffer.wrap(bytes, tagIdx + 16, 4)
+                    .order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
+                val duration = ByteBuffer.wrap(bytes, tagIdx + 20, 4)
+                    .order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
+                if (timescale > 0L && duration > 0L) {
+                    return (duration * 1000L) / timescale
+                }
+            } else if (version == 1 && tagIdx + 36 <= bytes.size) {
+                val timescale = ByteBuffer.wrap(bytes, tagIdx + 24, 4)
+                    .order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
+                val duration = ByteBuffer.wrap(bytes, tagIdx + 28, 8)
+                    .order(ByteOrder.BIG_ENDIAN).long
+                if (timescale > 0L && duration > 0L) {
+                    return (duration * 1000L) / timescale
+                }
+            }
+        }
+        return 0L
     }
 
     // -------------------------------------------------------------------------
