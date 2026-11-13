@@ -95,6 +95,16 @@ class SafLibraryImporter(
                     } catch (_: Exception) {
                         // Fallback to filename metadata
                     }
+                    if (audioDurationMs == 3600000L) {
+                        val headerDurationMs = try {
+                            CoverExtractor.extractDurationMs(context, uri)
+                        } catch (_: Exception) {
+                            0L
+                        }
+                        if (headerDurationMs > 0L) {
+                            audioDurationMs = headerDurationMs
+                        }
+                    }
 
                     val bookId = uri.toString().hashCode().toString()
                     extractedCoverPath = CoverExtractor.extractCover(context, uri, bookId)
@@ -245,7 +255,7 @@ class SafLibraryImporter(
         if (embeddedChapters.isNotEmpty()) {
             if (audioDurationMs > 0L) {
                 val last = embeddedChapters.last()
-                if (last.endMs < audioDurationMs) {
+                if (audioDurationMs > last.startMs && last.endMs != audioDurationMs) {
                     val updated = embeddedChapters.toMutableList()
                     updated[updated.size - 1] = last.copy(endMs = audioDurationMs)
                     return@withContext updated
