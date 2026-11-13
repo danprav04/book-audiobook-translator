@@ -33,6 +33,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import java.io.File
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -269,13 +270,16 @@ fun AudiobookPlayerScreen(
                         }
                         Text(
                             text = state.sourceSubtitle.ifBlank {
-                                if (state.isLiveTranslationActive && state.isPlaying) {
-                                    "Streaming source audio to Gemini Live..."
-                                } else {
-                                    "Source transcript appears here during Live AI translation."
+                                when {
+                                    !state.errorMessage.isNullOrBlank() -> "Source transcript paused due to error."
+                                    state.isLiveTranslationActive && state.isPlaying -> "Streaming source audio to Gemini Live..."
+                                    else -> "Source transcript appears here during Live AI translation."
                                 }
                             },
-                            style = MaterialTheme.typography.bodyMedium
+                            style = MaterialTheme.typography.bodyMedium,
+                            minLines = 2,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Row(
@@ -293,6 +297,7 @@ fun AudiobookPlayerScreen(
                                     !state.isLiveTranslationActive -> "Status: Off (Playing original audio)"
                                     !state.errorMessage.isNullOrBlank() -> "Status: Paused / Error — see notice above"
                                     state.bufferAheadMs > 0L -> String.format(
+                                        Locale.US,
                                         "Look-ahead buffer: %.1fs ahead",
                                         state.bufferAheadMs / 1000.0
                                     )
@@ -341,11 +346,15 @@ fun AudiobookPlayerScreen(
                             text = when {
                                 !state.isLiveTranslationActive -> "(Live AI Translation Disabled — Original Audio Active)"
                                 state.translatedSubtitle.isNotBlank() -> state.translatedSubtitle
+                                !state.errorMessage.isNullOrBlank() -> "Fix the notice above, then press Play to resume translation."
                                 state.isPlaying -> "Translating speech into ${state.targetLanguage.displayName}..."
                                 else -> "Press Play to start real-time AI audio translation."
                             },
                             style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.SemiBold,
+                            minLines = 2,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
@@ -356,8 +365,17 @@ fun AudiobookPlayerScreen(
                 val chapterCount = state.chapters.size.coerceAtLeast(1)
                 val chapterNumText = "Chapter ${state.currentChapterIndex + 1} of $chapterCount"
                 val chapterStartMs = currentChapter?.startMs ?: 0L
-                val chapterDurationMs = (currentChapter?.durationMs ?: state.durationMs).coerceAtLeast(1000L)
+                val chapterDurationMs = (currentChapter?.durationMs?.takeIf { it > 0L } ?: state.durationMs).coerceAtLeast(1000L)
                 val elapsedInChapterMs = (state.currentPositionMs - chapterStartMs).coerceIn(0L, chapterDurationMs)
+
+                var isDraggingSlider by remember(state.bookId, state.currentChapterIndex) { mutableStateOf(false) }
+                var dragElapsedMs by remember(state.bookId, state.currentChapterIndex) { mutableStateOf(elapsedInChapterMs) }
+                val displayedElapsedMs = if (isDraggingSlider) dragElapsedMs.coerceIn(0L, chapterDurationMs) else elapsedInChapterMs
+                val displayedTotalMs = if (isDraggingSlider) {
+                    (chapterStartMs + displayedElapsedMs).coerceIn(0L, state.durationMs.coerceAtLeast(chapterStartMs + displayedElapsedMs))
+                } else {
+                    state.currentPositionMs
+                }
 
                 Column(modifier = Modifier.fillMaxWidth()) {
                     Row(
@@ -385,9 +403,15 @@ fun AudiobookPlayerScreen(
                     }
 
                     Slider(
-                        value = elapsedInChapterMs.toFloat(),
+                        value = displayedElapsedMs.toFloat(),
                         onValueChange = { newElapsed ->
-                            viewModel.seekTo(chapterStartMs + newElapsed.toLong())
+                            isDraggingSlider = true
+                            dragElapsedMs = newElapsed.toLong()
+                        },
+                        onValueChangeFinished = {
+                            val targetPos = chapterStartMs + dragElapsedMs.coerceIn(0L, chapterDurationMs)
+                            isDraggingSlider = false
+                            viewModel.seekTo(targetPos)
                         },
                         valueRange = 0f..chapterDurationMs.toFloat()
                     )
@@ -396,7 +420,7 @@ fun AudiobookPlayerScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = formatTime(elapsedInChapterMs),
+                            text = formatTime(displayedElapsedMs),
                             style = MaterialTheme.typography.bodySmall
                         )
                         Text(
@@ -412,7 +436,7 @@ fun AudiobookPlayerScreen(
 
                     Spacer(modifier = Modifier.height(4.dp))
                     val totalProgress = if (state.durationMs > 0L) {
-                        (state.currentPositionMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
+                        (displayedTotalMs.toFloat() / state.durationMs.toFloat()).coerceIn(0f, 1f)
                     } else 0f
                     LinearProgressIndicator(
                         progress = { totalProgress },
@@ -429,7 +453,7 @@ fun AudiobookPlayerScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "Total Book: ${formatTime(state.currentPositionMs)} / ${formatTime(state.durationMs)}",
+                            text = "Total Book: ${formatTime(displayedTotalMs)} / ${formatTime(state.durationMs)}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
