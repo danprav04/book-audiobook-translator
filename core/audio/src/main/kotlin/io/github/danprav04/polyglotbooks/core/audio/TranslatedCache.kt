@@ -21,7 +21,8 @@ interface TranslatedCache {
  */
 class DiskTranslatedCache(
     private val cacheDir: File,
-    private val cacheDao: TranslationCacheDao
+    private val cacheDao: TranslationCacheDao,
+    private val maxCacheBytes: Long = DEFAULT_MAX_CACHE_BYTES
 ) : TranslatedCache {
 
     init {
@@ -59,6 +60,9 @@ class DiskTranslatedCache(
             createdAt = System.currentTimeMillis()
         )
         cacheDao.insertSegment(entity)
+        if (maxCacheBytes > 0L) {
+            evictToMaxBytes(maxCacheBytes)
+        }
     }
 
     override suspend fun getSegmentPcm(segment: TranslatedSegmentEntity): ByteArray? {
@@ -95,5 +99,9 @@ class DiskTranslatedCache(
             }
             cacheDao.deleteSegment(segment)
         }
+    }
+
+    companion object {
+        const val DEFAULT_MAX_CACHE_BYTES: Long = 1024L * 1024L * 1024L // 1 GB
     }
 }
