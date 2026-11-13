@@ -282,7 +282,10 @@ private fun ApiKeySection(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedButton(
-                    onClick = onTestKey,
+                    onClick = {
+                        focusManager.clearFocus()
+                        onTestKey()
+                    },
                     modifier = Modifier.weight(1f),
                     enabled = uiState.testKeyStatus !is TestKeyStatus.Testing && uiState.apiKeyInput.isNotBlank()
                 ) {
@@ -290,7 +293,10 @@ private fun ApiKeySection(
                 }
 
                 Button(
-                    onClick = onSaveKey,
+                    onClick = {
+                        focusManager.clearFocus()
+                        onSaveKey()
+                    },
                     modifier = Modifier.weight(1f),
                     enabled = uiState.apiKeyInput.isNotBlank()
                 ) {
