@@ -10,6 +10,8 @@ import android.os.Build
 import android.os.PowerManager
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
@@ -122,13 +124,86 @@ class PolyglotPlaybackService : MediaSessionService() {
             .build()
         exoPlayer = newPlayer
 
-        val sessionBuilder = MediaSession.Builder(this, newPlayer)
+        val sessionPlayer = SessionForwardingPlayer(newPlayer)
+        val sessionBuilder = MediaSession.Builder(this, sessionPlayer)
         PlaybackNotificationManager.createSessionActivityPendingIntent(this)?.let { pendingIntent ->
             sessionBuilder.setSessionActivity(pendingIntent)
         }
         mediaSession = sessionBuilder.build()
 
         activeSessionManager.attachService(this)
+    }
+
+    private inner class SessionForwardingPlayer(
+        wrappedPlayer: ExoPlayer
+    ) : ForwardingPlayer(wrappedPlayer) {
+
+        override fun getAvailableCommands(): Player.Commands {
+            return super.getAvailableCommands().buildUpon().addAll(
+                COMMAND_SEEK_BACK,
+                COMMAND_SEEK_FORWARD,
+                COMMAND_SEEK_TO_PREVIOUS,
+                COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                COMMAND_SEEK_TO_NEXT,
+                COMMAND_SEEK_TO_NEXT_MEDIA_ITEM
+            ).build()
+        }
+
+        override fun isCommandAvailable(command: Int): Boolean {
+            return when (command) {
+                COMMAND_SEEK_BACK,
+                COMMAND_SEEK_FORWARD,
+                COMMAND_SEEK_TO_PREVIOUS,
+                COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                COMMAND_SEEK_TO_NEXT,
+                COMMAND_SEEK_TO_NEXT_MEDIA_ITEM -> true
+                else -> super.isCommandAvailable(command)
+            }
+        }
+
+        override fun play() {
+            activeSessionManager.play()
+        }
+
+        override fun pause() {
+            activeSessionManager.pause()
+        }
+
+        override fun seekTo(positionMs: Long) {
+            activeSessionManager.seekTo(positionMs)
+        }
+
+        override fun seekTo(mediaItemIndex: Int, positionMs: Long) {
+            if (mediaItemIndex == C.INDEX_UNSET || mediaItemIndex == currentMediaItemIndex) {
+                activeSessionManager.seekTo(positionMs)
+            } else {
+                super.seekTo(mediaItemIndex, positionMs)
+            }
+        }
+
+        override fun seekBack() {
+            activeSessionManager.seekBy(-NOTIFICATION_SEEK_DELTA_MS)
+        }
+
+        override fun seekForward() {
+            activeSessionManager.seekBy(NOTIFICATION_SEEK_DELTA_MS)
+        }
+
+        override fun seekToNext() {
+            activeSessionManager.nextChapter()
+        }
+
+        override fun seekToNextMediaItem() {
+            activeSessionManager.nextChapter()
+        }
+
+        override fun seekToPrevious() {
+            activeSessionManager.previousChapter()
+        }
+
+        override fun seekToPreviousMediaItem() {
+            activeSessionManager.previousChapter()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -339,5 +414,6 @@ class PolyglotPlaybackService : MediaSessionService() {
         const val WAKE_LOCK_TAG = "PolyglotBooks:LiveTranslateWakeLock"
         const val WIFI_LOCK_TAG = "PolyglotBooks:LiveTranslateWifiLock"
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L // 4 hours max safety timeout
+        private const val NOTIFICATION_SEEK_DELTA_MS = 15_000L
     }
 }
