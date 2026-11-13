@@ -375,4 +375,152 @@ class TranslationPipelineTest {
         assertEquals(listOf("start:fr", "stop:begin", "stop:end", "start:de"), events.toList())
         pipeline.stop()
     }
+
+    @Test
+    fun testIncrementalSubtitlesAccumulatePerTurnAndMidSegmentCacheResumeSlicesOffset() = runTest {
+        val fakeDecoder = object : SourceDecoder {
+            override fun decode(filePath: String, startPositionMs: Long, durationMs: Long): Flow<PcmChunk> = flow {
+                emit(PcmChunk(ByteArray(3200) { 1 }, sampleRate = 16000, channels = 1, timestampMs = startPositionMs))
+            }
+
+            override fun release() {}
+        }
+
+        val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
+        val fakeClient = object : LiveTranslateClient {
+            override val translationStream: Flow<TranslationOutput> = outputFlow.asSharedFlow()
+            override suspend fun start(
+                apiKey: String,
+                targetLanguageCode: String,
+                echoTargetLanguage: Boolean,
+                model: String
+            ) {}
+
+            override suspend fun sendAudio(chunk: PcmChunk) {}
+            override suspend fun stop() {}
+        }
+
+        // Cached 1000ms segment [0..1000], resuming at fromMs = 500 -> should slice last half of bytes
+        val fullCachedPcm = ByteArray(100) { idx -> idx.toByte() }
+        val cachedSeg = TranslatedSegmentEntity(
+            id = "b1_ru_0_1000",
+            bookId = "b1",
+            targetLang = "ru",
+            sourceStartMs = 0L,
+            sourceEndMs = 1000L,
+            aacFilePath = "/tmp/cache.pcm",
+            fileSizeBytes = fullCachedPcm.size.toLong(),
+            createdAt = 1L
+        )
+        val cache = object : TranslatedCache {
+            override suspend fun findCachedRange(bookId: String, targetLanguage: String, sourceMs: Long): TranslatedSegmentEntity? {
+                return if (sourceMs in 0L until 1000L) cachedSeg else null
+            }
+
+            override suspend fun putSegment(bookId: String, targetLanguage: String, sourceStartMs: Long, sourceEndMs: Long, pcmData: ByteArray) {}
+            override suspend fun getSegmentPcm(segment: TranslatedSegmentEntity): ByteArray? = fullCachedPcm
+            override suspend fun evictToMaxBytes(maxBytes: Long) {}
+            override suspend fun clearCache() {}
+        }
+
+        val writtenChunks = mutableListOf<PcmChunk>()
+        val recordingPlayer = object : PcmPlayer {
+            override val currentPositionMs = kotlinx.coroutines.flow.MutableStateFlow(0L)
+            override fun init(sampleRate: Int, channels: Int) {}
+            override fun write(chunk: PcmChunk): Int {
+                writtenChunks.add(chunk)
+                return chunk.data.size
+            }
+            override fun setPlaybackSpeed(speed: Float) {}
+            override fun setOriginalAudioVolume(volume: Float) {}
+            override fun play() {}
+            override fun pause() {}
+            override fun stop() {}
+            override fun flush() {}
+            override fun release() {}
+        }
+
+        val pipeline = TranslationPipeline(
+            sourceDecoder = fakeDecoder,
+            resampler = StreamingLinearResampler(),
+            chunker = Chunker(3200),
+            pacer = Pacer(),
+            liveTranslateClient = fakeClient,
+            pcmPlayer = recordingPlayer,
+            translatedCache = cache,
+            enablePacingDelay = false
+        )
+
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "b1",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.RUSSIAN,
+            apiKey = "valid-key",
+            startPositionMs = 500L
+        )
+        advanceUntilIdle()
+
+        // Mid-segment resume should have written the second half (50 bytes starting at 50)
+        assertEquals(1, writtenChunks.size)
+        assertEquals(50, writtenChunks[0].data.size)
+        assertEquals(50.toByte(), writtenChunks[0].data[0])
+
+        // Incremental deltas within one turn should accumulate cleanly, not overwrite with 1 word
+        outputFlow.emit(TranslationOutput(sourceTranscript = "Hello ", targetTranscript = "Привет "))
+        outputFlow.emit(TranslationOutput(sourceTranscript = "world", targetTranscript = "мир", isTurnComplete = true))
+        advanceUntilIdle()
+
+        assertEquals("Hello world", pipeline.state.value.currentSourceSubtitle)
+        assertEquals("Привет мир", pipeline.state.value.currentTranslatedSubtitle)
+
+        // Next turn after isTurnComplete resets cleanly to the new turn's text
+        outputFlow.emit(TranslationOutput(sourceTranscript = "Next sentence", targetTranscript = "Следующая фраза"))
+        advanceUntilIdle()
+
+        assertEquals("Next sentence", pipeline.state.value.currentSourceSubtitle)
+        assertEquals("Следующая фраза", pipeline.state.value.currentTranslatedSubtitle)
+
+        pipeline.stop()
+    }
+
+    @Test
+    fun testPausedWebsocketErrorDoesNotExposeErrorBanner() = runTest {
+        val fakeDecoder = object : SourceDecoder {
+            override fun decode(filePath: String, startPositionMs: Long, durationMs: Long): Flow<PcmChunk> = flow {}
+            override fun release() {}
+        }
+        val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
+        val fakeClient = object : LiveTranslateClient {
+            override val translationStream: Flow<TranslationOutput> = outputFlow.asSharedFlow()
+            override suspend fun start(apiKey: String, targetLanguageCode: String, echoTargetLanguage: Boolean, model: String) {}
+            override suspend fun sendAudio(chunk: PcmChunk) {}
+            override suspend fun stop() {}
+        }
+        val pipeline = TranslationPipeline(
+            sourceDecoder = fakeDecoder,
+            resampler = StreamingLinearResampler(),
+            chunker = Chunker(3200),
+            pacer = Pacer(),
+            liveTranslateClient = fakeClient,
+            pcmPlayer = AudioTrackPcmPlayer { _, _ -> null },
+            enablePacingDelay = false
+        )
+
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "b2",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.SPANISH,
+            apiKey = "valid-key"
+        )
+        advanceUntilIdle()
+        pipeline.pauseAudio()
+
+        outputFlow.emit(TranslationOutput(errorMessage = "Idle timeout"))
+        advanceUntilIdle()
+
+        assertFalse(pipeline.state.value.isRunning)
+        assertNull(pipeline.state.value.errorMessage)
+    }
 }

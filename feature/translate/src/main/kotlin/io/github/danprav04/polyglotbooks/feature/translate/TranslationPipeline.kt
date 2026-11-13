@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -183,6 +184,7 @@ class TranslationPipeline(
 
                 // 1. Check cache first
                 val decodeStartMs = playCachedSegmentsIfAvailable(
+                    runGen = runGen,
                     bookId = bookId,
                     targetLanguageCode = targetLanguage.code,
                     fromMs = initialPosMs
@@ -195,6 +197,10 @@ class TranslationPipeline(
                 var activeOutputChannels = 1
                 val turnBuffer = ByteArrayOutputStream()
                 var turnStartSourceMs = decodeStartMs
+                val sourceTurnBuilder = StringBuilder()
+                val targetTurnBuilder = StringBuilder()
+                var resetSourceOnNextText = false
+                var resetTargetOnNextText = false
 
                 val newCollectorJob = launch(Dispatchers.Unconfined) {
                     liveTranslateClient.translationStream.collect { output ->
@@ -207,10 +213,11 @@ class TranslationPipeline(
 
                         if (!output.errorMessage.isNullOrBlank()) {
                             abortedByError.set(true)
+                            val pausedWhenClosed = isPaused.get()
                             _state.update {
                                 it.copy(
                                     isRunning = false,
-                                    errorMessage = output.errorMessage
+                                    errorMessage = if (pausedWhenClosed) null else output.errorMessage
                                 )
                             }
                             try {
@@ -229,10 +236,24 @@ class TranslationPipeline(
                         val newSource = output.sourceTranscript?.takeIf { it.isNotBlank() }
                         val newTarget = output.targetTranscript?.takeIf { it.isNotBlank() }
                         if (newSource != null || newTarget != null) {
+                            val mergedSource = if (newSource != null) {
+                                val reset = resetSourceOnNextText
+                                resetSourceOnNextText = false
+                                mergeSubtitleDelta(sourceTurnBuilder, newSource, reset)
+                            } else {
+                                null
+                            }
+                            val mergedTarget = if (newTarget != null) {
+                                val reset = resetTargetOnNextText
+                                resetTargetOnNextText = false
+                                mergeSubtitleDelta(targetTurnBuilder, newTarget, reset)
+                            } else {
+                                null
+                            }
                             _state.update { prev ->
                                 prev.copy(
-                                    currentSourceSubtitle = newSource ?: prev.currentSourceSubtitle,
-                                    currentTranslatedSubtitle = newTarget ?: prev.currentTranslatedSubtitle
+                                    currentSourceSubtitle = mergedSource ?: prev.currentSourceSubtitle,
+                                    currentTranslatedSubtitle = mergedTarget ?: prev.currentTranslatedSubtitle
                                 )
                             }
                         }
@@ -263,23 +284,31 @@ class TranslationPipeline(
                             }
                         }
 
-                        if (output.isTurnComplete && turnBuffer.size() > 0) {
-                            val endSourceMs = sourceDecodedCursorMs.get()
-                            if (translatedCache != null && endSourceMs > turnStartSourceMs) {
-                                val pcmBytes = turnBuffer.toByteArray()
-                                try {
-                                    translatedCache.putSegment(
-                                        bookId = bookId,
-                                        targetLanguage = targetLanguage.code,
-                                        sourceStartMs = turnStartSourceMs,
-                                        sourceEndMs = endSourceMs,
-                                        pcmData = pcmBytes
-                                    )
-                                } catch (_: Throwable) {
-                                }
+                        if (output.isTurnComplete) {
+                            if (sourceTurnBuilder.isNotEmpty()) {
+                                resetSourceOnNextText = true
                             }
-                            turnBuffer.reset()
-                            turnStartSourceMs = endSourceMs
+                            if (targetTurnBuilder.isNotEmpty()) {
+                                resetTargetOnNextText = true
+                            }
+                            if (turnBuffer.size() > 0) {
+                                val endSourceMs = sourceDecodedCursorMs.get()
+                                if (translatedCache != null && endSourceMs > turnStartSourceMs) {
+                                    val pcmBytes = turnBuffer.toByteArray()
+                                    try {
+                                        translatedCache.putSegment(
+                                            bookId = bookId,
+                                            targetLanguage = targetLanguage.code,
+                                            sourceStartMs = turnStartSourceMs,
+                                            sourceEndMs = endSourceMs,
+                                            pcmData = pcmBytes
+                                        )
+                                    } catch (_: Throwable) {
+                                    }
+                                }
+                                turnBuffer.reset()
+                                turnStartSourceMs = endSourceMs
+                            }
                         }
                     }
                 }
@@ -313,12 +342,14 @@ class TranslationPipeline(
                 if (pipelineGeneration.get() != runGen || abortedByError.get()) return@launch
 
                 // 4. Decode source audio -> resample to 16 kHz mono -> chunk 100 ms (3200 B) -> pace -> send
+                var lastChunkSentWallMs = 0L
                 sourceDecoder.decode(filePath = filePath, startPositionMs = decodeStartMs).collect { decodedChunk ->
                     if (pipelineGeneration.get() != runGen || abortedByError.get()) {
                         throw CancellationException("Pipeline stopped")
                     }
                     while (isPaused.get()) {
                         delay(PAUSE_POLL_MS)
+                        lastChunkSentWallMs = 0L
                     }
 
                     val resampled = resampler.resample(
@@ -333,21 +364,47 @@ class TranslationPipeline(
                         }
                         while (isPaused.get()) {
                             delay(PAUSE_POLL_MS)
+                            lastChunkSentWallMs = 0L
                         }
 
                         val frameStartMs = sourceDecodedCursorMs.get()
                         val frameEndMs = sourceDecodedCursorMs.addAndGet(CHUNK_DURATION_MS)
-                        val bufferAhead = calculateBufferAheadMs(frameEndMs)
+                        var bufferAhead = calculateBufferAheadMs(frameEndMs)
                         updateBuffer(bufferAhead, frameEndMs)
 
                         if (enablePacingDelay) {
-                            val delayMs = pacer.calculateDelayMs(
-                                chunkDurationMs = CHUNK_DURATION_MS,
-                                currentBufferAheadMs = bufferAhead
-                            )
-                            if (delayMs > 0L) {
-                                delay(delayMs)
+                            while (isActive && pipelineGeneration.get() == runGen && !abortedByError.get()) {
+                                if (isPaused.get()) {
+                                    delay(PAUSE_POLL_MS)
+                                    lastChunkSentWallMs = 0L
+                                    continue
+                                }
+                                bufferAhead = calculateBufferAheadMs(frameEndMs)
+                                updateBuffer(bufferAhead, frameEndMs)
+                                val rawDelay = pacer.calculateDelayMs(
+                                    chunkDurationMs = CHUNK_DURATION_MS,
+                                    currentBufferAheadMs = bufferAhead
+                                )
+                                if (rawDelay < 0L) {
+                                    // Backpressure limit reached: wait until playback drains below targetBufferAheadMs
+                                    delay(PAUSE_POLL_MS)
+                                    lastChunkSentWallMs = 0L
+                                    continue
+                                }
+                                val speedFactor = currentPlaybackSpeed.coerceIn(0.5f, 3.0f)
+                                val scaledDelay = (rawDelay / speedFactor).toLong()
+                                val elapsedMs = if (lastChunkSentWallMs > 0L) {
+                                    (System.currentTimeMillis() - lastChunkSentWallMs).coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
+                                val waitMs = (scaledDelay - elapsedMs).coerceAtLeast(0L)
+                                if (waitMs > 0L) {
+                                    delay(waitMs)
+                                }
+                                break
                             }
+                            lastChunkSentWallMs = System.currentTimeMillis()
                         }
 
                         if (pipelineGeneration.get() != runGen || abortedByError.get()) {
@@ -391,13 +448,15 @@ class TranslationPipeline(
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Throwable) {
-                if (!abortedByError.get() && pipelineGeneration.get() == runGen) {
+                if (!abortedByError.get() && pipelineGeneration.get() == runGen && !isPaused.get()) {
                     _state.update {
                         it.copy(
                             isRunning = false,
                             errorMessage = e.message ?: "Live translation pipeline failed"
                         )
                     }
+                } else if (isPaused.get() && pipelineGeneration.get() == runGen) {
+                    _state.update { it.copy(isRunning = false, errorMessage = null) }
                 }
             }
         }
@@ -409,6 +468,7 @@ class TranslationPipeline(
     }
 
     private suspend fun playCachedSegmentsIfAvailable(
+        runGen: Long,
         bookId: String,
         targetLanguageCode: String,
         fromMs: Long
@@ -423,6 +483,12 @@ class TranslationPipeline(
         if (translatedCache != null) {
             var safetyCounter = 0
             while (safetyCounter++ < 10_000) {
+                if (pipelineGeneration.get() != runGen) break
+                while (enablePacingDelay && isPaused.get() && pipelineGeneration.get() == runGen) {
+                    delay(PAUSE_POLL_MS)
+                }
+                if (pipelineGeneration.get() != runGen) break
+
                 val segment = try {
                     translatedCache.findCachedRange(bookId, targetLanguageCode, cursorMs)
                 } catch (_: Throwable) {
@@ -437,17 +503,37 @@ class TranslationPipeline(
                 }
                 if (cachedPcm == null || cachedPcm.isEmpty()) break
 
+                val segSpanMs = (segment.sourceEndMs - segment.sourceStartMs).coerceAtLeast(1L)
+                val trimOffsetMs = (cursorMs - segment.sourceStartMs).coerceIn(0L, segSpanMs)
+                val rawByteOffset = ((cachedPcm.size.toDouble() * trimOffsetMs) / segSpanMs).toInt()
+                val alignedByteOffset = (rawByteOffset / 2) * 2
+                val pcmToWrite = if (alignedByteOffset in 1 until cachedPcm.size) {
+                    cachedPcm.copyOfRange(alignedByteOffset, cachedPcm.size)
+                } else {
+                    cachedPcm
+                }
+
+                if (enablePacingDelay) {
+                    while (pipelineGeneration.get() == runGen &&
+                        pacer.calculateDelayMs(CHUNK_DURATION_MS, calculateBufferAheadMs(cursorMs)) < 0L
+                    ) {
+                        delay(PAUSE_POLL_MS)
+                    }
+                    if (pipelineGeneration.get() != runGen) break
+                }
+
                 pcmPlayer.write(
                     PcmChunk(
-                        data = cachedPcm,
+                        data = pcmToWrite,
                         sampleRate = OUTPUT_SAMPLE_RATE,
                         channels = 1,
-                        timestampMs = segment.sourceStartMs
+                        timestampMs = cursorMs
                     )
                 )
                 val segDurationMs = (segment.sourceEndMs - cursorMs).coerceAtLeast(0L)
                 receivedTranslatedDurationMs.addAndGet(segDurationMs)
                 cursorMs = segment.sourceEndMs
+                sourceDecodedCursorMs.set(cursorMs)
                 val bufferAhead = calculateBufferAheadMs(cursorMs)
                 updateBuffer(bufferAhead, cursorMs)
             }
@@ -458,6 +544,35 @@ class TranslationPipeline(
         }
 
         return cursorMs
+    }
+
+    private fun mergeSubtitleDelta(
+        builder: StringBuilder,
+        delta: String,
+        resetBeforeAppend: Boolean
+    ): String {
+        if (resetBeforeAppend) {
+            builder.clear()
+        }
+        if (builder.isEmpty()) {
+            builder.append(delta.trimStart())
+        } else {
+            val current = builder.toString()
+            if (delta.startsWith(current)) {
+                builder.clear()
+                builder.append(delta)
+            } else {
+                builder.append(delta)
+            }
+        }
+        if (builder.length > MAX_SUBTITLE_CHARS) {
+            val trimmed = builder.substring(builder.length - MAX_SUBTITLE_CHARS)
+            val firstSpace = trimmed.indexOf(' ')
+            val cleanTail = if (firstSpace in 0 until 24) trimmed.substring(firstSpace + 1) else trimmed
+            builder.clear()
+            builder.append("...").append(cleanTail)
+        }
+        return builder.toString().trim()
     }
 
     private fun calculateBufferAheadMs(sourceCursorMs: Long): Long {
@@ -525,7 +640,14 @@ class TranslationPipeline(
                 pcmPlayer.stop()
             } catch (_: Throwable) {
             }
-            _state.update { it.copy(isRunning = false) }
+            _state.update {
+                it.copy(
+                    isRunning = false,
+                    bufferAheadMs = 0L,
+                    currentSourceSubtitle = "",
+                    currentTranslatedSubtitle = ""
+                )
+            }
         }
         scheduleClientStop(stopGen)
     }
@@ -557,6 +679,7 @@ class TranslationPipeline(
         const val CHUNK_DURATION_MS = 100L
         const val CHUNK_SIZE_BYTES = 3200
         private const val PAUSE_POLL_MS = 50L
+        private const val MAX_SUBTITLE_CHARS = 220
 
         const val MISSING_API_KEY_MESSAGE =
             "Gemini API key is missing. Add it in Settings to use Live AI Translation."

@@ -258,7 +258,12 @@ object AppModule {
             sourceDecoder = sourceDecoder,
             resampler = resampler,
             chunker = chunker,
-            pacer = Pacer(),
+            pacer = Pacer(
+                minBufferAheadMs = 4_000L,
+                targetBufferAheadMs = 12_000L,
+                maxSendSpeed = 1.25f,
+                enableBackpressure = true
+            ),
             timelineMapper = DefaultTimelineMapper(),
             liveTranslateClient = liveTranslateClient,
             pcmPlayer = pcmPlayer,
