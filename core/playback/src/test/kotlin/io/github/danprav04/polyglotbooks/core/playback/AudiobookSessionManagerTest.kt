@@ -17,6 +17,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import io.mockk.slot
 import io.mockk.verify
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -30,6 +31,7 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -452,5 +454,140 @@ class AudiobookSessionManagerTest {
 
         verify { exoPlayer.prepare() }
         verify { exoPlayer.seekTo(15_000L) }
+    }
+
+    @Test
+    fun `play with missing API key blocks original audio playback and clears error when key is saved`() = runTest {
+        val bookDao = mockk<BookDao>(relaxed = true)
+        val chapterDao = mockk<ChapterDao>(relaxed = true)
+        val playbackStateDao = mockk<PlaybackStateDao>(relaxed = true)
+        val settingsRepo = FakeSettingsRepository().apply { apiKeyFlow.value = "" }
+        val backend = FakeLiveTranslationBackend()
+        val exoPlayer = mockk<ExoPlayer>(relaxed = true)
+
+        coEvery { bookDao.getBookById("book-nokey") } returns sampleBook("book-nokey")
+        every { chapterDao.getChaptersForBook("book-nokey") } returns flowOf(sampleChapters("book-nokey"))
+        coEvery { playbackStateDao.getPlaybackState("book-nokey") } returns null
+
+        val manager = AudiobookSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            settingsRepository = settingsRepo,
+            liveTranslationBackend = backend,
+            applicationScope = backgroundScope
+        )
+        manager.attachPlayer(exoPlayer)
+        manager.loadBook("book-nokey")
+        runCurrent()
+
+        manager.play()
+        runCurrent()
+
+        assertFalse(manager.state.value.isPlaying)
+        assertEquals(NoOpLiveTranslationBackend.MISSING_API_KEY_MESSAGE, manager.state.value.errorMessage)
+        verify(exactly = 0) { exoPlayer.play() }
+
+        // Save API key -> error clears and subsequent Play succeeds
+        settingsRepo.saveApiKey("AIza-valid-key")
+        runCurrent()
+        assertNull(manager.state.value.errorMessage)
+
+        manager.play()
+        runCurrent()
+        assertTrue(manager.state.value.isPlaying)
+        assertEquals(1, backend.startCalls)
+        verify(exactly = 1) { exoPlayer.play() }
+    }
+
+    @Test
+    fun `seeking and chapter switching while playing restarts live translation at new position`() = runTest {
+        val bookDao = mockk<BookDao>(relaxed = true)
+        val chapterDao = mockk<ChapterDao>(relaxed = true)
+        val playbackStateDao = mockk<PlaybackStateDao>(relaxed = true)
+        val settingsRepo = FakeSettingsRepository()
+        val backend = FakeLiveTranslationBackend()
+        val exoPlayer = mockk<ExoPlayer>(relaxed = true)
+
+        val threeChapters = listOf(
+            ChapterEntity("c0", "book-seek", 0, "Ch 1", 0L, 30_000L, null, 0),
+            ChapterEntity("c1", "book-seek", 1, "Ch 2", 30_000L, 60_000L, null, 0),
+            ChapterEntity("c2", "book-seek", 2, "Ch 3", 60_000L, 90_000L, null, 0)
+        )
+        coEvery { bookDao.getBookById("book-seek") } returns sampleBook("book-seek")
+        every { chapterDao.getChaptersForBook("book-seek") } returns flowOf(threeChapters)
+        coEvery { playbackStateDao.getPlaybackState("book-seek") } returns null
+
+        val manager = AudiobookSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            settingsRepository = settingsRepo,
+            liveTranslationBackend = backend,
+            applicationScope = backgroundScope
+        )
+        manager.seekRestartDebounceMs = 0L
+        manager.attachPlayer(exoPlayer)
+        manager.loadBook("book-seek")
+        runCurrent()
+
+        manager.play()
+        runCurrent()
+        backend.emitSubtitles("Old source", "Старые субтитры", 18_000L)
+        runCurrent()
+        assertEquals("Old source", manager.state.value.sourceSubtitle)
+
+        manager.seekTo(42_000L)
+        runCurrent()
+
+        assertEquals(42_000L, manager.state.value.currentPositionMs)
+        assertEquals("", manager.state.value.sourceSubtitle)
+        assertEquals("", manager.state.value.targetSubtitle)
+        assertEquals(12_000L, manager.state.value.bufferAheadMs)
+        assertEquals(1, backend.stopCalls)
+        assertEquals(2, backend.startCalls)
+        assertEquals(42_000L, backend.lastStartPositionMs)
+
+        manager.selectChapter(2) // startMs = 60_000L
+        runCurrent()
+        assertEquals(2, manager.state.value.currentChapterIndex)
+        assertEquals(60_000L, manager.state.value.currentPositionMs)
+        assertEquals(2, backend.stopCalls)
+        assertEquals(3, backend.startCalls)
+        assertEquals(60_000L, backend.lastStartPositionMs)
+    }
+
+    @Test
+    fun `STATE_READY updates last chapter endMs for multi-chapter book and persists to Room`() = runTest {
+        val bookDao = mockk<BookDao>(relaxed = true)
+        val chapterDao = mockk<ChapterDao>(relaxed = true)
+        val playbackStateDao = mockk<PlaybackStateDao>(relaxed = true)
+        val exoPlayer = mockk<ExoPlayer>(relaxed = true)
+        val listenerSlot = slot<Player.Listener>()
+        every { exoPlayer.addListener(capture(listenerSlot)) } returns Unit
+        every { exoPlayer.duration } returns 125_000L
+
+        coEvery { bookDao.getBookById("book-dur") } returns sampleBook("book-dur")
+        every { chapterDao.getChaptersForBook("book-dur") } returns flowOf(sampleChapters("book-dur"))
+        coEvery { playbackStateDao.getPlaybackState("book-dur") } returns null
+
+        val manager = AudiobookSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            applicationScope = backgroundScope
+        )
+        manager.attachPlayer(exoPlayer)
+        manager.loadBook("book-dur")
+        runCurrent()
+
+        listenerSlot.captured.onPlaybackStateChanged(Player.STATE_READY)
+        runCurrent()
+
+        assertEquals(125_000L, manager.state.value.durationMs)
+        assertEquals(125_000L, manager.state.value.chapters.last().endMs)
+        coVerify {
+            chapterDao.insertChapters(match { list -> list.size == 1 && list[0].endMs == 125_000L })
+        }
     }
 }
