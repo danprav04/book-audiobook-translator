@@ -317,8 +317,16 @@ class ReaderViewModel @Inject constructor(
                         } else {
                             base.bilingualTranslations
                         }
+                        val validSessionHighlight = session.highlightedCfi?.takeIf { cfi ->
+                            cfi.isNotBlank() && cfiMatchesChapter(
+                                cfi = cfi,
+                                expectedChapterIndex = updatedChapterIndex,
+                                chapters = base.chapters.ifEmpty { session.chapters },
+                                bookFormat = base.bookFormat.ifBlank { session.bookFormat }
+                            )
+                        }
                         val syncedActiveCfi = if (session.isActiveSession && session.isPlaying) {
-                            session.highlightedCfi
+                            validSessionHighlight
                                 ?: syncedParagraphs.getOrNull(session.activeParagraphIndex)?.cfi
                                 ?: base.currentCfi
                         } else {
@@ -353,7 +361,7 @@ class ReaderViewModel @Inject constructor(
                             } else {
                                 base.activeParagraphIndex
                             },
-                            highlightedCfi = if (session.isActiveSession) session.highlightedCfi else base.highlightedCfi,
+                            highlightedCfi = if (session.isActiveSession) validSessionHighlight else base.highlightedCfi,
                             isNarrationPlaying = session.isPlaying,
                             isBuffering = session.isBuffering,
                             isTranslating = session.isTranslating,
@@ -389,6 +397,14 @@ class ReaderViewModel @Inject constructor(
 
         val existingSession = sessionManager.sessionState.value
         val activeForTarget = sessionManager.isSessionActiveFor(targetBookId)
+        val validExistingHighlight = existingSession.highlightedCfi?.takeIf { cfi ->
+            activeForTarget && cfi.isNotBlank() && cfiMatchesChapter(
+                cfi = cfi,
+                expectedChapterIndex = existingSession.currentChapterIndex,
+                chapters = existingSession.chapters,
+                bookFormat = existingSession.bookFormat
+            )
+        }
 
         _uiState.update { state ->
             if (switchingBook) {
@@ -401,7 +417,7 @@ class ReaderViewModel @Inject constructor(
                     bookFilePath = if (activeForTarget) existingSession.bookFilePath else "",
                     chapters = if (activeForTarget) existingSession.chapters else emptyList(),
                     currentChapterIndex = if (activeForTarget) existingSession.currentChapterIndex else 0,
-                    currentCfi = if (activeForTarget) existingSession.highlightedCfi.orEmpty() else "",
+                    currentCfi = validExistingHighlight.orEmpty(),
                     progress = 0f,
                     isStateRestored = false,
                     isBookReady = false,
@@ -409,7 +425,7 @@ class ReaderViewModel @Inject constructor(
                     extractedBook = if (activeForTarget) existingSession.extractedBook else null,
                     activeParagraphIndex = if (activeForTarget) existingSession.activeParagraphIndex else 0,
                     paragraphs = if (activeForTarget) existingSession.paragraphs else emptyList(),
-                    highlightedCfi = if (activeForTarget) existingSession.highlightedCfi else null,
+                    highlightedCfi = validExistingHighlight,
                     isNarrationPlaying = activeForTarget && existingSession.isPlaying,
                     bilingualTranslations = if (activeForTarget) existingSession.bilingualTranslations else emptyMap(),
                     isBilingualEnabled = activeForTarget && (existingSession.isBilingualEnabled || existingSession.narrateTranslatedText),
@@ -440,13 +456,8 @@ class ReaderViewModel @Inject constructor(
                     val savedState = playbackStateDao?.getPlaybackState(targetBookId)
                     val isReattaching = sessionManager.isSessionActiveFor(targetBookId)
                     val liveSessionSnapshot = sessionManager.sessionState.value
-
-                    val restoredCfi = if (isReattaching && !liveSessionSnapshot.highlightedCfi.isNullOrBlank()) {
-                        liveSessionSnapshot.highlightedCfi
-                    } else {
-                        savedState?.lastCfi.orEmpty()
-                    }
-                    val restoredProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
+                    val rawSavedCfi = savedState?.lastCfi.orEmpty()
+                    val rawSavedProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
 
                     val extracted = if (appContext != null && book.filePath.isNotBlank()) {
                         if (isReattaching && liveSessionSnapshot.extractedBook != null) {
@@ -492,8 +503,8 @@ class ReaderViewModel @Inject constructor(
                     } else {
                         resolveChapterIndex(
                             chapters = dbChapters,
-                            cfi = restoredCfi,
-                            progress = restoredProgress,
+                            cfi = rawSavedCfi,
+                            progress = rawSavedProgress,
                             fallbackIndex = savedState?.chapterIndex ?: 0
                         )
                     }
@@ -504,13 +515,60 @@ class ReaderViewModel @Inject constructor(
                         restoredChapterIndex.coerceAtLeast(0)
                     }
 
+                    val isPdfBook = extracted?.format?.equals("PDF", ignoreCase = true) == true ||
+                        book.format.equals("PDF", ignoreCase = true)
+                    val sessionParasMatchChapter = isReattaching &&
+                        liveSessionSnapshot.paragraphs.isNotEmpty() &&
+                        cfiMatchesChapter(
+                            cfi = liveSessionSnapshot.paragraphs.firstOrNull()?.cfi,
+                            expectedChapterIndex = clampedChapterIndex,
+                            chapters = dbChapters,
+                            bookFormat = book.format
+                        )
                     val initialParagraphs = when {
-                        isReattaching && liveSessionSnapshot.paragraphs.isNotEmpty() -> liveSessionSnapshot.paragraphs
+                        sessionParasMatchChapter -> liveSessionSnapshot.paragraphs
                         extracted != null -> sessionManager.buildParagraphsForChapter(extracted, clampedChapterIndex, book.format)
                         else -> emptyList()
                     }
+                    val validLiveHighlight = liveSessionSnapshot.highlightedCfi?.takeIf { cfi ->
+                        isReattaching && cfi.isNotBlank() && cfiMatchesChapter(
+                            cfi = cfi,
+                            expectedChapterIndex = clampedChapterIndex,
+                            chapters = dbChapters,
+                            bookFormat = book.format
+                        )
+                    }
+                    val savedCfiMatchesChapter = rawSavedCfi.isNotBlank() && cfiMatchesChapter(
+                        cfi = rawSavedCfi,
+                        expectedChapterIndex = clampedChapterIndex,
+                        chapters = dbChapters,
+                        bookFormat = book.format
+                    )
+                    val clampedSessionParaIdx = liveSessionSnapshot.activeParagraphIndex
+                        .coerceIn(0, maxOf(0, initialParagraphs.lastIndex))
+                    val fallbackChapterCfi = initialParagraphs.getOrNull(clampedSessionParaIdx)?.cfi
+                        ?: dbChapters.getOrNull(clampedChapterIndex)?.cfiRange?.takeIf { it.isNotBlank() }
+                        ?: sessionManager.defaultChapterCfi(clampedChapterIndex, isPdfBook)
+                    val restoredCfi = if (isReattaching) {
+                        when {
+                            validLiveHighlight != null -> validLiveHighlight
+                            savedCfiMatchesChapter -> rawSavedCfi
+                            else -> fallbackChapterCfi
+                        }
+                    } else {
+                        rawSavedCfi
+                    }
+                    val restoredProgress = if (isReattaching && !savedCfiMatchesChapter && totalChapters > 1) {
+                        (clampedChapterIndex.toFloat() / (totalChapters - 1)).coerceIn(0f, 1f)
+                    } else {
+                        rawSavedProgress
+                    }
                     val initialActiveParaIndex = if (isReattaching) {
-                        liveSessionSnapshot.activeParagraphIndex.coerceIn(0, maxOf(0, initialParagraphs.lastIndex))
+                        if (validLiveHighlight != null) {
+                            clampedSessionParaIdx
+                        } else {
+                            deriveParagraphIndexOrNull(restoredCfi, initialParagraphs) ?: clampedSessionParaIdx
+                        }
                     } else {
                         deriveParagraphIndexFromCfi(restoredCfi, initialParagraphs)
                     }
@@ -527,6 +585,7 @@ class ReaderViewModel @Inject constructor(
                             extractedBook = extracted,
                             paragraphs = initialParagraphs,
                             activeParagraphIndex = initialActiveParaIndex,
+                            highlightedCfi = if (isReattaching) validLiveHighlight else it.highlightedCfi,
                             currentCfi = restoredCfi,
                             progress = restoredProgress,
                             currentChapterIndex = clampedChapterIndex,
@@ -1169,6 +1228,7 @@ class ReaderViewModel @Inject constructor(
         val clampedProgress = progress.coerceIn(0f, 1f)
         val targetBookId = bookId
         var resolvedChapter = 0
+        var chapterChangedWhileNotPlaying = false
         _uiState.update { state ->
             val chapterIndex = resolveChapterIndex(
                 chapters = state.chapters,
@@ -1178,20 +1238,52 @@ class ReaderViewModel @Inject constructor(
                 fallbackIndex = state.currentChapterIndex
             )
             resolvedChapter = chapterIndex
-            val updatedPara = if (!state.isNarrationPlaying && state.paragraphs.isNotEmpty()) {
-                deriveParagraphIndexOrNull(cfi, state.paragraphs) ?: state.activeParagraphIndex
+            val chapterChanged = chapterIndex != state.currentChapterIndex
+            chapterChangedWhileNotPlaying = !state.isNarrationPlaying && (
+                chapterChanged || (
+                    sessionManager.isSessionActiveFor(targetBookId) &&
+                        !sessionManager.sessionState.value.isPlaying &&
+                        chapterIndex != sessionManager.sessionState.value.currentChapterIndex
+                    )
+                )
+            val updatedParagraphs = if (chapterChanged && !state.isNarrationPlaying && state.extractedBook != null) {
+                sessionManager.buildParagraphsForChapter(state.extractedBook, chapterIndex, state.bookFormat)
+            } else {
+                state.paragraphs
+            }
+            val updatedPara = if (!state.isNarrationPlaying && updatedParagraphs.isNotEmpty()) {
+                deriveParagraphIndexOrNull(cfi, updatedParagraphs) ?: if (chapterChanged) 0 else state.activeParagraphIndex
+            } else if (chapterChanged && !state.isNarrationPlaying) {
+                0
             } else {
                 state.activeParagraphIndex
+            }
+            val updatedHighlight = if (
+                !state.isNarrationPlaying &&
+                !state.highlightedCfi.isNullOrBlank() &&
+                !cfiMatchesChapter(state.highlightedCfi, chapterIndex, state.chapters, state.bookFormat)
+            ) {
+                null
+            } else {
+                state.highlightedCfi
             }
             state.copy(
                 currentCfi = cfi,
                 progress = clampedProgress,
                 currentChapterIndex = chapterIndex,
-                activeParagraphIndex = updatedPara
+                paragraphs = updatedParagraphs,
+                activeParagraphIndex = updatedPara,
+                highlightedCfi = updatedHighlight
             )
         }
         if (targetBookId.isNotBlank()) {
             persistProgress(targetBookId, cfi, clampedProgress, resolvedChapter)
+            if (chapterChangedWhileNotPlaying &&
+                sessionManager.isSessionActiveFor(targetBookId) &&
+                !sessionManager.sessionState.value.isPlaying
+            ) {
+                syncContextToSession(forceWhenDifferentBook = false)
+            }
         }
     }
 
@@ -1273,6 +1365,59 @@ class ReaderViewModel @Inject constructor(
             return (progress * chapters.size).toInt().coerceIn(0, chapters.size - 1)
         }
         return if (chapters.isNotEmpty()) fallbackIndex.coerceIn(0, chapters.size - 1) else fallbackIndex.coerceAtLeast(0)
+    }
+
+    private fun cfiMatchesChapter(
+        cfi: String?,
+        expectedChapterIndex: Int,
+        chapters: List<ChapterEntity>,
+        bookFormat: String
+    ): Boolean {
+        if (cfi.isNullOrBlank()) return false
+        val exactIndex = chapters.indexOfFirst { !it.cfiRange.isNullOrBlank() && it.cfiRange == cfi }
+        if (exactIndex >= 0) return exactIndex == expectedChapterIndex
+
+        val prefixMatch = chapters.mapIndexedNotNull { index, chapter ->
+            val range = chapter.cfiRange?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+            val base = range.removeSuffix(")")
+            if (cfi.startsWith("$base!") || cfi.startsWith("$base/") || cfi.startsWith("$range:")) {
+                index to range.length
+            } else {
+                null
+            }
+        }.maxByOrNull { it.second }
+        if (prefixMatch != null) return prefixMatch.first == expectedChapterIndex
+
+        if (bookFormat.equals("PDF", ignoreCase = true) || cfi.startsWith("pdf:page:", ignoreCase = true)) {
+            PDF_PAGE_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { pdfPage ->
+                val byPdfRange = chapters.indexOfLast { ch ->
+                    val startPage = ch.cfiRange?.let { r ->
+                        PDF_PAGE_CFI_REGEX.find(r)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    }
+                    startPage != null && startPage <= pdfPage
+                }
+                return if (byPdfRange >= 0) {
+                    byPdfRange == expectedChapterIndex
+                } else {
+                    pdfPage == expectedChapterIndex
+                }
+            }
+        }
+
+        EPUB_SPINE_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { spineStep ->
+            val byChapterSpine = chapters.indexOfFirst { ch ->
+                val range = ch.cfiRange ?: return@indexOfFirst false
+                EPUB_SPINE_CFI_REGEX.find(range)?.groupValues?.getOrNull(1)?.toIntOrNull() == spineStep
+            }
+            val resolved = if (byChapterSpine >= 0) {
+                byChapterSpine
+            } else {
+                (spineStep - 2).coerceAtLeast(0) / 2
+            }
+            return resolved == expectedChapterIndex
+        }
+
+        return true
     }
 
     private fun deriveParagraphIndexOrNull(

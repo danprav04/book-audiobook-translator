@@ -413,8 +413,21 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
         val clampedParaIndex = if (resolvedParagraphs.isEmpty()) 0 else activeParagraphIndex.coerceIn(0, resolvedParagraphs.lastIndex)
         val chapterTitle = resolveChapterTitle(resolvedChapters, resolvedExtracted, currentChapterIndex)
+        val isPdf = bookFormat.equals("PDF", ignoreCase = true) ||
+            resolvedExtracted?.format.equals("PDF", ignoreCase = true)
 
         _sessionState.update { state ->
+            val keepExistingHighlight = state.bookId == bookId &&
+                currentChapterIndex == state.currentChapterIndex &&
+                clampedParaIndex == state.activeParagraphIndex &&
+                !state.highlightedCfi.isNullOrBlank() &&
+                cfiBelongsToChapter(
+                    cfi = state.highlightedCfi,
+                    expectedChapterIndex = currentChapterIndex,
+                    paragraphs = resolvedParagraphs,
+                    chapters = resolvedChapters,
+                    isPdf = isPdf
+                )
             val next = state.copy(
                 bookId = bookId,
                 bookTitle = bookTitle.ifBlank { state.bookTitle },
@@ -428,6 +441,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                 currentChapterTitle = chapterTitle,
                 paragraphs = resolvedParagraphs,
                 activeParagraphIndex = clampedParaIndex,
+                highlightedCfi = if (keepExistingHighlight) state.highlightedCfi else null,
                 characters = characters,
                 isBilingualEnabled = isBilingualEnabled,
                 bilingualTranslations = if (bilingualTranslations.isNotEmpty() || !isBilingualEnabled) {
@@ -510,6 +524,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                 else -> paragraphs
             },
             activeParagraphIndex = when {
+                sameBookPaused && !postFlushCurrent.highlightedCfi.isNullOrBlank() -> postFlushCurrent.activeParagraphIndex
+                sameBookPaused && activeParagraphIndex > 0 -> activeParagraphIndex
                 sameBookPaused -> postFlushCurrent.activeParagraphIndex
                 preserveSameBookPreparedParagraphs && activeParagraphIndex == 0 && postFlushCurrent.activeParagraphIndex > 0 ->
                     postFlushCurrent.activeParagraphIndex
@@ -2067,7 +2083,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                 currentChapterTitle = chapterTitle,
                 paragraphs = newParagraphs,
                 activeParagraphIndex = 0,
-                highlightedCfi = firstCfi,
+                highlightedCfi = if (generation != null || s.isPlaying) firstCfi else null,
                 bilingualTranslations = if (s.isBilingualEnabled || s.narrateTranslatedText) emptyMap() else s.bilingualTranslations,
                 isTranslationCached = false
             )
@@ -2229,7 +2245,7 @@ class ReaderNarrationSessionManager @Inject constructor(
 
         val langTagSuffix = chunk.languageCode?.takeIf { it.isNotBlank() }?.let { "_$it" }.orEmpty()
         val primaryTag = when (engineChoice) {
-            NarrationEngine.GEMINI_FLASH_TTS -> "GEMINI_TTS$langTagSuffix"
+            NarrationEngine.GEMINI_FLASH_TTS -> "$GEMINI_TTS_CACHE_TAG_PREFIX$langTagSuffix"
             NarrationEngine.GEMINI_LIVE -> "GEMINI_LIVE$langTagSuffix"
             NarrationEngine.SYSTEM_TTS -> "SYSTEM_TTS$langTagSuffix"
         }
@@ -2982,6 +2998,49 @@ class ReaderNarrationSessionManager @Inject constructor(
         return match.groupValues[1].toIntOrNull()?.takeIf { it >= 0 }
     }
 
+    internal fun cfiBelongsToChapter(
+        cfi: String?,
+        expectedChapterIndex: Int,
+        paragraphs: List<ReaderParagraph>,
+        chapters: List<ChapterEntity>,
+        isPdf: Boolean
+    ): Boolean {
+        if (cfi.isNullOrBlank()) return false
+        if (paragraphs.any { it.cfi == cfi }) return true
+        val expectedRange = chapters.getOrNull(expectedChapterIndex)?.cfiRange?.takeIf { it.isNotBlank() }
+        if (expectedRange != null && expectedRange == cfi) return true
+
+        if (isPdf || cfi.startsWith("pdf:page:", ignoreCase = true)) {
+            val page = parsePdfPageFromHref(cfi)
+            if (page != null) {
+                val chapterWithPage = chapters.indexOfLast { ch ->
+                    val startPage = parsePdfPageFromHref(ch.cfiRange)
+                    startPage != null && startPage <= page
+                }
+                return if (chapterWithPage >= 0) {
+                    chapterWithPage == expectedChapterIndex
+                } else {
+                    page == expectedChapterIndex
+                }
+            }
+        }
+
+        val spineStep = EPUB_SPINE_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        if (spineStep != null) {
+            val byChapterSpine = chapters.indexOfFirst { ch ->
+                val range = ch.cfiRange ?: return@indexOfFirst false
+                EPUB_SPINE_CFI_REGEX.find(range)?.groupValues?.getOrNull(1)?.toIntOrNull() == spineStep
+            }
+            return if (byChapterSpine >= 0) {
+                byChapterSpine == expectedChapterIndex
+            } else {
+                ((spineStep - 2).coerceAtLeast(0) / 2) == expectedChapterIndex
+            }
+        }
+
+        return paragraphs.isEmpty()
+    }
+
     internal fun defaultChapterCfi(chapterIndex: Int, isPdf: Boolean): String {
         return if (isPdf) {
             "pdf:page:$chapterIndex"
@@ -3078,8 +3137,10 @@ class ReaderNarrationSessionManager @Inject constructor(
     }
 
     companion object {
+        internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V2"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val COLON_SPEAKER_REGEX = Regex("""^([A-Z][a-zA-Z]{1,24}(?:\s+[A-Z][a-zA-Z]{1,20})?):\s+\S""")
         private val PDF_PAGE_HREF_REGEX = Regex("""pdf:page:(\d+)""", RegexOption.IGNORE_CASE)
+        private val EPUB_SPINE_CFI_REGEX = Regex("""/6/(\d+)""")
     }
 }
