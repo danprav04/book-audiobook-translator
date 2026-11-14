@@ -1,17 +1,30 @@
 package io.github.danprav04.polyglotbooks.core.data
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import io.github.danprav04.polyglotbooks.core.model.Chapter
+import org.w3c.dom.Document
+import org.w3c.dom.Element
 import java.io.BufferedReader
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
 import java.io.InputStreamReader
+import java.net.URLDecoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import java.util.zip.ZipInputStream
+import javax.xml.parsers.DocumentBuilderFactory
 
 /**
  * Utility for extracting embedded cover art and chapters from audiobooks
@@ -33,6 +46,374 @@ object CoverExtractor {
         } catch (_: Exception) {
             null
         }
+    }
+
+    fun extractEbookCover(context: Context, uri: Uri, bookId: String, formatName: String): String? {
+        val coversDir = File(context.filesDir, "covers").apply { mkdirs() }
+        val destFile = File(coversDir, "$bookId.jpg")
+        if (destFile.exists() && destFile.length() > 0) {
+            return destFile.absolutePath
+        }
+
+        return when (formatName.trim().uppercase()) {
+            "PDF" -> extractPdfCover(context, uri, destFile)
+            "EPUB" -> {
+                val epubBytes = openUriInputStream(context, uri)?.use { it.readBytes() } ?: return null
+                val coverBytes = extractEpubCoverBytes(epubBytes) ?: return null
+                decodeAndSaveCoverJpeg(coverBytes, destFile)
+            }
+            "CBZ" -> {
+                val coverBytes = extractCbzCoverBytes(context, uri) ?: return null
+                decodeAndSaveCoverJpeg(coverBytes, destFile)
+            }
+            "FB2" -> {
+                val fb2Bytes = openUriInputStream(context, uri)?.use { it.readBytes() } ?: return null
+                val coverBytes = extractFb2CoverBytes(fb2Bytes) ?: return null
+                decodeAndSaveCoverJpeg(coverBytes, destFile)
+            }
+            else -> null
+        }
+    }
+
+    fun extractEpubCoverBytes(epubBytes: ByteArray): ByteArray? {
+        if (epubBytes.isEmpty()) return null
+        val entries = linkedMapOf<String, ByteArray>()
+        try {
+            ZipInputStream(ByteArrayInputStream(epubBytes)).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val name = entry.name.trimStart('/')
+                        entries[name] = zis.readBytes()
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+        } catch (_: Exception) {
+            return null
+        }
+        if (entries.isEmpty()) return null
+
+        val opfPath = locateEpubOpfPath(entries)
+        if (opfPath != null) {
+            val opfBytes = findZipEntry(entries, opfPath)
+            if (opfBytes != null) {
+                val opfDoc = parseXmlSafely(opfBytes)
+                if (opfDoc != null) {
+                    val opfDir = opfPath.substringBeforeLast('/', "")
+                    var metaCoverId: String? = null
+                    val metaNodes = getElementsByLocalOrTagName(opfDoc, "meta")
+                    for (meta in metaNodes) {
+                        if (meta.getAttribute("name").equals("cover", ignoreCase = true)) {
+                            val content = meta.getAttribute("content").trim()
+                            if (content.isNotEmpty()) {
+                                metaCoverId = content
+                                break
+                            }
+                        }
+                    }
+
+                    val items = getElementsByLocalOrTagName(opfDoc, "item")
+                    var epub3CoverHref: String? = null
+                    var epub2CoverHref: String? = null
+                    var heuristicCoverHref: String? = null
+
+                    for (item in items) {
+                        val id = item.getAttribute("id").trim()
+                        val href = item.getAttribute("href").trim()
+                        if (href.isEmpty()) continue
+                        val mediaType = item.getAttribute("media-type").trim()
+                        val props = item.getAttribute("properties")
+                            .split(Regex("\\s+"))
+                            .filter { it.isNotEmpty() }
+
+                        if (props.any { it.equals("cover-image", ignoreCase = true) }) {
+                            epub3CoverHref = href
+                            break
+                        }
+                        if (metaCoverId != null && id == metaCoverId) {
+                            epub2CoverHref = href
+                        }
+                        if (heuristicCoverHref == null &&
+                            mediaType.startsWith("image/", ignoreCase = true) &&
+                            (id.contains("cover", ignoreCase = true) || href.contains("cover", ignoreCase = true))
+                        ) {
+                            heuristicCoverHref = href
+                        }
+                    }
+
+                    val matchedHref = epub3CoverHref ?: epub2CoverHref ?: heuristicCoverHref
+                    if (matchedHref != null) {
+                        val decodedHref = stripFragmentAndDecode(matchedHref)
+                        val resolvedPath = resolveZipPath(opfDir, decodedHref)
+                        findZipEntry(entries, resolvedPath)?.let { return it }
+                    }
+                }
+            }
+        }
+
+        // Fallback: first image entry containing "cover"
+        return entries.entries.firstOrNull { (name, _) ->
+            isImageFileName(name) && name.contains("cover", ignoreCase = true)
+        }?.value
+    }
+
+    private fun extractPdfCover(context: Context, uri: Uri, destFile: File): String? {
+        val pfd = openParcelFileDescriptor(context, uri) ?: return null
+        return pfd.use { descriptor ->
+            try {
+                PdfRenderer(descriptor).use { renderer ->
+                    if (renderer.pageCount <= 0) return@use null
+                    renderer.openPage(0).use { page ->
+                        val targetWidth = 600
+                        val aspect = if (page.width > 0) page.height.toFloat() / page.width.toFloat() else 1.4f
+                        val targetHeight = (targetWidth * aspect).toInt().coerceIn(100, 1800)
+                        val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                        try {
+                            bitmap.eraseColor(Color.WHITE)
+                            page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                            saveBitmapAsJpeg(bitmap, destFile)
+                        } finally {
+                            bitmap.recycle()
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    private fun extractCbzCoverBytes(context: Context, uri: Uri): ByteArray? {
+        val stream = openUriInputStream(context, uri) ?: return null
+        var bestName: String? = null
+        var bestBytes: ByteArray? = null
+        return try {
+            ZipInputStream(stream).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val name = entry.name.trimStart('/')
+                        val base = name.substringAfterLast('/')
+                        if (!name.startsWith("__MACOSX/") && !base.startsWith("._") && isImageFileName(name)) {
+                            if (bestName == null || name.compareTo(bestName!!, ignoreCase = true) < 0) {
+                                bestName = name
+                                bestBytes = zis.readBytes()
+                            }
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            bestBytes
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun extractFb2CoverBytes(fb2Bytes: ByteArray): ByteArray? {
+        if (fb2Bytes.isEmpty()) return null
+        val doc = parseXmlSafely(fb2Bytes)
+        if (doc != null) {
+            var referencedId: String? = null
+            val coverpages = getElementsByLocalOrTagName(doc, "coverpage")
+            for (cp in coverpages) {
+                val images = getElementsByLocalOrTagName(cp, "image")
+                for (img in images) {
+                    val href = img.getAttributeNS("http://www.w3.org/1999/xlink", "href")
+                        .ifBlank { img.getAttribute("l:href") }
+                        .ifBlank { img.getAttribute("xlink:href") }
+                        .ifBlank { img.getAttribute("href") }
+                        .trim()
+                    if (href.startsWith("#") && href.length > 1) {
+                        referencedId = href.substring(1)
+                        break
+                    }
+                }
+                if (referencedId != null) break
+            }
+
+            val binaries = getElementsByLocalOrTagName(doc, "binary")
+            val targetBinary = binaries.firstOrNull { el ->
+                referencedId != null && el.getAttribute("id") == referencedId
+            } ?: binaries.firstOrNull { el ->
+                el.getAttribute("id").contains("cover", ignoreCase = true)
+            } ?: binaries.firstOrNull { el ->
+                el.getAttribute("content-type").startsWith("image/", ignoreCase = true)
+            }
+
+            val b64 = targetBinary?.textContent?.trim()
+            if (!b64.isNullOrEmpty()) {
+                try {
+                    return Base64.getMimeDecoder().decode(b64)
+                } catch (_: Exception) {}
+            }
+        }
+
+        // Regex fallback
+        val text = String(fb2Bytes, StandardCharsets.UTF_8)
+        val regex = Regex(
+            """<binary\b[^>]*id\s*=\s*["']([^"']*cover[^"']*)["'][^>]*>(.*?)</binary>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+        val match = regex.find(text) ?: return null
+        return try {
+            Base64.getMimeDecoder().decode(match.groupValues[2].trim())
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun decodeAndSaveCoverJpeg(imageBytes: ByteArray, destFile: File): String? {
+        val bitmap = try {
+            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        return try {
+            saveBitmapAsJpeg(bitmap, destFile)
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun saveBitmapAsJpeg(bitmap: Bitmap, destFile: File): String? {
+        return try {
+            destFile.parentFile?.mkdirs()
+            destFile.outputStream().use { out ->
+                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)) {
+                    return null
+                }
+            }
+            if (destFile.exists() && destFile.length() > 0) destFile.absolutePath else null
+        } catch (_: Exception) {
+            destFile.delete()
+            null
+        }
+    }
+
+    private fun openParcelFileDescriptor(context: Context, uri: Uri): ParcelFileDescriptor? {
+        if (uri.scheme == "file" || uri.scheme.isNullOrEmpty()) {
+            val path = uri.path
+            if (!path.isNullOrBlank()) {
+                val file = File(path)
+                if (file.exists()) {
+                    try {
+                        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                    } catch (_: Exception) {
+                        // Fall back to ContentResolver
+                    }
+                }
+            }
+        }
+        return try {
+            context.contentResolver.openFileDescriptor(uri, "r")
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun openUriInputStream(context: Context, uri: Uri): InputStream? {
+        if (uri.scheme == "file" || uri.scheme.isNullOrEmpty()) {
+            val path = uri.path
+            if (!path.isNullOrBlank()) {
+                val file = File(path)
+                if (file.exists()) {
+                    return try {
+                        file.inputStream()
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+        }
+        return try {
+            context.contentResolver.openInputStream(uri)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun locateEpubOpfPath(entries: Map<String, ByteArray>): String? {
+        val containerBytes = findZipEntry(entries, "META-INF/container.xml")
+        if (containerBytes != null) {
+            val doc = parseXmlSafely(containerBytes)
+            if (doc != null) {
+                for (el in getElementsByLocalOrTagName(doc, "rootfile")) {
+                    val fullPath = el.getAttribute("full-path").trim().trimStart('/')
+                    if (fullPath.isNotEmpty()) return fullPath
+                }
+            }
+        }
+        return entries.keys.firstOrNull { it.lowercase().endsWith(".opf") }
+    }
+
+    private fun findZipEntry(entries: Map<String, ByteArray>, path: String): ByteArray? {
+        val normalized = path.trimStart('/')
+        return entries[normalized]
+            ?: entries.entries.firstOrNull { it.key.equals(normalized, ignoreCase = true) }?.value
+    }
+
+    private fun isImageFileName(name: String): Boolean {
+        val lower = name.lowercase()
+        return lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+            lower.endsWith(".png") || lower.endsWith(".webp")
+    }
+
+    private fun stripFragmentAndDecode(href: String): String {
+        val withoutFragment = href.substringBefore('#').trim()
+        return try {
+            URLDecoder.decode(withoutFragment.replace("+", "%2B"), "UTF-8")
+        } catch (_: Exception) {
+            withoutFragment
+        }
+    }
+
+    private fun resolveZipPath(baseDir: String, relativeHref: String): String {
+        val combined = if (relativeHref.startsWith("/")) {
+            relativeHref.trimStart('/')
+        } else if (baseDir.isEmpty()) {
+            relativeHref
+        } else {
+            "$baseDir/$relativeHref"
+        }
+        val parts = ArrayDeque<String>()
+        for (segment in combined.split('/')) {
+            when (segment) {
+                "", "." -> Unit
+                ".." -> if (parts.isNotEmpty()) parts.removeLast()
+                else -> parts.addLast(segment)
+            }
+        }
+        return parts.joinToString("/")
+    }
+
+    private fun parseXmlSafely(bytes: ByteArray): Document? {
+        return try {
+            val dbf = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = true }
+            dbf.newDocumentBuilder().parse(ByteArrayInputStream(bytes))
+        } catch (_: Exception) {
+            try {
+                val dbf = DocumentBuilderFactory.newInstance().apply { isNamespaceAware = false }
+                dbf.newDocumentBuilder().parse(ByteArrayInputStream(bytes))
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun getElementsByLocalOrTagName(root: Document, name: String): List<Element> {
+        val nsList = root.getElementsByTagNameNS("*", name)
+        val nodeList = if (nsList.length > 0) nsList else root.getElementsByTagName(name)
+        return (0 until nodeList.length).mapNotNull { nodeList.item(it) as? Element }
+    }
+
+    private fun getElementsByLocalOrTagName(root: Element, name: String): List<Element> {
+        val nsList = root.getElementsByTagNameNS("*", name)
+        val nodeList = if (nsList.length > 0) nsList else root.getElementsByTagName(name)
+        return (0 until nodeList.length).mapNotNull { nodeList.item(it) as? Element }
     }
 
     fun extractCoverBytes(context: Context, uri: Uri): ByteArray? {

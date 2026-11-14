@@ -69,14 +69,21 @@ class SafLibraryImporter(
         for ((uri, fileName, format) in candidateUris) {
             try {
                 val baseName = fileName.substringBeforeLast('.')
-                val effectiveFormat = if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
-                    BookFormat.EPUB
-                } else {
-                    format
-                }
+                val bookId = uri.toString().hashCode().toString()
+                val isConvertedFormat = format in listOf(
+                    BookFormat.TXT,
+                    BookFormat.MD,
+                    BookFormat.HTML,
+                    BookFormat.DOCX,
+                    BookFormat.ODT,
+                    BookFormat.RTF
+                )
+                val effectiveFormat = if (isConvertedFormat) BookFormat.EPUB else format
 
                 var audioDurationMs = 3600000L
                 var extractedCoverPath: String? = null
+                var preParsedEbookChapters: List<Chapter>? = null
+
                 val bookModel = if (format.isAudiobook) {
                     var title = baseName
                     var author = "Unknown Author"
@@ -106,7 +113,6 @@ class SafLibraryImporter(
                         }
                     }
 
-                    val bookId = uri.toString().hashCode().toString()
                     extractedCoverPath = CoverExtractor.extractCover(context, uri, bookId)
 
                     // If embedded cover art wasn't found, check if a companion image was selected
@@ -128,66 +134,149 @@ class SafLibraryImporter(
                         }
                     }
 
+                    val durableAudioPath = if (uri in urisNeedingLocalCopy) {
+                        copyUriToInternalStorage(context, uri, bookId, fileName, format)
+                            ?: uri.toString()
+                    } else {
+                        uri.toString()
+                    }
+
                     io.github.danprav04.polyglotbooks.core.model.Book(
                         id = bookId,
                         title = title,
                         author = author,
                         format = format.name,
-                        filePath = uri.toString(),
+                        filePath = durableAudioPath,
                         coverUri = extractedCoverPath,
                         isAudiobook = true
                     )
-                } else if (format in listOf(BookFormat.TXT, BookFormat.MD, BookFormat.HTML, BookFormat.DOCX, BookFormat.ODT, BookFormat.RTF)) {
+                } else if (isConvertedFormat) {
                     val fullBytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
+                    val (extractedTitle, extractedAuthor) = if (format == BookFormat.HTML) {
+                        val htmlMeta = metadataExtractor.extractMetadata(
+                            fullBytes.inputStream(),
+                            BookFormat.HTML,
+                            fileName
+                        )
+                        htmlMeta.title to htmlMeta.author
+                    } else {
+                        baseName to "Unknown Author"
+                    }
+
                     val epubBytes = EbookFormatConverter.convertToEpub(
                         fullBytes.inputStream(),
                         format,
-                        title = baseName,
-                        author = "Unknown Author"
+                        title = extractedTitle,
+                        author = extractedAuthor
                     )
+
+                    val booksDir = File(context.filesDir, "books").apply { mkdirs() }
+                    val epubFile = File(booksDir, "$bookId.epub")
+                    epubFile.writeBytes(epubBytes)
+                    val durableFilePath = Uri.fromFile(epubFile).toString()
+
+                    preParsedEbookChapters = try {
+                        epubBytes.inputStream().use { stream ->
+                            chapterParser.parseChapters(stream, BookFormat.EPUB)
+                        }
+                    } catch (_: Throwable) {
+                        emptyList()
+                    }
+
                     epubBytes.inputStream().use { stream ->
-                        metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
-                    }?.copy(filePath = uri.toString())
+                        metadataExtractor.extractMetadata(stream, BookFormat.EPUB, fileName)
+                    }.copy(
+                        id = bookId,
+                        filePath = durableFilePath
+                    )
                 } else {
-                    context.contentResolver.openInputStream(uri)?.use { stream ->
-                        metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
-                    }?.copy(filePath = uri.toString())
+                    val booksDir = File(context.filesDir, "books").apply { mkdirs() }
+                    val copiedFile = copyNativeEbookToFile(
+                        context = context,
+                        uri = uri,
+                        destFile = File(booksDir, "$bookId.${format.name.lowercase()}")
+                    )
+                    val durableFilePath = copiedFile?.let { Uri.fromFile(it).toString() } ?: uri.toString()
+
+                    preParsedEbookChapters = try {
+                        if (copiedFile != null && copiedFile.exists()) {
+                            chapterParser.parseChapters(copiedFile, effectiveFormat)
+                        } else {
+                            context.contentResolver.openInputStream(uri)?.use { stream ->
+                                chapterParser.parseChapters(stream, effectiveFormat)
+                            } ?: emptyList()
+                        }
+                    } catch (_: Throwable) {
+                        emptyList()
+                    }
+
+                    val extractedBook = if (copiedFile != null && copiedFile.exists()) {
+                        metadataExtractor.extractMetadata(copiedFile, effectiveFormat)
+                    } else {
+                        context.contentResolver.openInputStream(uri)?.use { stream ->
+                            metadataExtractor.extractMetadata(stream, effectiveFormat, fileName)
+                        }
+                    }
+                    extractedBook?.copy(
+                        id = bookId,
+                        filePath = durableFilePath
+                    )
                 }
 
                 if (bookModel != null) {
+                    val durableFilePath = bookModel.filePath
+                    if (!format.isAudiobook) {
+                        extractedCoverPath = CoverExtractor.extractEbookCover(
+                            context,
+                            Uri.parse(durableFilePath),
+                            bookModel.id,
+                            effectiveFormat.name
+                        ) ?: CoverExtractor.extractEbookCover(
+                            context,
+                            uri,
+                            bookModel.id,
+                            effectiveFormat.name
+                        )
+                    }
+
                     val companionCueUri = cueUrisByBaseName[baseName] ?: cueUrisByBaseName.values.firstOrNull()
                     val parsedChapters = if (format.isAudiobook) {
                         extractChapters(context, uri, bookModel.id, audioDurationMs, companionCueUri)
                     } else {
-                        try {
-                            context.contentResolver.openInputStream(uri)?.use { stream ->
-                                chapterParser.parseChapters(stream, effectiveFormat)
-                            } ?: emptyList()
-                        } catch (e: Throwable) {
-                            emptyList()
-                        }
+                        preParsedEbookChapters ?: emptyList()
                     }
 
-                    val chapters = if (parsedChapters.isEmpty() && format.isAudiobook) {
-                        listOf(
-                            Chapter(
-                                id = "chap_0",
-                                bookId = bookModel.id,
-                                index = 0,
-                                title = bookModel.title,
-                                startMs = 0L,
-                                endMs = audioDurationMs
+                    val chapters = if (parsedChapters.isEmpty()) {
+                        if (format.isAudiobook) {
+                            listOf(
+                                Chapter(
+                                    id = "chap_0",
+                                    bookId = bookModel.id,
+                                    index = 0,
+                                    title = bookModel.title,
+                                    startMs = 0L,
+                                    endMs = audioDurationMs
+                                )
                             )
-                        )
+                        } else {
+                            listOf(
+                                Chapter(
+                                    id = "${bookModel.id}_chap_0",
+                                    bookId = bookModel.id,
+                                    index = 0,
+                                    title = bookModel.title,
+                                    startMs = 0L,
+                                    endMs = 0L,
+                                    cfiRange = if (effectiveFormat == BookFormat.PDF) {
+                                        "pdf:page:0"
+                                    } else {
+                                        "epubcfi(/6/2!/4/2/1:0)"
+                                    }
+                                )
+                            )
+                        }
                     } else {
                         parsedChapters
-                    }
-
-                    val durableFilePath = if (uri in urisNeedingLocalCopy) {
-                        copyUriToInternalStorage(context, uri, bookModel.id, fileName, format)
-                            ?: bookModel.filePath
-                    } else {
-                        bookModel.filePath
                     }
 
                     val bookEntity = BookEntity(
@@ -203,8 +292,13 @@ class SafLibraryImporter(
                     )
 
                     val chapterEntities = chapters.map { ch ->
+                        val chapterId = if (ch.id.startsWith("${bookModel.id}_")) {
+                            ch.id
+                        } else {
+                            "${bookModel.id}_${ch.id}"
+                        }
                         ChapterEntity(
-                            id = "${bookModel.id}_${ch.id}",
+                            id = chapterId,
                             bookId = bookModel.id,
                             index = ch.index,
                             title = ch.title,
@@ -333,7 +427,16 @@ class SafLibraryImporter(
             ?: format.extension.ifBlank { "dat" }
         val booksDir = File(context.filesDir, "books").apply { mkdirs() }
         val destFile = File(booksDir, "$bookId.$ext")
-        val tempFile = File(booksDir, "$bookId.$ext.tmp")
+        return copyNativeEbookToFile(context, uri, destFile)?.let { Uri.fromFile(it).toString() }
+    }
+
+    private fun copyNativeEbookToFile(
+        context: Context,
+        uri: Uri,
+        destFile: File
+    ): File? {
+        destFile.parentFile?.mkdirs()
+        val tempFile = File(destFile.parentFile, "${destFile.name}.tmp")
         return try {
             val copiedBytes = context.contentResolver.openInputStream(uri)?.use { input ->
                 tempFile.outputStream().use { output ->
@@ -351,12 +454,12 @@ class SafLibraryImporter(
                 tempFile.copyTo(destFile, overwrite = true)
                 tempFile.delete()
             }
-            Uri.fromFile(destFile).toString()
+            destFile
         } catch (e: Exception) {
             tempFile.delete()
             android.util.Log.w(
                 "SafLibraryImporter",
-                "Failed to copy non-persistable URI to internal storage for $bookId",
+                "Failed to copy URI to internal storage: ${destFile.name}",
                 e
             )
             null
