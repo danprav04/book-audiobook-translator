@@ -17,11 +17,31 @@ import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.gemini.Blob
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
+import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
+import io.github.danprav04.polyglotbooks.core.gemini.LiveClientMessage
+import io.github.danprav04.polyglotbooks.core.gemini.LiveServerMessage
+import io.github.danprav04.polyglotbooks.core.gemini.LiveSession
+import io.github.danprav04.polyglotbooks.core.gemini.LiveSessionFactory
+import io.github.danprav04.polyglotbooks.core.gemini.ModelTurn
+import io.github.danprav04.polyglotbooks.core.gemini.Part
+import io.github.danprav04.polyglotbooks.core.gemini.ServerContentData
+import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
+import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.feature.narration.SystemTtsEngine
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.test.advanceUntilIdle
+import java.nio.file.Files
+import java.util.Base64
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -153,14 +173,28 @@ class FakePlaybackStateDao : PlaybackStateDao {
 
 class FakeSettingsRepository : SettingsRepository {
     private val _lastOpenedBookId = MutableStateFlow<String?>(null)
+    private val _targetLanguage = MutableStateFlow(LanguageCode.ENGLISH)
+    private val _readerNarrationEngine = MutableStateFlow("GEMINI_FLASH_TTS")
+    private val _readerReadTranslated = MutableStateFlow(false)
+    private val _readerNarrationSpeed = MutableStateFlow(1.0f)
+    private val _readerTheme = MutableStateFlow("LIGHT")
+    private val _readerFontSizeSp = MutableStateFlow(18)
+    private val _readerFontFamily = MutableStateFlow("Sans-Serif")
+
     override val apiKey: Flow<String?> = flowOf(null)
     override val modelPerRole: Flow<Map<ModelRole, String>> = flowOf(DefaultModels.map)
-    override val targetLanguage: Flow<LanguageCode> = flowOf(LanguageCode.ENGLISH)
+    override val targetLanguage: Flow<LanguageCode> = _targetLanguage
     override val cacheLimitBytes: Flow<Long> = flowOf(1024L * 1024L * 1024L)
     override val duckLevel: Flow<Float> = flowOf(0.15f)
     override val echoTargetLanguage: Flow<Boolean> = flowOf(false)
     override val featureUsageStats: Flow<FeatureUsageStats> = flowOf(FeatureUsageStats())
     override val lastOpenedBookId: Flow<String?> = _lastOpenedBookId
+    override val readerNarrationEngine: Flow<String> = _readerNarrationEngine
+    override val readerReadTranslated: Flow<Boolean> = _readerReadTranslated
+    override val readerNarrationSpeed: Flow<Float> = _readerNarrationSpeed
+    override val readerTheme: Flow<String> = _readerTheme
+    override val readerFontSizeSp: Flow<Int> = _readerFontSizeSp
+    override val readerFontFamily: Flow<String> = _readerFontFamily
 
     var lastRecordedBookId: String? = null
 
@@ -168,7 +202,9 @@ class FakeSettingsRepository : SettingsRepository {
     override suspend fun clearApiKey() {}
     override suspend fun setModel(role: ModelRole, modelId: String) {}
     override suspend fun resetModelsToDefaults() {}
-    override suspend fun setTargetLanguage(language: LanguageCode) {}
+    override suspend fun setTargetLanguage(language: LanguageCode) {
+        _targetLanguage.value = language
+    }
     override suspend fun setCacheLimit(bytes: Long) {}
     override suspend fun setDuckLevel(level: Float) {}
     override suspend fun setEchoTargetLanguage(echo: Boolean) {}
@@ -176,6 +212,24 @@ class FakeSettingsRepository : SettingsRepository {
     override suspend fun setLastOpenedBookId(bookId: String?) {
         lastRecordedBookId = bookId
         _lastOpenedBookId.value = bookId
+    }
+    override suspend fun setReaderNarrationEngine(engineName: String) {
+        _readerNarrationEngine.value = engineName
+    }
+    override suspend fun setReaderReadTranslated(readTranslated: Boolean) {
+        _readerReadTranslated.value = readTranslated
+    }
+    override suspend fun setReaderNarrationSpeed(speed: Float) {
+        _readerNarrationSpeed.value = speed.coerceIn(0.5f, 2.5f)
+    }
+    override suspend fun setReaderTheme(themeName: String) {
+        _readerTheme.value = themeName
+    }
+    override suspend fun setReaderFontSizeSp(sizeSp: Int) {
+        _readerFontSizeSp.value = sizeSp.coerceIn(12, 32)
+    }
+    override suspend fun setReaderFontFamily(family: String) {
+        _readerFontFamily.value = family
     }
 
     override suspend fun recordUsage(
@@ -624,5 +678,399 @@ class ReaderViewModelTest {
 
         bridge.onReaderError("Failed to render chapter")
         assertEquals("Failed to render chapter", viewModel.uiState.value.errorMessage)
+    }
+
+    @Test
+    fun `translation disk cache hit prevents redundant TextModelClient calls`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-cache-hit-test").toFile()
+        try {
+            var apiCalls = 0
+            val textClient = object : TextModelClient {
+                override suspend fun generateContent(
+                    apiKey: String,
+                    prompt: String,
+                    systemInstruction: String?,
+                    responseJsonSchema: String?,
+                    model: String
+                ): String {
+                    apiCalls++
+                    val count = Regex("of (\\d+) paragraphs").find(prompt)?.groupValues?.get(1)?.toIntOrNull() ?: 2
+                    return (0 until count).joinToString(prefix = "[", postfix = "]") { idx ->
+                        "\"Hola $idx\""
+                    }
+                }
+            }
+            val keyStore = object : SecureKeyStore {
+                override suspend fun getApiKey(): String = "test-api-key"
+                override suspend fun saveApiKey(key: String) {}
+                override suspend fun deleteApiKey() {}
+            }
+            val viewModel = ReaderViewModel(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-1")),
+                settingsRepository = FakeSettingsRepository(),
+                secureKeyStore = keyStore,
+                textModelClient = textClient,
+                quotaTracker = GeminiQuotaTracker()
+            )
+            val cache = TranslationDiskCache(tempDir)
+            viewModel.testDiskCache = cache
+
+            val chaptersJson = """
+                [{"index":0,"title":"Chapter 1","href":"ch1.html"}]
+            """.trimIndent()
+            viewModel.onChaptersExtracted(chaptersJson)
+            viewModel.onParagraphsExtracted(0, """["Hello world.","Good morning."]""")
+            advanceUntilIdle()
+
+            // First toggle translates via TextModelClient and populates disk cache
+            viewModel.toggleBilingualMode()
+            advanceUntilIdle()
+            assertEquals(1, apiCalls)
+            assertTrue(viewModel.uiState.value.isBilingualEnabled)
+            assertEquals("Hola 0", viewModel.uiState.value.bilingualTranslations.values.firstOrNull())
+
+            // Toggle off and back on: should hit disk cache with zero additional API calls
+            viewModel.toggleBilingualMode()
+            advanceUntilIdle()
+            viewModel.toggleBilingualMode()
+            advanceUntilIdle()
+
+            assertEquals(1, apiCalls)
+            assertTrue(viewModel.uiState.value.isTranslationCached)
+            assertEquals(2, viewModel.uiState.value.bilingualTranslations.size)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `large chapter translation uses single optimal batch and persists incrementally`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-batch-cache-test").toFile()
+        try {
+            var apiCalls = 0
+            val textClient = object : TextModelClient {
+                override suspend fun generateContent(
+                    apiKey: String,
+                    prompt: String,
+                    systemInstruction: String?,
+                    responseJsonSchema: String?,
+                    model: String
+                ): String {
+                    apiCalls++
+                    val count = Regex("of (\\d+) paragraphs").find(prompt)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+                    return (0 until count).joinToString(prefix = "[", postfix = "]") { idx ->
+                        "\"Trad $idx\""
+                    }
+                }
+            }
+            val keyStore = object : SecureKeyStore {
+                override suspend fun getApiKey(): String = "test-api-key"
+                override suspend fun saveApiKey(key: String) {}
+                override suspend fun deleteApiKey() {}
+            }
+            val viewModel = ReaderViewModel(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-batch")),
+                settingsRepository = FakeSettingsRepository(),
+                secureKeyStore = keyStore,
+                textModelClient = textClient,
+                quotaTracker = GeminiQuotaTracker()
+            )
+            val cache = TranslationDiskCache(tempDir)
+            viewModel.testDiskCache = cache
+
+            val paragraphsJson = (0 until 35).joinToString(",") { "\"Paragraph number $it unique text\"" }
+            viewModel.onChaptersExtracted("""[{"index":0,"title":"Ch 1","href":"c1.html"}]""")
+            viewModel.onParagraphsExtracted(0, "[$paragraphsJson]")
+            advanceUntilIdle()
+
+            viewModel.toggleBilingualMode()
+            advanceUntilIdle()
+
+            assertEquals("Expected 35 paragraphs in one optimal batch, not 25-item bursts", 1, apiCalls)
+            assertEquals(35, viewModel.uiState.value.bilingualTranslations.size)
+
+            val persisted = cache.loadTranslations(
+                bookId = "book-batch",
+                chapterIndex = 0,
+                targetLang = viewModel.uiState.value.targetLanguage.code,
+                currentParagraphsByCfi = viewModel.uiState.value.paragraphs.associate { it.cfi to it.text }
+            )
+            assertEquals(35, persisted.size)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `buildSpeechChunks groups same speaker and honors engine limits`() {
+        val viewModel = ReaderViewModel(
+            bookDao = FakeBookDao(),
+            chapterDao = FakeChapterDao(),
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-1"))
+        )
+        val characters = listOf(
+            CharacterEntity(
+                id = "c1",
+                bookId = "book-1",
+                name = "Alice",
+                aliases = "",
+                gender = "female",
+                age = "adult",
+                voiceTraits = "warm",
+                assignedVoiceId = "Kore"
+            )
+        )
+        val longText = "A".repeat(950)
+        val paragraphs = listOf(
+            ReaderParagraph(0, "p-0", "Narrator sentence one.", "cfi-0"),
+            ReaderParagraph(1, "p-1", "Narrator sentence two.", "cfi-1"),
+            ReaderParagraph(2, "p-2", "Alice said, \"Hello there!\"", "cfi-2"),
+            ReaderParagraph(3, "p-3", longText, "cfi-3")
+        )
+
+        val ttsChunks = viewModel.buildSpeechChunks(paragraphs, characters, NarrationEngine.GEMINI_FLASH_TTS)
+        assertEquals(3, ttsChunks.size)
+        assertEquals(listOf("cfi-0", "cfi-1"), ttsChunks[0].allCfis)
+        assertEquals(listOf("cfi-2"), ttsChunks[1].allCfis)
+        assertEquals("Kore", ttsChunks[1].voiceId)
+        assertEquals(listOf("cfi-3"), ttsChunks[2].allCfis)
+
+        val sysChunks = viewModel.buildSpeechChunks(paragraphs, characters, NarrationEngine.SYSTEM_TTS)
+        assertEquals(4, sysChunks.size)
+    }
+
+    @Test
+    fun `synthesizeSpeechChunk replays cached audio and falls back TTS to Live to System`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-audio-cache-test").toFile()
+        try {
+            val cache = TranslationDiskCache(tempDir)
+            var ttsCalls = 0
+            val failingTtsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
+                    ttsCalls++
+                    throw IllegalStateException("429 quota exhausted")
+                }
+
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = emptyFlow()
+            }
+
+            val incoming = MutableSharedFlow<LiveServerMessage>(replay = 4)
+            var liveConnectCount = 0
+            var failLive = false
+            val liveSessionFactory = object : LiveSessionFactory {
+                override fun create(): LiveSession = object : LiveSession {
+                    override val isConnected: Boolean = true
+                    override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
+
+                    override suspend fun connect(apiKey: String, config: io.github.danprav04.polyglotbooks.core.gemini.SetupConfig) {
+                        liveConnectCount++
+                        if (failLive) throw IllegalStateException("Live unavailable")
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        val b64 = Base64.getEncoder().encodeToString(byteArrayOf(10, 20, 30, 40))
+                        incoming.tryEmit(
+                            LiveServerMessage.ServerContentMessage(
+                                ServerContentData(
+                                    modelTurn = ModelTurn(parts = listOf(Part(inlineData = Blob("audio/pcm", b64)))),
+                                    turnComplete = true
+                                )
+                            )
+                        )
+                    }
+
+                    override suspend fun disconnect() {}
+                }
+            }
+
+            val keyStore = object : SecureKeyStore {
+                override suspend fun getApiKey(): String = "test-api-key"
+                override suspend fun saveApiKey(key: String) {}
+                override suspend fun deleteApiKey() {}
+            }
+            val quotaTracker = GeminiQuotaTracker().apply {
+                recordHttpError("gemini-3.8-flash-tts", 429, "ResourceExhausted", "60")
+            }
+            val viewModel = ReaderViewModel(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-1")),
+                settingsRepository = FakeSettingsRepository(),
+                secureKeyStore = keyStore,
+                interactionsTtsClient = failingTtsClient,
+                liveSessionFactory = liveSessionFactory,
+                quotaTracker = quotaTracker
+            )
+
+            val chunk = viewModel.buildSpeechChunks(
+                paragraphs = listOf(ReaderParagraph(0, "p-0", "Test audio fallback.", "cfi-0")),
+                characters = emptyList(),
+                engine = NarrationEngine.GEMINI_FLASH_TTS
+            ).single()
+            val systemFallback = SystemTtsEngine(null)
+
+            // 1. Pre-exhausted TTS quota skips TTS call and falls back cleanly to Live
+            val collectedLive = mutableListOf<ByteArray>()
+            var ttsFailedSignaled = false
+            viewModel.synthesizeSpeechChunk(
+                chunk = chunk,
+                engineChoice = NarrationEngine.GEMINI_FLASH_TTS,
+                systemFallback = systemFallback,
+                diskCache = cache,
+                maxCacheBytes = 1024L * 1024L,
+                ttsAlreadyFailed = false,
+                onTtsFailed = { ttsFailedSignaled = true },
+                onStatusUpdate = {},
+                onPcmChunk = { collectedLive.add(it.data) }
+            )
+            assertEquals(0, ttsCalls)
+            assertTrue(ttsFailedSignaled)
+            assertEquals(1, liveConnectCount)
+            assertTrue(collectedLive.any { it.contentEquals(byteArrayOf(10, 20, 30, 40)) })
+
+            // 2. Subsequent call for the same chunk replays cached Live PCM with 0 network calls
+            val collectedCached = mutableListOf<ByteArray>()
+            viewModel.synthesizeSpeechChunk(
+                chunk = chunk,
+                engineChoice = NarrationEngine.GEMINI_LIVE,
+                systemFallback = systemFallback,
+                diskCache = cache,
+                maxCacheBytes = 1024L * 1024L,
+                ttsAlreadyFailed = true,
+                onTtsFailed = {},
+                onStatusUpdate = {},
+                onPcmChunk = { collectedCached.add(it.data) }
+            )
+            assertEquals(1, liveConnectCount)
+            assertTrue(collectedCached.any { it.contentEquals(byteArrayOf(10, 20, 30, 40)) })
+
+            // 3. When Live also fails on uncached text, falls back to SystemTtsEngine
+            failLive = true
+            val uncachedChunk = viewModel.buildSpeechChunks(
+                paragraphs = listOf(ReaderParagraph(1, "p-1", "Offline fallback text.", "cfi-1")),
+                characters = emptyList(),
+                engine = NarrationEngine.GEMINI_FLASH_TTS
+            ).single()
+            val collectedSystem = mutableListOf<ByteArray>()
+            viewModel.synthesizeSpeechChunk(
+                chunk = uncachedChunk,
+                engineChoice = NarrationEngine.GEMINI_FLASH_TTS,
+                systemFallback = systemFallback,
+                diskCache = cache,
+                maxCacheBytes = 1024L * 1024L,
+                ttsAlreadyFailed = true,
+                onTtsFailed = {},
+                onStatusUpdate = {},
+                onPcmChunk = { collectedSystem.add(it.data) }
+            )
+            assertTrue(collectedSystem.sumOf { it.size } > 0)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `reader appearance and narration preferences persist via SettingsRepository`() = runTest {
+        val settingsRepo = FakeSettingsRepository()
+        val viewModel = ReaderViewModel(
+            bookDao = FakeBookDao(),
+            chapterDao = FakeChapterDao(),
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-prefs")),
+            settingsRepository = settingsRepo
+        )
+        advanceUntilIdle()
+
+        viewModel.setTheme(ReaderTheme.DARK)
+        viewModel.setFontSize(22)
+        viewModel.setFontFamily("Serif")
+        viewModel.setNarrationEngine(NarrationEngine.GEMINI_LIVE)
+        viewModel.setNarrateTranslatedText(true)
+        viewModel.setPlaybackSpeed(1.5f)
+        advanceUntilIdle()
+
+        assertEquals("DARK", settingsRepo.readerTheme.first())
+        assertEquals(22, settingsRepo.readerFontSizeSp.first())
+        assertEquals("Serif", settingsRepo.readerFontFamily.first())
+        assertEquals("GEMINI_LIVE", settingsRepo.readerNarrationEngine.first())
+        assertEquals(true, settingsRepo.readerReadTranslated.first())
+        assertEquals(1.5f, settingsRepo.readerNarrationSpeed.first())
+    }
+
+    @Test
+    fun `reopening book reattaches to active background session and onCleared keeps playing`() = runTest {
+        val bookDao = FakeBookDao()
+        val chapterDao = FakeChapterDao()
+        val settingsRepo = FakeSettingsRepository()
+        bookDao.insertBook(
+            BookEntity(
+                id = "book-bg",
+                title = "Background Book",
+                author = "Tester",
+                format = "EPUB",
+                filePath = "/tmp/bg.epub",
+                coverUri = null,
+                addedDate = 1L,
+                lastReadDate = 1L,
+                isAudiobook = false
+            )
+        )
+        val chapters = listOf(
+            ChapterEntity("c0", "book-bg", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+            ChapterEntity("c1", "book-bg", 1, "Ch 2", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 100)
+        )
+        chapterDao.insertChapters(chapters)
+
+        val sharedSession = ReaderNarrationSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            settingsRepository = settingsRepo,
+            applicationScope = backgroundScope
+        )
+        sharedSession.updateBookContext(
+            bookId = "book-bg",
+            bookTitle = "Background Book",
+            chapters = chapters,
+            currentChapterIndex = 1,
+            paragraphs = listOf(
+                ReaderParagraph(0, "p0", "Ch2 Para 0", "epubcfi(/6/4!/4/2/1:0)"),
+                ReaderParagraph(1, "p1", "Ch2 Para 1", "epubcfi(/6/4!/4/2/2:0)")
+            ),
+            activeParagraphIndex = 1,
+            forceWhenDifferentBook = true
+        )
+        sharedSession.seekToParagraph(1)
+        // Simulate active background session on chapter 1 paragraph 1
+        sharedSession.startOrResume(
+            bookId = "book-bg",
+            bookTitle = "Background Book",
+            chapters = chapters,
+            currentChapterIndex = 1,
+            paragraphs = emptyList(),
+            activeParagraphIndex = 0
+        )
+
+        val vm1 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-bg")),
+            settingsRepository = settingsRepo,
+            injectedSessionManager = sharedSession
+        )
+        advanceUntilIdle()
+
+        assertTrue(vm1.uiState.value.isNarrationPlaying)
+        assertEquals(1, vm1.uiState.value.currentChapterIndex)
+
+        // Clearing ViewModel simulates navigating back to Library; background session must keep running!
+        val onClearedMethod = androidx.lifecycle.ViewModel::class.java.getDeclaredMethod("onCleared")
+        onClearedMethod.isAccessible = true
+        onClearedMethod.invoke(vm1)
+
+        assertTrue(sharedSession.sessionState.value.isActiveSession)
+        assertTrue(sharedSession.sessionState.value.isPlaying)
     }
 }

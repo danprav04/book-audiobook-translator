@@ -605,7 +605,7 @@
       }
     },
 
-    highlightCfi: function (cfiRange) {
+    highlightCfi: function (cfiRange, followScroll) {
       activeHighlightCfi = cfiRange || null;
       if (!cfiRange) {
         this.clearHighlights();
@@ -628,9 +628,39 @@
         }
       }
       applyHighlightToDom();
-      const el = findElementByCfi(cfiRange);
+      if (followScroll !== false) {
+        const el = findElementByCfi(cfiRange);
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          const vh = window.innerHeight || document.documentElement.clientHeight || 600;
+          const comfortTop = vh * 0.18;
+          const comfortBottom = vh * 0.72;
+          const outOfComfortZone = rect.top < comfortTop || rect.bottom > comfortBottom;
+          if (outOfComfortZone) {
+            suppressScrollUntil = Date.now() + 350;
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+          }
+        }
+      }
+    },
+
+    jumpToHighlight: function () {
+      if (!activeHighlightCfi) return;
+      if (!isPdfFormat()) {
+        const targetChapter = parseChapterIndexFromCfi(activeHighlightCfi);
+        if (
+          targetChapter !== null &&
+          chaptersData?.chapters &&
+          targetChapter < chaptersData.chapters.length &&
+          targetChapter !== currentChapterIndex
+        ) {
+          renderReflowableChapter(targetChapter, false);
+          applyHighlightToDom();
+        }
+      }
+      const el = findElementByCfi(activeHighlightCfi);
       if (el) {
-        suppressScrollUntil = Date.now() + 250;
+        suppressScrollUntil = Date.now() + 350;
         el.scrollIntoView({ behavior: "smooth", block: "center" });
       }
     },

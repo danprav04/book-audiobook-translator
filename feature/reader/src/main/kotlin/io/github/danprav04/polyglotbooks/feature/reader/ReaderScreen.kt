@@ -1,11 +1,13 @@
 package io.github.danprav04.polyglotbooks.feature.reader
 
 import android.annotation.SuppressLint
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -13,6 +15,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -23,6 +26,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -35,6 +43,8 @@ import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
+import java.io.File
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private const val READER_ORIGIN_HOST = "appassets.androidplatform.net"
@@ -143,20 +153,37 @@ fun ReaderScreen(
         }
     }
 
-    // Sync active highlight CFI to WebView.
-    LaunchedEffect(isWebViewPageFinished, uiState.isBookReady, uiState.highlightedCfi, webViewInstance) {
+    // Sync active highlight CFI to WebView respecting followHighlight setting.
+    LaunchedEffect(
+        isWebViewPageFinished,
+        uiState.isBookReady,
+        uiState.highlightedCfi,
+        uiState.followHighlight,
+        webViewInstance
+    ) {
         val webView = webViewInstance
         if (webView != null && isWebViewPageFinished) {
             val cfi = uiState.highlightedCfi
             if (!cfi.isNullOrBlank()) {
-                webView.evaluateJavascript("window.FoliateBridge?.highlightCfi(${JSONObject.quote(cfi)});", null)
+                webView.evaluateJavascript(
+                    "window.FoliateBridge?.highlightCfi(${JSONObject.quote(cfi)}, ${uiState.followHighlight});",
+                    null
+                )
             } else {
                 webView.evaluateJavascript("window.FoliateBridge?.clearHighlights();", null)
             }
         }
     }
 
-    // Flush reading position on pause/stop and when navigating away from the reader.
+    // Explicit "Jump to current" action requested by the user.
+    LaunchedEffect(uiState.jumpToHighlightNonce, isWebViewPageFinished, uiState.isBookReady, webViewInstance) {
+        val webView = webViewInstance
+        if (webView != null && isWebViewPageFinished && uiState.jumpToHighlightNonce > 0) {
+            webView.evaluateJavascript("window.FoliateBridge?.jumpToHighlight?.();", null)
+        }
+    }
+
+    // Flush reading position on pause/stop; keep background narration running when navigating away!
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
@@ -167,7 +194,6 @@ fun ReaderScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            viewModel.stopNarration()
             viewModel.flushProgress()
         }
     }
@@ -252,85 +278,16 @@ fun ReaderScreen(
             )
         },
         bottomBar = {
-            BottomAppBar(
-                tonalElevation = 8.dp
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(
-                            onClick = { viewModel.prevChapter() },
-                            enabled = uiState.currentChapterIndex > 0
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.NavigateBefore, contentDescription = "Previous Chapter")
-                        }
-                        IconButton(
-                            onClick = { viewModel.nextChapter() },
-                            enabled = uiState.currentChapterIndex < maxOf(
-                                uiState.chapters.lastIndex,
-                                (uiState.extractedBook?.chapters?.lastIndex ?: -1)
-                            )
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.NavigateNext, contentDescription = "Next Chapter")
-                        }
-                    }
-
-                    var engineExpanded by remember { mutableStateOf(false) }
-                    Box {
-                        OutlinedButton(
-                            onClick = { engineExpanded = true },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = when (uiState.narrationEngine) {
-                                    NarrationEngine.GEMINI_FLASH_TTS -> "Gemini TTS"
-                                    NarrationEngine.GEMINI_LIVE -> "Gemini Live"
-                                    NarrationEngine.SYSTEM_TTS -> "System TTS"
-                                },
-                                maxLines = 1
-                            )
-                        }
-                        DropdownMenu(
-                            expanded = engineExpanded,
-                            onDismissRequest = { engineExpanded = false }
-                        ) {
-                            NarrationEngine.values().forEach { engine ->
-                                DropdownMenuItem(
-                                    text = { Text(engine.name.replace("_", " ")) },
-                                    onClick = {
-                                        viewModel.setNarrationEngine(engine)
-                                        engineExpanded = false
-                                    }
-                                )
-                            }
-                        }
-                    }
-
-                    SmallFloatingActionButton(
-                        onClick = { viewModel.toggleNarration() },
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    ) {
-                        Icon(
-                            if (uiState.isNarrationPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Play/Pause Narration"
-                        )
-                    }
-
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { viewModel.setCastEditorOpen(true) }) {
-                            Icon(Icons.Default.Group, contentDescription = "Cast Editor")
-                        }
-                        IconButton(onClick = { viewModel.setReportDialogOpen(true) }) {
-                            Icon(Icons.Default.Report, contentDescription = "Report AI Output")
-                        }
-                    }
-                }
-            }
+            NarrationControlDock(
+                uiState = uiState,
+                onToggleNarrateTranslated = { viewModel.setNarrateTranslatedText(!uiState.narrateTranslatedText) },
+                onSelectEngine = viewModel::setNarrationEngine,
+                onPrevParagraph = { viewModel.previousParagraph() },
+                onTogglePlayPause = { viewModel.toggleNarration() },
+                onNextParagraph = { viewModel.nextParagraph() },
+                onSeekToMs = viewModel::seekToChapterPositionMs,
+                onExpandSheet = { viewModel.setNarrationSheetExpanded(true) }
+            )
         }
     ) { paddingValues ->
         Column(
@@ -340,6 +297,21 @@ fun ReaderScreen(
         ) {
             if (uiState.isTranslating || uiState.isCastAnalyzing) {
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            if (uiState.isBilingualEnabled && (uiState.isTranslating || uiState.isTranslationCached)) {
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = if (uiState.isTranslating) "Translating..." else "Cached",
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                    )
+                }
             }
 
             uiState.errorMessage?.let { errorMsg ->
@@ -367,8 +339,15 @@ fun ReaderScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
                                 text = errorMsg,
-                                style = MaterialTheme.typography.bodySmall
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 4,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                             )
+                        }
+                        if (uiState.isBilingualEnabled || uiState.narrateTranslatedText) {
+                            TextButton(onClick = { viewModel.retryTranslation() }) {
+                                Text("Retry")
+                            }
                         }
                         IconButton(onClick = { viewModel.clearError() }) {
                             Icon(Icons.Default.Close, contentDescription = "Dismiss Error")
@@ -570,7 +549,38 @@ fun ReaderScreen(
                         onThemeSelected = viewModel::setTheme,
                         onFontSizeChange = viewModel::setFontSize,
                         onFontFamilySelected = viewModel::setFontFamily,
-                        onTargetLanguageSelected = viewModel::setTargetLanguage
+                        onTargetLanguageSelected = viewModel::setTargetLanguage,
+                        onNarrateTranslatedSelected = viewModel::setNarrateTranslatedText
+                    )
+                }
+
+                if (uiState.isNarrationSheetExpanded) {
+                    ExpandedNarrationSheet(
+                        uiState = uiState,
+                        chapterSubtitle = currentChapterSubtitle,
+                        onDismiss = { viewModel.setNarrationSheetExpanded(false) },
+                        onPrevChapter = { viewModel.prevChapter() },
+                        onNextChapter = { viewModel.nextChapter() },
+                        onSeekByDelta = viewModel::seekByDeltaMs,
+                        onSeekToChapterMs = viewModel::seekToChapterPositionMs,
+                        onTogglePlayPause = { viewModel.toggleNarration() },
+                        onStopNarration = {
+                            viewModel.stopNarration()
+                            viewModel.setNarrationSheetExpanded(false)
+                        },
+                        onSelectNarrateTranslated = viewModel::setNarrateTranslatedText,
+                        onSelectEngine = viewModel::setNarrationEngine,
+                        onSelectSpeed = viewModel::setPlaybackSpeed,
+                        onSelectSleepTimer = viewModel::setSleepTimer,
+                        onToggleFollowHighlight = viewModel::setFollowHighlight,
+                        onJumpToCurrent = {
+                            viewModel.jumpToActiveHighlight()
+                            viewModel.setNarrationSheetExpanded(false)
+                        },
+                        onOpenCastEditor = {
+                            viewModel.setNarrationSheetExpanded(false)
+                            viewModel.setCastEditorOpen(true)
+                        }
                     )
                 }
 
@@ -627,7 +637,8 @@ private fun AppearanceAndLanguageDialog(
     onThemeSelected: (ReaderTheme) -> Unit,
     onFontSizeChange: (Int) -> Unit,
     onFontFamilySelected: (String) -> Unit,
-    onTargetLanguageSelected: (LanguageCode) -> Unit
+    onTargetLanguageSelected: (LanguageCode) -> Unit,
+    onNarrateTranslatedSelected: (Boolean) -> Unit
 ) {
     var langMenuExpanded by remember { mutableStateOf(false) }
 
@@ -687,6 +698,23 @@ private fun AppearanceAndLanguageDialog(
                             label = { Text(family) }
                         )
                     }
+                }
+
+                Text("Narration Speech Source", style = MaterialTheme.typography.labelLarge)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = !uiState.narrateTranslatedText,
+                        onClick = { onNarrateTranslatedSelected(false) },
+                        label = { Text("Original") }
+                    )
+                    FilterChip(
+                        selected = uiState.narrateTranslatedText,
+                        onClick = { onNarrateTranslatedSelected(true) },
+                        label = { Text("Translated (${uiState.targetLanguage.code.uppercase()})") }
+                    )
                 }
 
                 Text("Target Translation Language", style = MaterialTheme.typography.labelLarge)
@@ -861,6 +889,627 @@ private fun CastCharacterRow(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun NarrationControlDock(
+    uiState: ReaderUiState,
+    onToggleNarrateTranslated: () -> Unit,
+    onSelectEngine: (NarrationEngine) -> Unit,
+    onPrevParagraph: () -> Unit,
+    onTogglePlayPause: () -> Unit,
+    onNextParagraph: () -> Unit,
+    onSeekToMs: (Long) -> Unit,
+    onExpandSheet: () -> Unit
+) {
+    val totalChapters = maxOf(uiState.chapters.size, uiState.extractedBook?.chapters?.size ?: 0).coerceAtLeast(1)
+    val totalParagraphs = uiState.paragraphs.size
+    val activeParaDisplay = if (totalParagraphs > 0) (uiState.activeParagraphIndex + 1).coerceIn(1, totalParagraphs) else 0
+    val chapterDurationMs = uiState.chapterDurationMs.coerceAtLeast(1L)
+
+    var isDraggingSlider by remember(uiState.bookId, uiState.currentChapterIndex) { mutableStateOf(false) }
+    var dragPosMs by remember(uiState.bookId, uiState.currentChapterIndex) { mutableStateOf(uiState.chapterPositionMs) }
+    val displayedPosMs = if (isDraggingSlider) dragPosMs.coerceIn(0L, chapterDurationMs) else uiState.chapterPositionMs.coerceIn(0L, chapterDurationMs)
+
+    var engineExpanded by remember { mutableStateOf(false) }
+
+    Surface(
+        tonalElevation = 8.dp,
+        shadowElevation = 6.dp,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+            if (uiState.chapterDurationMs > 0L) {
+                Slider(
+                    value = displayedPosMs.toFloat(),
+                    onValueChange = { next ->
+                        isDraggingSlider = true
+                        dragPosMs = next.toLong()
+                    },
+                    onValueChangeFinished = {
+                        val target = dragPosMs.coerceIn(0L, chapterDurationMs)
+                        isDraggingSlider = false
+                        onSeekToMs(target)
+                    },
+                    valueRange = 0f..chapterDurationMs.toFloat(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(24.dp)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (uiState.chapterDurationMs > 0L) {
+                        "${formatNarrationTime(displayedPosMs)} / ${formatNarrationTime(chapterDurationMs)}"
+                    } else {
+                        "Ch ${uiState.currentChapterIndex + 1}/$totalChapters"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = if (totalParagraphs > 0) {
+                        "Ch ${uiState.currentChapterIndex + 1}/$totalChapters · Para $activeParaDisplay/$totalParagraphs"
+                    } else {
+                        "Ch ${uiState.currentChapterIndex + 1}/$totalChapters"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val speedAndTimer = buildString {
+                    append("${uiState.playbackSpeed}x")
+                    if (uiState.stopAfterCurrentChapter) append(" · End Ch")
+                    else if (uiState.sleepTimerMinutesRemaining > 0) append(" · ${uiState.sleepTimerMinutesRemaining}m")
+                }
+                Text(
+                    text = speedAndTimer,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                // Speech Source pill: Original vs Translated (<LANG>)
+                FilterChip(
+                    selected = uiState.narrateTranslatedText,
+                    onClick = onToggleNarrateTranslated,
+                    label = {
+                        Text(
+                            text = if (uiState.narrateTranslatedText) {
+                                uiState.targetLanguage.code.uppercase().take(4)
+                            } else {
+                                "Orig"
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1
+                        )
+                    }
+                )
+
+                // Provider pill + quota hints menu
+                Box {
+                    OutlinedButton(
+                        onClick = { engineExpanded = true },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        Text(
+                            text = narrationEngineShortLabel(uiState.narrationEngine),
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = engineExpanded,
+                        onDismissRequest = { engineExpanded = false }
+                    ) {
+                        NarrationEngine.values().forEach { engine ->
+                            val (title, hint) = narrationEngineQuotaInfo(engine)
+                            DropdownMenuItem(
+                                text = {
+                                    Column {
+                                        Text(text = title, style = MaterialTheme.typography.bodyMedium)
+                                        Text(
+                                            text = hint,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                },
+                                onClick = {
+                                    onSelectEngine(engine)
+                                    engineExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                // Transport: Prev Para, Play/Pause, Next Para
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onPrevParagraph,
+                        enabled = totalParagraphs > 0
+                    ) {
+                        Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Paragraph")
+                    }
+                    SmallFloatingActionButton(
+                        onClick = onTogglePlayPause,
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        if (uiState.isBuffering && uiState.isNarrationPlaying) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                if (uiState.isNarrationPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = if (uiState.isNarrationPlaying) "Pause Narration" else "Play Narration"
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = onNextParagraph,
+                        enabled = totalParagraphs > 0
+                    ) {
+                        Icon(Icons.Default.SkipNext, contentDescription = "Next Paragraph")
+                    }
+                }
+
+                IconButton(onClick = onExpandSheet) {
+                    Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Expand Narration Player")
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ExpandedNarrationSheet(
+    uiState: ReaderUiState,
+    chapterSubtitle: String,
+    onDismiss: () -> Unit,
+    onPrevChapter: () -> Unit,
+    onNextChapter: () -> Unit,
+    onSeekByDelta: (Long) -> Unit,
+    onSeekToChapterMs: (Long) -> Unit,
+    onTogglePlayPause: () -> Unit,
+    onStopNarration: () -> Unit,
+    onSelectNarrateTranslated: (Boolean) -> Unit,
+    onSelectEngine: (NarrationEngine) -> Unit,
+    onSelectSpeed: (Float) -> Unit,
+    onSelectSleepTimer: (Int) -> Unit,
+    onToggleFollowHighlight: (Boolean) -> Unit,
+    onJumpToCurrent: () -> Unit,
+    onOpenCastEditor: () -> Unit
+) {
+    val context = LocalContext.current
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var speedMenuExpanded by remember { mutableStateOf(false) }
+    var sleepMenuExpanded by remember { mutableStateOf(false) }
+
+    val coverBitmap = remember(uiState.bookCoverUri, uiState.bookId) {
+        val uriFile = uiState.bookCoverUri?.let { File(it) }
+        val defaultCover = if (uiState.bookId.isNotBlank()) File(context.filesDir, "covers/${uiState.bookId}.jpg") else null
+        val path = when {
+            uriFile != null && uriFile.exists() -> uriFile.absolutePath
+            defaultCover != null && defaultCover.exists() -> defaultCover.absolutePath
+            !uiState.bookCoverUri.isNullOrBlank() -> uiState.bookCoverUri
+            else -> null
+        }
+        path?.let {
+            try {
+                BitmapFactory.decodeFile(it)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    val activeParagraph = uiState.paragraphs.getOrNull(uiState.activeParagraphIndex)
+    val snippetText = remember(activeParagraph, uiState.narrateTranslatedText, uiState.bilingualTranslations) {
+        if (activeParagraph == null) {
+            "Press Play to start audiobook-grade narration."
+        } else if (uiState.narrateTranslatedText) {
+            uiState.bilingualTranslations[activeParagraph.cfi]?.takeIf { it.isNotBlank() } ?: activeParagraph.text
+        } else {
+            activeParagraph.text
+        }
+    }
+
+    val totalChapters = maxOf(uiState.chapters.size, uiState.extractedBook?.chapters?.size ?: 0).coerceAtLeast(1)
+    val chapterDurationMs = uiState.chapterDurationMs.coerceAtLeast(1L)
+    var isDraggingSlider by remember(uiState.bookId, uiState.currentChapterIndex) { mutableStateOf(false) }
+    var dragPosMs by remember(uiState.bookId, uiState.currentChapterIndex) { mutableStateOf(uiState.chapterPositionMs) }
+    val displayedChapterPosMs = if (isDraggingSlider) dragPosMs.coerceIn(0L, chapterDurationMs) else uiState.chapterPositionMs.coerceIn(0L, chapterDurationMs)
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Header: Cover/Icon + Book Title + Chapter Subtitle
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    modifier = Modifier.size(64.dp)
+                ) {
+                    if (coverBitmap != null) {
+                        Image(
+                            bitmap = coverBitmap.asImageBitmap(),
+                            contentDescription = uiState.bookTitle,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
+                            Icon(
+                                Icons.Default.MenuBook,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+                    }
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = uiState.bookTitle.ifBlank { "Reader Narration" },
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (uiState.bookAuthor.isNotBlank()) {
+                        Text(
+                            text = uiState.bookAuthor,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Text(
+                        text = chapterSubtitle.ifBlank { "Chapter ${uiState.currentChapterIndex + 1} / $totalChapters" },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                IconButton(onClick = onStopNarration) {
+                    Icon(Icons.Default.Stop, contentDescription = "Stop Background Narration")
+                }
+            }
+
+            // Active paragraph snippet preview
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = if (uiState.paragraphs.isNotEmpty()) {
+                            "Paragraph ${uiState.activeParagraphIndex + 1} of ${uiState.paragraphs.size}"
+                        } else {
+                            "Current Segment"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = snippetText,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            // Chapter Timeline Slider & Book Progress
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Slider(
+                    value = displayedChapterPosMs.toFloat(),
+                    onValueChange = { next ->
+                        isDraggingSlider = true
+                        dragPosMs = next.toLong()
+                    },
+                    onValueChangeFinished = {
+                        val target = dragPosMs.coerceIn(0L, chapterDurationMs)
+                        isDraggingSlider = false
+                        onSeekToChapterMs(target)
+                    },
+                    valueRange = 0f..chapterDurationMs.toFloat()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(formatNarrationTime(displayedChapterPosMs), style = MaterialTheme.typography.labelSmall)
+                    Text(formatNarrationTime(chapterDurationMs), style = MaterialTheme.typography.labelSmall)
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                val bookDurationMs = uiState.bookDurationMs.coerceAtLeast(1L)
+                val bookFraction = if (uiState.bookDurationMs > 0L) {
+                    (uiState.bookPositionMs.toFloat() / bookDurationMs.toFloat()).coerceIn(0f, 1f)
+                } else {
+                    uiState.progress.coerceIn(0f, 1f)
+                }
+                LinearProgressIndicator(
+                    progress = { bookFraction },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp))
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = if (uiState.bookDurationMs > 0L) {
+                            "Book: ${formatNarrationTime(uiState.bookPositionMs)} / ${formatNarrationTime(uiState.bookDurationMs)}"
+                        } else {
+                            "Book Progress"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "${(bookFraction * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // 5-button Transport Row
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = onPrevChapter,
+                    enabled = uiState.currentChapterIndex > 0
+                ) {
+                    Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Chapter")
+                }
+                IconButton(onClick = { onSeekByDelta(-15_000L) }) {
+                    Icon(Icons.Default.FastRewind, contentDescription = "Rewind 15s / Previous Paragraph")
+                }
+                FilledIconButton(
+                    onClick = onTogglePlayPause,
+                    modifier = Modifier.size(60.dp)
+                ) {
+                    if (uiState.isBuffering && uiState.isNarrationPlaying) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                            strokeWidth = 2.5.dp
+                        )
+                    } else {
+                        Icon(
+                            imageVector = if (uiState.isNarrationPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = if (uiState.isNarrationPlaying) "Pause" else "Play",
+                            modifier = Modifier.size(30.dp)
+                        )
+                    }
+                }
+                IconButton(onClick = { onSeekByDelta(15_000L) }) {
+                    Icon(Icons.Default.FastForward, contentDescription = "Forward 15s / Next Paragraph")
+                }
+                IconButton(
+                    onClick = onNextChapter,
+                    enabled = uiState.currentChapterIndex < totalChapters - 1
+                ) {
+                    Icon(Icons.Default.SkipNext, contentDescription = "Next Chapter")
+                }
+            }
+
+            // Speech Source Selector: Original Text vs Translated (<LANG>)
+            Text("Speech Source", style = MaterialTheme.typography.labelLarge)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = !uiState.narrateTranslatedText,
+                    onClick = { onSelectNarrateTranslated(false) },
+                    label = { Text("Original Text") },
+                    modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = uiState.narrateTranslatedText,
+                    onClick = { onSelectNarrateTranslated(true) },
+                    label = { Text("Translated (${uiState.targetLanguage.code.uppercase()})") },
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // Provider Chips + Quota Hint
+            Text("Voice Provider", style = MaterialTheme.typography.labelLarge)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                NarrationEngine.values().forEach { engine ->
+                    FilterChip(
+                        selected = uiState.narrationEngine == engine,
+                        onClick = { onSelectEngine(engine) },
+                        label = {
+                            Text(
+                                text = narrationEngineShortLabel(engine),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+            val (_, activeHint) = narrationEngineQuotaInfo(uiState.narrationEngine)
+            Text(
+                text = activeHint,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            // Comfort Controls Row: Speed, Sleep Timer, Follow Highlight, Jump to current, Cast Editor
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box {
+                    OutlinedButton(onClick = { speedMenuExpanded = true }) {
+                        Icon(Icons.Default.Speed, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("${uiState.playbackSpeed}x")
+                    }
+                    DropdownMenu(
+                        expanded = speedMenuExpanded,
+                        onDismissRequest = { speedMenuExpanded = false }
+                    ) {
+                        listOf(0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f).forEach { spd ->
+                            DropdownMenuItem(
+                                text = { Text("${spd}x") },
+                                onClick = {
+                                    onSelectSpeed(spd)
+                                    speedMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                Box {
+                    OutlinedButton(onClick = { sleepMenuExpanded = true }) {
+                        Icon(Icons.Default.Timer, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            when {
+                                uiState.stopAfterCurrentChapter -> "End Ch"
+                                uiState.sleepTimerMinutesRemaining > 0 -> "${uiState.sleepTimerMinutesRemaining}m"
+                                else -> "Sleep"
+                            }
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = sleepMenuExpanded,
+                        onDismissRequest = { sleepMenuExpanded = false }
+                    ) {
+                        listOf(0, 10, 15, 30, 45, 60, -1).forEach { mins ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        when (mins) {
+                                            0 -> "Off"
+                                            -1 -> "End of Chapter"
+                                            else -> "$mins minutes"
+                                        }
+                                    )
+                                },
+                                onClick = {
+                                    onSelectSleepTimer(mins)
+                                    sleepMenuExpanded = false
+                                }
+                            )
+                        }
+                    }
+                }
+
+                IconButton(onClick = onOpenCastEditor) {
+                    Icon(Icons.Default.Group, contentDescription = "Cast Editor")
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                FilterChip(
+                    selected = uiState.followHighlight,
+                    onClick = { onToggleFollowHighlight(!uiState.followHighlight) },
+                    label = { Text("Follow highlight") }
+                )
+                TextButton(
+                    onClick = onJumpToCurrent,
+                    enabled = !uiState.highlightedCfi.isNullOrBlank()
+                ) {
+                    Icon(Icons.Default.MyLocation, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Jump to current")
+                }
+            }
+        }
+    }
+}
+
+private fun narrationEngineShortLabel(engine: NarrationEngine): String {
+    return when (engine) {
+        NarrationEngine.GEMINI_FLASH_TTS -> "Gemini TTS"
+        NarrationEngine.GEMINI_LIVE -> "Gemini Live"
+        NarrationEngine.SYSTEM_TTS -> "System TTS"
+    }
+}
+
+private fun narrationEngineQuotaInfo(engine: NarrationEngine): Pair<String, String> {
+    return when (engine) {
+        NarrationEngine.GEMINI_FLASH_TTS ->
+            "Gemini Flash TTS" to "3 RPM · 10 RPD (batched & cached)"
+        NarrationEngine.GEMINI_LIVE ->
+            "Gemini Live" to "Unlimited RPM/RPD (recommended for free tier)"
+        NarrationEngine.SYSTEM_TTS ->
+            "System TTS" to "Offline · Unlimited"
+    }
+}
+
+private fun formatNarrationTime(millis: Long): String {
+    val totalSeconds = (millis.coerceAtLeast(0L) / 1000L)
+    val seconds = totalSeconds % 60
+    val minutes = (totalSeconds / 60) % 60
+    val hours = totalSeconds / 3600
+    return if (hours > 0) {
+        String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
+    } else {
+        String.format(Locale.US, "%02d:%02d", minutes, seconds)
     }
 }
 

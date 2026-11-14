@@ -6,7 +6,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
-import io.github.danprav04.polyglotbooks.core.audio.AudioTrackPcmPlayer
 import io.github.danprav04.polyglotbooks.core.audio.PcmPlayer
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
@@ -17,27 +16,23 @@ import io.github.danprav04.polyglotbooks.core.data.db.NarrationDao
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveSessionFactory
+import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.Character
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.feature.narration.CastingService
-import io.github.danprav04.polyglotbooks.feature.narration.ChapterTranslator
-import io.github.danprav04.polyglotbooks.feature.narration.GeminiLiveEngine
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
-import io.github.danprav04.polyglotbooks.feature.narration.GeminiTtsEngine
-import io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest
-import io.github.danprav04.polyglotbooks.feature.narration.SystemTtsEngine
 import io.github.danprav04.polyglotbooks.feature.narration.VoiceCaster
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -65,9 +60,23 @@ data class ReaderParagraph(
     val cfi: String
 )
 
+data class SpeechChunk(
+    val text: String,
+    val leadCfi: String,
+    val allCfis: List<String>,
+    val leadIndex: Int,
+    val voiceId: String,
+    val style: String?,
+    val paragraphIndices: List<Int> = emptyList(),
+    val paragraphCharWeights: List<Int> = emptyList(),
+    val languageCode: String? = null
+)
+
 data class ReaderUiState(
     val bookId: String = "",
     val bookTitle: String = "Reader",
+    val bookAuthor: String = "",
+    val bookCoverUri: String? = null,
     val bookFormat: String = "EPUB",
     val bookFilePath: String = "",
     val chapters: List<ChapterEntity> = emptyList(),
@@ -84,7 +93,19 @@ data class ReaderUiState(
     val searchQuery: String = "",
     val searchResults: List<SearchResultItem> = emptyList(),
     val isNarrationPlaying: Boolean = false,
+    val isBuffering: Boolean = false,
     val narrationEngine: NarrationEngine = NarrationEngine.GEMINI_FLASH_TTS,
+    val narrateTranslatedText: Boolean = false,
+    val playbackSpeed: Float = 1.0f,
+    val sleepTimerMinutesRemaining: Int = 0,
+    val stopAfterCurrentChapter: Boolean = false,
+    val chapterPositionMs: Long = 0L,
+    val chapterDurationMs: Long = 0L,
+    val bookPositionMs: Long = 0L,
+    val bookDurationMs: Long = 0L,
+    val followHighlight: Boolean = true,
+    val isNarrationSheetExpanded: Boolean = false,
+    val jumpToHighlightNonce: Int = 0,
     val isCastEditorOpen: Boolean = false,
     val isBilingualEnabled: Boolean = false,
     val targetLanguage: LanguageCode = LanguageCode.SPANISH,
@@ -95,6 +116,7 @@ data class ReaderUiState(
     val characters: List<CharacterEntity> = emptyList(),
     val isCastAnalyzing: Boolean = false,
     val isTranslating: Boolean = false,
+    val isTranslationCached: Boolean = false,
     val extractedBook: EbookContentExtractor.ExtractedBook? = null,
     val activeParagraphIndex: Int = 0,
     val paragraphs: List<ReaderParagraph> = emptyList(),
@@ -114,24 +136,53 @@ class ReaderViewModel @Inject constructor(
     private val secureKeyStore: SecureKeyStore? = null,
     private val interactionsTtsClient: InteractionsTtsClient? = null,
     private val textModelClient: TextModelClient? = null,
-    private val liveSessionFactory: LiveSessionFactory? = null
+    private val liveSessionFactory: LiveSessionFactory? = null,
+    private val quotaTracker: GeminiQuotaTracker? = null,
+    private val modelCatalogService: ModelCatalogService? = null,
+    private val injectedSessionManager: ReaderNarrationSessionManager? = null
 ) : ViewModel(), ReaderBridgeListener {
 
     private var bookId: String = savedStateHandle.get<String>("bookId") ?: "sample_book_id"
     private var loadJob: Job? = null
     private var charactersJob: Job? = null
     private var settingsJob: Job? = null
-    private var narrationJob: Job? = null
-    private var translationJob: Job? = null
+    private var sessionObserverJob: Job? = null
     private var castJob: Job? = null
-    private var activePcmPlayer: PcmPlayer? = null
     private val saveMutex = Mutex()
+
+    private val localFallbackSessionManager: ReaderNarrationSessionManager by lazy {
+        ReaderNarrationSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            characterDao = characterDao,
+            settingsRepository = settingsRepository,
+            secureKeyStore = secureKeyStore,
+            interactionsTtsClient = interactionsTtsClient,
+            textModelClient = textModelClient,
+            liveSessionFactory = liveSessionFactory,
+            quotaTracker = quotaTracker,
+            modelCatalogService = modelCatalogService,
+            playbackCoordinator = null,
+            applicationScope = viewModelScope
+        )
+    }
+
+    internal val sessionManager: ReaderNarrationSessionManager
+        get() = injectedSessionManager ?: localFallbackSessionManager
+
+    internal var testDiskCache: TranslationDiskCache?
+        get() = sessionManager.testDiskCache
+        set(value) {
+            sessionManager.testDiskCache = value
+        }
 
     private val _uiState = MutableStateFlow(ReaderUiState(bookId = bookId))
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
     init {
         observeSettings()
+        observeSessionState()
         loadBookAndChapters(bookId)
     }
 
@@ -139,8 +190,113 @@ class ReaderViewModel @Inject constructor(
         settingsJob?.cancel()
         val repo = settingsRepository ?: return
         settingsJob = viewModelScope.launch {
-            repo.targetLanguage.collect { lang ->
-                _uiState.update { it.copy(targetLanguage = lang) }
+            launch {
+                repo.targetLanguage.collect { lang ->
+                    _uiState.update { it.copy(targetLanguage = lang) }
+                }
+            }
+            launch {
+                repo.readerNarrationEngine.collect { engineName ->
+                    val parsed = parseNarrationEngine(engineName)
+                    _uiState.update { it.copy(narrationEngine = parsed) }
+                }
+            }
+            launch {
+                repo.readerReadTranslated.collect { readTranslated ->
+                    _uiState.update { it.copy(narrateTranslatedText = readTranslated) }
+                }
+            }
+            launch {
+                repo.readerNarrationSpeed.collect { speed ->
+                    _uiState.update { it.copy(playbackSpeed = speed.coerceIn(0.5f, 2.5f)) }
+                }
+            }
+            launch {
+                repo.readerTheme.collect { themeName ->
+                    val parsed = ReaderTheme.values().firstOrNull {
+                        it.name.equals(themeName, ignoreCase = true)
+                    } ?: ReaderTheme.LIGHT
+                    _uiState.update { it.copy(theme = parsed) }
+                }
+            }
+            launch {
+                repo.readerFontSizeSp.collect { sizeSp ->
+                    _uiState.update { it.copy(fontSizeSp = sizeSp.coerceIn(12, 32)) }
+                }
+            }
+            launch {
+                repo.readerFontFamily.collect { family ->
+                    if (family.isNotBlank()) {
+                        _uiState.update { it.copy(fontFamily = family) }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun observeSessionState() {
+        sessionObserverJob?.cancel()
+        sessionObserverJob = viewModelScope.launch {
+            sessionManager.sessionState.collect { session ->
+                _uiState.update { state ->
+                    val base = state.copy(
+                        narrationEngine = session.narrationEngine,
+                        narrateTranslatedText = session.narrateTranslatedText,
+                        playbackSpeed = session.playbackSpeed,
+                        targetLanguage = session.targetLanguage
+                    )
+                    if (session.bookId != bookId || bookId.isBlank()) {
+                        base.copy(isNarrationPlaying = false, isBuffering = false)
+                    } else {
+                        val totalChapters = maxOf(
+                            base.chapters.size,
+                            base.extractedBook?.chapters?.size ?: 0,
+                            session.chapters.size
+                        )
+                        val updatedChapterIndex = if (session.isActiveSession && totalChapters > 0) {
+                            session.currentChapterIndex.coerceIn(0, totalChapters - 1)
+                        } else {
+                            base.currentChapterIndex
+                        }
+                        val syncedParagraphs = if (session.isActiveSession && session.paragraphs.isNotEmpty()) {
+                            session.paragraphs
+                        } else {
+                            base.paragraphs
+                        }
+                        val syncedTranslations = if (
+                            session.bilingualTranslations.isNotEmpty() ||
+                            (!base.isBilingualEnabled && !session.isBilingualEnabled)
+                        ) {
+                            session.bilingualTranslations
+                        } else {
+                            base.bilingualTranslations
+                        }
+                        base.copy(
+                            currentChapterIndex = updatedChapterIndex,
+                            paragraphs = syncedParagraphs,
+                            activeParagraphIndex = if (session.isActiveSession) {
+                                session.activeParagraphIndex
+                            } else {
+                                base.activeParagraphIndex
+                            },
+                            highlightedCfi = if (session.isActiveSession) session.highlightedCfi else base.highlightedCfi,
+                            isNarrationPlaying = session.isPlaying,
+                            isBuffering = session.isBuffering,
+                            isTranslating = session.isTranslating,
+                            isTranslationCached = session.isTranslationCached,
+                            isBilingualEnabled = base.isBilingualEnabled || session.isBilingualEnabled,
+                            bilingualTranslations = syncedTranslations,
+                            sleepTimerMinutesRemaining = session.sleepTimerMinutesRemaining,
+                            stopAfterCurrentChapter = session.stopAfterCurrentChapter,
+                            chapterPositionMs = session.chapterPositionMs,
+                            chapterDurationMs = session.chapterDurationMs,
+                            bookPositionMs = session.bookPositionMs,
+                            bookDurationMs = session.bookDurationMs,
+                            narrationStatusMessage = session.statusMessage ?: base.narrationStatusMessage,
+                            errorMessage = session.errorMessage ?: base.errorMessage
+                        )
+                    }
+                }
             }
         }
     }
@@ -152,31 +308,37 @@ class ReaderViewModel @Inject constructor(
         loadJob?.cancel()
         charactersJob?.cancel()
         if (switchingBook) {
-            stopNarration()
-            translationJob?.cancel()
             castJob?.cancel()
         }
+
+        val existingSession = sessionManager.sessionState.value
+        val activeForTarget = sessionManager.isSessionActiveFor(targetBookId)
 
         _uiState.update { state ->
             if (switchingBook) {
                 state.copy(
                     bookId = targetBookId,
-                    bookTitle = "Reader",
-                    bookFormat = "EPUB",
-                    bookFilePath = "",
-                    chapters = emptyList(),
-                    currentChapterIndex = 0,
-                    currentCfi = "",
+                    bookTitle = if (activeForTarget) existingSession.bookTitle.ifBlank { "Reader" } else "Reader",
+                    bookAuthor = if (activeForTarget) existingSession.author else "",
+                    bookCoverUri = if (activeForTarget) existingSession.coverPath else null,
+                    bookFormat = if (activeForTarget) existingSession.bookFormat else "EPUB",
+                    bookFilePath = if (activeForTarget) existingSession.bookFilePath else "",
+                    chapters = if (activeForTarget) existingSession.chapters else emptyList(),
+                    currentChapterIndex = if (activeForTarget) existingSession.currentChapterIndex else 0,
+                    currentCfi = if (activeForTarget) existingSession.highlightedCfi.orEmpty() else "",
                     progress = 0f,
                     isStateRestored = false,
                     isBookReady = false,
-                    characters = emptyList(),
-                    extractedBook = null,
-                    activeParagraphIndex = 0,
-                    paragraphs = emptyList(),
-                    bilingualTranslations = emptyMap(),
+                    characters = if (activeForTarget) existingSession.characters else emptyList(),
+                    extractedBook = if (activeForTarget) existingSession.extractedBook else null,
+                    activeParagraphIndex = if (activeForTarget) existingSession.activeParagraphIndex else 0,
+                    paragraphs = if (activeForTarget) existingSession.paragraphs else emptyList(),
+                    highlightedCfi = if (activeForTarget) existingSession.highlightedCfi else null,
+                    isNarrationPlaying = activeForTarget && existingSession.isPlaying,
+                    bilingualTranslations = if (activeForTarget) existingSession.bilingualTranslations else emptyMap(),
+                    isBilingualEnabled = activeForTarget && (existingSession.isBilingualEnabled || existingSession.narrateTranslatedText),
                     errorMessage = null,
-                    narrationStatusMessage = null
+                    narrationStatusMessage = if (activeForTarget) existingSession.statusMessage else null
                 )
             } else {
                 state.copy(isStateRestored = false)
@@ -187,6 +349,9 @@ class ReaderViewModel @Inject constructor(
             charactersJob = viewModelScope.launch {
                 dao.getCharactersForBook(targetBookId).collect { chars ->
                     _uiState.update { it.copy(characters = chars) }
+                    if (sessionManager.sessionState.value.bookId == targetBookId) {
+                        syncContextToSession(forceWhenDifferentBook = false)
+                    }
                 }
             }
         }
@@ -196,19 +361,33 @@ class ReaderViewModel @Inject constructor(
                 val book = bookDao.getBookById(targetBookId)
                 if (book != null) {
                     val savedState = playbackStateDao?.getPlaybackState(targetBookId)
-                    val restoredCfi = savedState?.lastCfi.orEmpty()
+                    val isReattaching = sessionManager.isSessionActiveFor(targetBookId)
+                    val liveSessionSnapshot = sessionManager.sessionState.value
+
+                    val restoredCfi = if (isReattaching && !liveSessionSnapshot.highlightedCfi.isNullOrBlank()) {
+                        liveSessionSnapshot.highlightedCfi
+                    } else {
+                        savedState?.lastCfi.orEmpty()
+                    }
                     val restoredProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
                     val existingChapters = _uiState.value.chapters
-                    val restoredChapterIndex = resolveChapterIndex(
-                        chapters = existingChapters,
-                        cfi = restoredCfi,
-                        progress = restoredProgress,
-                        fallbackIndex = savedState?.chapterIndex ?: 0
-                    )
+                    val restoredChapterIndex = if (isReattaching) {
+                        liveSessionSnapshot.currentChapterIndex
+                    } else {
+                        resolveChapterIndex(
+                            chapters = existingChapters,
+                            cfi = restoredCfi,
+                            progress = restoredProgress,
+                            fallbackIndex = savedState?.chapterIndex ?: 0
+                        )
+                    }
+
                     _uiState.update {
                         it.copy(
                             bookId = targetBookId,
                             bookTitle = book.title,
+                            bookAuthor = book.author,
+                            bookCoverUri = book.coverUri,
                             bookFormat = book.format,
                             bookFilePath = book.filePath,
                             currentCfi = restoredCfi,
@@ -224,13 +403,17 @@ class ReaderViewModel @Inject constructor(
                     }
 
                     if (appContext != null && book.filePath.isNotBlank()) {
-                        val extracted = try {
-                            withContext(Dispatchers.IO) {
-                                EbookContentExtractor.extractBook(appContext, book.filePath, book.format)
+                        val extracted = if (isReattaching && liveSessionSnapshot.extractedBook != null) {
+                            liveSessionSnapshot.extractedBook
+                        } else {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    EbookContentExtractor.extractBook(appContext, book.filePath, book.format)
+                                }
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                null
                             }
-                        } catch (e: Exception) {
-                            if (e is CancellationException) throw e
-                            null
                         }
 
                         if (extracted != null) {
@@ -248,7 +431,7 @@ class ReaderViewModel @Inject constructor(
                                         },
                                         startMs = ch.index * 1000L,
                                         endMs = (ch.index + 1) * 1000L,
-                                        cfiRange = defaultChapterCfi(ch.index, isPdf),
+                                        cfiRange = sessionManager.defaultChapterCfi(ch.index, isPdf),
                                         textLength = ch.paragraphs.sumOf { it.length }
                                     )
                                 }
@@ -257,7 +440,7 @@ class ReaderViewModel @Inject constructor(
                             _uiState.update { state ->
                                 val idx = state.currentChapterIndex.coerceIn(0, maxOf(0, extracted.chapters.lastIndex))
                                 val initialParagraphs = if (state.paragraphs.isEmpty()) {
-                                    buildParagraphsForChapter(extracted, idx, book.format)
+                                    sessionManager.buildParagraphsForChapter(extracted, idx, book.format)
                                 } else {
                                     state.paragraphs
                                 }
@@ -268,6 +451,7 @@ class ReaderViewModel @Inject constructor(
                             }
                         }
                     }
+                    syncContextToSession(forceWhenDifferentBook = false)
                 } else {
                     _uiState.update {
                         it.copy(
@@ -280,14 +464,19 @@ class ReaderViewModel @Inject constructor(
 
                 chapterDao.getChaptersForBook(targetBookId).collect { chapters ->
                     _uiState.update { state ->
-                        val resolvedChapter = resolveChapterIndex(
-                            chapters = chapters,
-                            cfi = state.currentCfi,
-                            progress = state.progress,
-                            fallbackIndex = state.currentChapterIndex
-                        )
+                        val isReattaching = sessionManager.isSessionActiveFor(targetBookId)
+                        val resolvedChapter = if (isReattaching) {
+                            sessionManager.sessionState.value.currentChapterIndex
+                        } else {
+                            resolveChapterIndex(
+                                chapters = chapters,
+                                cfi = state.currentCfi,
+                                progress = state.progress,
+                                fallbackIndex = state.currentChapterIndex
+                            )
+                        }
                         val refreshedParagraphs = if (state.paragraphs.isEmpty() && state.extractedBook != null) {
-                            buildParagraphsForChapter(state.extractedBook, resolvedChapter, state.bookFormat)
+                            sessionManager.buildParagraphsForChapter(state.extractedBook, resolvedChapter, state.bookFormat)
                         } else {
                             state.paragraphs
                         }
@@ -297,6 +486,7 @@ class ReaderViewModel @Inject constructor(
                             paragraphs = refreshedParagraphs
                         )
                     }
+                    syncContextToSession(forceWhenDifferentBook = false)
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -310,21 +500,62 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
+    private fun syncContextToSession(forceWhenDifferentBook: Boolean) {
+        val state = _uiState.value
+        if (state.bookId.isBlank()) return
+        sessionManager.updateBookContext(
+            bookId = state.bookId,
+            bookTitle = state.bookTitle,
+            author = state.bookAuthor,
+            coverPath = state.bookCoverUri,
+            bookFormat = state.bookFormat,
+            bookFilePath = state.bookFilePath,
+            extractedBook = state.extractedBook,
+            chapters = state.chapters,
+            currentChapterIndex = state.currentChapterIndex,
+            paragraphs = state.paragraphs,
+            activeParagraphIndex = state.activeParagraphIndex,
+            characters = state.characters,
+            isBilingualEnabled = state.isBilingualEnabled,
+            bilingualTranslations = state.bilingualTranslations,
+            forceWhenDifferentBook = forceWhenDifferentBook
+        )
+    }
+
     fun clearError() {
         _uiState.update { it.copy(errorMessage = null, narrationStatusMessage = null) }
+        sessionManager.clearNotices()
     }
 
     fun setTheme(theme: ReaderTheme) {
         _uiState.update { it.copy(theme = theme) }
+        viewModelScope.launch(NonCancellable) {
+            try {
+                settingsRepository?.setReaderTheme(theme.name)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun setFontSize(size: Int) {
         val clamped = size.coerceIn(12, 32)
         _uiState.update { it.copy(fontSizeSp = clamped) }
+        viewModelScope.launch(NonCancellable) {
+            try {
+                settingsRepository?.setReaderFontSizeSp(clamped)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun setFontFamily(family: String) {
         _uiState.update { it.copy(fontFamily = family) }
+        viewModelScope.launch(NonCancellable) {
+            try {
+                settingsRepository?.setReaderFontFamily(family)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun setTocOpen(open: Boolean) {
@@ -343,6 +574,18 @@ class ReaderViewModel @Inject constructor(
 
     fun setSearchQuery(query: String) {
         _uiState.update { it.copy(searchQuery = query) }
+    }
+
+    fun setFollowHighlight(follow: Boolean) {
+        _uiState.update { it.copy(followHighlight = follow) }
+    }
+
+    fun setNarrationSheetExpanded(expanded: Boolean) {
+        _uiState.update { it.copy(isNarrationSheetExpanded = expanded) }
+    }
+
+    fun jumpToActiveHighlight() {
+        _uiState.update { it.copy(jumpToHighlightNonce = it.jumpToHighlightNonce + 1) }
     }
 
     fun selectChapter(chapter: ChapterEntity) {
@@ -373,10 +616,7 @@ class ReaderViewModel @Inject constructor(
 
     private fun selectChapterByIndex(index: Int) {
         val state = _uiState.value
-        val wasPlaying = state.isNarrationPlaying
-        if (wasPlaying) {
-            stopNarration()
-        }
+        val wasPlaying = state.isNarrationPlaying && sessionManager.isSessionActiveFor(bookId)
         val chapters = state.chapters
         val extracted = state.extractedBook
         val total = maxOf(chapters.size, extracted?.chapters?.size ?: 0)
@@ -384,10 +624,10 @@ class ReaderViewModel @Inject constructor(
         val chapter = chapters.getOrNull(clampedIndex)
         val isPdf = state.bookFormat.equals("PDF", ignoreCase = true) ||
             extracted?.format.equals("PDF", ignoreCase = true)
-        val cfi = chapter?.cfiRange?.takeIf { it.isNotBlank() } ?: defaultChapterCfi(clampedIndex, isPdf)
+        val cfi = chapter?.cfiRange?.takeIf { it.isNotBlank() } ?: sessionManager.defaultChapterCfi(clampedIndex, isPdf)
         val progress = if (total <= 1) 0f else (clampedIndex.toFloat() / (total - 1)).coerceIn(0f, 1f)
         val newParagraphs = if (extracted != null) {
-            buildParagraphsForChapter(extracted, clampedIndex, state.bookFormat)
+            sessionManager.buildParagraphsForChapter(extracted, clampedIndex, state.bookFormat)
         } else {
             emptyList()
         }
@@ -399,200 +639,64 @@ class ReaderViewModel @Inject constructor(
                 progress = progress,
                 activeParagraphIndex = 0,
                 paragraphs = newParagraphs,
-                highlightedCfi = null,
-                bilingualTranslations = if (it.isBilingualEnabled) emptyMap() else it.bilingualTranslations
+                highlightedCfi = if (wasPlaying) newParagraphs.firstOrNull()?.cfi else null,
+                bilingualTranslations = if (it.isBilingualEnabled || it.narrateTranslatedText) emptyMap() else it.bilingualTranslations
             )
         }
 
         if (bookId.isNotBlank()) {
             persistProgress(bookId, cfi, progress)
         }
-        if (_uiState.value.isBilingualEnabled) {
-            translateCurrentChapter()
+        if (wasPlaying) {
+            sessionManager.switchChapter(clampedIndex, continuePlaying = true)
+        } else {
+            syncContextToSession(forceWhenDifferentBook = sessionManager.isSessionActiveFor(bookId))
+            if (_uiState.value.isBilingualEnabled) {
+                sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = true)
+            }
         }
     }
 
     fun toggleNarration() {
         if (_uiState.value.isNarrationPlaying) {
-            stopNarration()
+            pauseNarration()
         } else {
             startNarration()
         }
     }
 
     fun startNarration() {
-        if (appContext == null) {
-            _uiState.update { it.copy(isNarrationPlaying = true) }
-            return
-        }
-
         val state = _uiState.value
-        val activeParagraphs = state.paragraphs.ifEmpty {
-            state.extractedBook?.let { buildParagraphsForChapter(it, state.currentChapterIndex, state.bookFormat) }
-                .orEmpty()
-        }
-        if (activeParagraphs.isEmpty()) {
-            _uiState.update {
-                it.copy(
-                    isNarrationPlaying = false,
-                    errorMessage = "No readable text found in this chapter to narrate."
-                )
-            }
-            return
-        }
+        sessionManager.startOrResume(
+            bookId = state.bookId,
+            bookTitle = state.bookTitle,
+            author = state.bookAuthor,
+            coverPath = state.bookCoverUri,
+            bookFormat = state.bookFormat,
+            bookFilePath = state.bookFilePath,
+            extractedBook = state.extractedBook,
+            chapters = state.chapters,
+            currentChapterIndex = state.currentChapterIndex,
+            paragraphs = state.paragraphs,
+            activeParagraphIndex = state.activeParagraphIndex,
+            characters = state.characters,
+            isBilingualEnabled = state.isBilingualEnabled,
+            bilingualTranslations = state.bilingualTranslations
+        )
+    }
 
-        narrationJob?.cancel()
-        releaseActivePlayer()
-        _uiState.update {
-            it.copy(
-                isNarrationPlaying = true,
-                paragraphs = activeParagraphs,
-                narrationStatusMessage = null
-            )
-        }
-
-        val startIndex = state.activeParagraphIndex.coerceIn(0, activeParagraphs.lastIndex)
-        val engineChoice = state.narrationEngine
-        val charactersSnapshot = state.characters
-
-        narrationJob = viewModelScope.launch(Dispatchers.IO) {
-            val player = AudioTrackPcmPlayer()
-            activePcmPlayer = player
-            var configuredSampleRate = 24000
-            var configuredChannels = 1
-            try {
-                player.init(sampleRate = configuredSampleRate, channels = configuredChannels)
-                player.play()
-
-                val narratorVoice = charactersSnapshot
-                    .firstOrNull { it.name.equals("Narrator", ignoreCase = true) }
-                    ?.assignedVoiceId ?: "Charon"
-                val systemFallback = SystemTtsEngine(appContext)
-
-                for (pIdx in startIndex until activeParagraphs.size) {
-                    ensureActive()
-                    val para = activeParagraphs[pIdx]
-                    if (para.text.isBlank()) continue
-
-                    _uiState.update {
-                        it.copy(
-                            activeParagraphIndex = pIdx,
-                            highlightedCfi = para.cfi
-                        )
-                    }
-
-                    val (voiceId, style) = resolveSpeakerVoiceAndStyle(
-                        paragraphText = para.text,
-                        characters = charactersSnapshot,
-                        defaultNarratorVoice = narratorVoice
-                    )
-                    val request = SynthesisRequest(
-                        text = para.text,
-                        voiceId = voiceId,
-                        style = style
-                    )
-
-                    val selectedEngine: FeatureNarrationEngine = when (engineChoice) {
-                        NarrationEngine.GEMINI_FLASH_TTS -> createGeminiTtsEngine()
-                        NarrationEngine.GEMINI_LIVE -> GeminiLiveEngine(
-                            fallbackEngine = createGeminiTtsEngine(),
-                            liveSessionFactory = liveSessionFactory?.let { factory -> { factory.create() } },
-                            apiKeyProvider = { resolveApiKey() },
-                            modelProvider = { resolveModel(ModelRole.LIVE_NARRATION) }
-                        )
-                        NarrationEngine.SYSTEM_TTS -> systemFallback
-                    }
-
-                    var emittedAudio = false
-                    try {
-                        selectedEngine.synthesize(request).collect { chunk ->
-                            ensureActive()
-                            if (chunk.data.isNotEmpty()) {
-                                emittedAudio = true
-                                if (chunk.sampleRate != configuredSampleRate || chunk.channels != configuredChannels) {
-                                    configuredSampleRate = chunk.sampleRate
-                                    configuredChannels = chunk.channels
-                                    player.init(configuredSampleRate, configuredChannels)
-                                    player.play()
-                                }
-                                player.write(chunk)
-                            }
-                        }
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        if (engineChoice != NarrationEngine.SYSTEM_TTS) {
-                            _uiState.update {
-                                it.copy(
-                                    narrationStatusMessage = "Using device TTS fallback (${e.message ?: "Gemini unavailable"})"
-                                )
-                            }
-                            systemFallback.synthesize(request).collect { chunk ->
-                                ensureActive()
-                                if (chunk.data.isNotEmpty()) {
-                                    emittedAudio = true
-                                    if (chunk.sampleRate != configuredSampleRate || chunk.channels != configuredChannels) {
-                                        configuredSampleRate = chunk.sampleRate
-                                        configuredChannels = chunk.channels
-                                        player.init(configuredSampleRate, configuredChannels)
-                                        player.play()
-                                    }
-                                    player.write(chunk)
-                                }
-                            }
-                        } else {
-                            throw e
-                        }
-                    }
-
-                    if (!emittedAudio && engineChoice != NarrationEngine.SYSTEM_TTS) {
-                        _uiState.update {
-                            it.copy(narrationStatusMessage = "Using device TTS fallback (empty Gemini audio)")
-                        }
-                        systemFallback.synthesize(request).collect { chunk ->
-                            ensureActive()
-                            if (chunk.data.isNotEmpty()) {
-                                if (chunk.sampleRate != configuredSampleRate || chunk.channels != configuredChannels) {
-                                    configuredSampleRate = chunk.sampleRate
-                                    configuredChannels = chunk.channels
-                                    player.init(configuredSampleRate, configuredChannels)
-                                    player.play()
-                                }
-                                player.write(chunk)
-                            }
-                        }
-                    }
-                }
-
-                // Allow hardware audio buffer to finish draining cleanly.
-                var drainWaitMs = 0L
-                while (player.bufferedMs > 0L && drainWaitMs < 3000L) {
-                    ensureActive()
-                    delay(100L)
-                    drainWaitMs += 100L
-                }
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                _uiState.update {
-                    it.copy(errorMessage = e.message ?: "Narration failed")
-                }
-            } finally {
-                try {
-                    player.stop()
-                    player.release()
-                } catch (_: Throwable) {
-                }
-                if (activePcmPlayer === player) {
-                    activePcmPlayer = null
-                }
-                _uiState.update { it.copy(isNarrationPlaying = false) }
-            }
+    fun pauseNarration() {
+        if (sessionManager.isSessionActiveFor(bookId)) {
+            sessionManager.pause()
+        } else {
+            _uiState.update { it.copy(isNarrationPlaying = false) }
         }
     }
 
     fun stopNarration() {
-        narrationJob?.cancel()
-        narrationJob = null
-        releaseActivePlayer()
+        if (sessionManager.isSessionActiveFor(bookId) || sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.stop()
+        }
         _uiState.update {
             it.copy(
                 isNarrationPlaying = false,
@@ -602,32 +706,95 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
-    private fun releaseActivePlayer() {
-        val player = activePcmPlayer
-        activePcmPlayer = null
-        if (player != null) {
-            try {
-                player.stop()
-                player.release()
-            } catch (_: Throwable) {
+    fun seekToChapterPositionMs(positionMs: Long) {
+        if (sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.seekToChapterPositionMs(positionMs)
+        }
+    }
+
+    fun seekByDeltaMs(deltaMs: Long) {
+        if (sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.seekByDeltaMs(deltaMs)
+        }
+    }
+
+    fun seekToParagraph(paragraphIndex: Int) {
+        if (sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.seekToParagraph(paragraphIndex)
+        } else {
+            val paras = _uiState.value.paragraphs
+            if (paras.isEmpty()) return
+            val clamped = paragraphIndex.coerceIn(0, paras.lastIndex)
+            _uiState.update {
+                it.copy(
+                    activeParagraphIndex = clamped,
+                    highlightedCfi = paras[clamped].cfi
+                )
             }
         }
     }
 
-    private fun createGeminiTtsEngine(): GeminiTtsEngine {
-        return GeminiTtsEngine(
-            ttsClient = interactionsTtsClient,
-            apiKeyProvider = { resolveApiKey() },
-            modelProvider = { resolveModel(ModelRole.TTS) }
-        )
+    fun nextParagraph() {
+        if (sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.nextParagraph()
+        }
+    }
+
+    fun previousParagraph() {
+        if (sessionManager.sessionState.value.bookId == bookId) {
+            sessionManager.previousParagraph()
+        }
+    }
+
+    fun setPlaybackSpeed(speed: Float) {
+        val clamped = speed.coerceIn(0.5f, 2.5f)
+        _uiState.update { it.copy(playbackSpeed = clamped) }
+        sessionManager.setPlaybackSpeed(clamped)
+    }
+
+    fun setSleepTimer(minutes: Int) {
+        sessionManager.setSleepTimer(minutes)
+    }
+
+    fun setNarrateTranslatedText(enabled: Boolean) {
+        _uiState.update { it.copy(narrateTranslatedText = enabled) }
+        syncContextToSession(forceWhenDifferentBook = false)
+        sessionManager.setNarrateTranslatedText(enabled)
     }
 
     fun setNarrationEngine(engine: NarrationEngine) {
-        val wasPlaying = _uiState.value.isNarrationPlaying
-        if (wasPlaying) {
-            stopNarration()
-        }
         _uiState.update { it.copy(narrationEngine = engine) }
+        sessionManager.setNarrationEngine(engine)
+    }
+
+    internal fun buildSpeechChunks(
+        paragraphs: List<ReaderParagraph>,
+        characters: List<CharacterEntity>,
+        engine: NarrationEngine
+    ): List<SpeechChunk> = sessionManager.buildSpeechChunks(paragraphs, characters, engine)
+
+    internal suspend fun synthesizeSpeechChunk(
+        chunk: SpeechChunk,
+        engineChoice: NarrationEngine,
+        systemFallback: FeatureNarrationEngine,
+        diskCache: TranslationDiskCache?,
+        maxCacheBytes: Long,
+        ttsAlreadyFailed: Boolean,
+        onTtsFailed: () -> Unit,
+        onStatusUpdate: (String) -> Unit,
+        onPcmChunk: suspend (PcmChunk) -> Unit
+    ) {
+        sessionManager.synthesizeSpeechChunk(
+            chunk = chunk,
+            engineChoice = engineChoice,
+            systemFallback = systemFallback,
+            diskCache = diskCache,
+            maxCacheBytes = maxCacheBytes,
+            ttsAlreadyFailed = ttsAlreadyFailed,
+            onTtsFailed = onTtsFailed,
+            onStatusUpdate = onStatusUpdate,
+            onPcmChunk = onPcmChunk
+        )
     }
 
     fun setCastEditorOpen(open: Boolean) {
@@ -641,8 +808,9 @@ class ReaderViewModel @Inject constructor(
             try {
                 val state = _uiState.value
                 val chapterParagraphs = state.paragraphs.ifEmpty {
-                    state.extractedBook?.let { buildParagraphsForChapter(it, state.currentChapterIndex, state.bookFormat) }
-                        .orEmpty()
+                    state.extractedBook?.let {
+                        sessionManager.buildParagraphsForChapter(it, state.currentChapterIndex, state.bookFormat)
+                    }.orEmpty()
                 }
                 val paragraphTexts = chapterParagraphs.map { it.text }.filter { it.isNotBlank() }
                 val existing = state.characters
@@ -669,7 +837,8 @@ class ReaderViewModel @Inject constructor(
                                 model = model
                             )
                         }
-                        val chapterId = state.chapters.getOrNull(state.currentChapterIndex)?.id ?: "${bookId}_chap_${state.currentChapterIndex}"
+                        val chapterId = state.chapters.getOrNull(state.currentChapterIndex)?.id
+                            ?: "${bookId}_chap_${state.currentChapterIndex}"
                         val result = castingService.parseAndValidateCasting(
                             jsonResponse = responseJson,
                             paragraphs = paragraphTexts,
@@ -687,7 +856,6 @@ class ReaderViewModel @Inject constructor(
                     detectedDomainChars = detectSpeakersHeuristically(paragraphTexts, bookId)
                 }
 
-                // Always include Narrator
                 val hasNarrator = detectedDomainChars.any {
                     it.id == "narrator" || it.name.equals("Narrator", ignoreCase = true)
                 }
@@ -704,7 +872,6 @@ class ReaderViewModel @Inject constructor(
                     ) + detectedDomainChars
                 }
 
-                // Merge with existing characters and assign distinct Gemini studio voices
                 val existingByName = existing.associateBy { it.name.lowercase() }
                 val mergedDomain = mutableListOf<Character>()
                 for (existingChar in existing) {
@@ -750,12 +917,13 @@ class ReaderViewModel @Inject constructor(
 
                 characterDao?.insertCharacters(finalEntities)
                 _uiState.update { it.copy(characters = finalEntities, isCastAnalyzing = false) }
+                syncContextToSession(forceWhenDifferentBook = false)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 _uiState.update {
                     it.copy(
                         isCastAnalyzing = false,
-                        errorMessage = e.message ?: "Failed to analyze character cast"
+                        errorMessage = sessionManager.formatConciseError(e, "Failed to analyze character cast")
                     )
                 }
             }
@@ -772,6 +940,7 @@ class ReaderViewModel @Inject constructor(
                 characters = state.characters.map { if (it.id == updated.id) updated else it }
             )
         }
+        syncContextToSession(forceWhenDifferentBook = false)
         viewModelScope.launch {
             characterDao?.updateCharacter(updated)
         }
@@ -780,86 +949,28 @@ class ReaderViewModel @Inject constructor(
     fun toggleBilingualMode() {
         val newState = !_uiState.value.isBilingualEnabled
         _uiState.update { it.copy(isBilingualEnabled = newState) }
-        if (newState) {
-            translateCurrentChapter()
-        } else {
-            translationJob?.cancel()
-            _uiState.update { it.copy(bilingualTranslations = emptyMap(), isTranslating = false) }
-        }
+        syncContextToSession(forceWhenDifferentBook = false)
+        sessionManager.setBilingualMode(newState)
     }
 
     fun setTargetLanguage(lang: LanguageCode) {
         _uiState.update { it.copy(targetLanguage = lang) }
-        viewModelScope.launch {
-            settingsRepository?.setTargetLanguage(lang)
-        }
-        if (_uiState.value.isBilingualEnabled) {
-            translateCurrentChapter()
-        }
+        syncContextToSession(forceWhenDifferentBook = false)
+        sessionManager.setTargetLanguage(lang)
     }
 
     fun setTargetLanguage(lang: String) {
         setTargetLanguage(LanguageCode.fromCode(lang))
     }
 
-    private fun translateCurrentChapter() {
-        translationJob?.cancel()
-        val state = _uiState.value
-        val activeParagraphs = state.paragraphs.ifEmpty {
-            state.extractedBook?.let { buildParagraphsForChapter(it, state.currentChapterIndex, state.bookFormat) }
-                .orEmpty()
-        }
-        val targetLangCode = state.targetLanguage.code
-
-        val paragraphMap: Map<String, String> = if (activeParagraphs.isNotEmpty()) {
-            activeParagraphs.filter { it.text.isNotBlank() }.associate { it.cfi to it.text }
-        } else {
-            mapOf(
-                "epubcfi(/6/1!/4/2/1:0)" to "Welcome to Polyglot Books. This is an immersive ebook reader.",
-                "epubcfi(/6/1!/4/2/1:1)" to "With advanced AI narration engines like Gemini Flash TTS.",
-                "epubcfi(/6/1!/4/2/1:2)" to "Switch between Light, Sepia, and Dark themes and adjust font sizes."
-            )
-        }
-
-        val translator = ChapterTranslator(
-            textModelClient = textModelClient,
-            apiKeyProvider = { resolveApiKey() },
-            modelProvider = { resolveModel(ModelRole.TEXT_TRANSLATION) }
-        )
-
-        translationJob = viewModelScope.launch {
-            _uiState.update { it.copy(isTranslating = true) }
-            try {
-                val merged = linkedMapOf<String, String>()
-                val entries = paragraphMap.entries.toList()
-                val batchSize = 25
-                for (start in entries.indices step batchSize) {
-                    ensureActive()
-                    val chunk = entries.subList(start, minOf(start + batchSize, entries.size))
-                        .associate { it.key to it.value }
-                    val result = translator.translateChapter(
-                        paragraphs = chunk,
-                        lines = emptyList(),
-                        targetLanguageCode = targetLangCode
-                    )
-                    merged.putAll(result.bilingualParagraphs)
-                    _uiState.update { it.copy(bilingualTranslations = merged.toMap()) }
-                }
-                _uiState.update { it.copy(isTranslating = false) }
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                _uiState.update {
-                    it.copy(
-                        isTranslating = false,
-                        errorMessage = e.message ?: "Translation failed"
-                    )
-                }
-            }
-        }
+    fun retryTranslation() {
+        clearError()
+        sessionManager.retryTranslation()
     }
 
     fun setBilingualTranslations(translations: Map<String, String>) {
         _uiState.update { it.copy(bilingualTranslations = translations) }
+        syncContextToSession(forceWhenDifferentBook = false)
     }
 
     fun setReportDialogOpen(open: Boolean) {
@@ -874,10 +985,6 @@ class ReaderViewModel @Inject constructor(
         saveProgressInternal(cfi, progress, chapterTitle = "")
     }
 
-    /**
-     * Flushes the currently restored/active reading position to durable storage.
-     * Skips writes if initial state has not finished loading or no position is set yet.
-     */
     fun flushProgress() {
         val state = _uiState.value
         if (!state.isStateRestored || state.bookId.isBlank()) return
@@ -912,7 +1019,6 @@ class ReaderViewModel @Inject constructor(
     }
 
     private fun persistProgress(targetBookId: String, cfi: String, progress: Float) {
-        // Detach parent Job via NonCancellable so abrupt UI/ViewModel teardown does not abort SQLite writes.
         viewModelScope.launch(NonCancellable) {
             try {
                 saveMutex.withLock {
@@ -968,12 +1074,11 @@ class ReaderViewModel @Inject constructor(
     }
 
     override fun onCleared() {
-        stopNarration()
+        // Do NOT stop background narration on ViewModel teardown; Audio continues cleanly in PlaybackCoordinator.
         flushProgress()
         super.onCleared()
     }
 
-    // ReaderBridgeListener callbacks
     override fun onParagraphsExtracted(chapterIndex: Int, paragraphsJson: String) {
         val state = _uiState.value
         val resolvedChapter = if (chapterIndex >= 0) chapterIndex else state.currentChapterIndex
@@ -985,11 +1090,12 @@ class ReaderViewModel @Inject constructor(
             _uiState.update {
                 it.copy(
                     paragraphs = parsed,
-                    activeParagraphIndex = if (changed) 0 else it.activeParagraphIndex
+                    activeParagraphIndex = if (changed && !it.isNarrationPlaying) 0 else it.activeParagraphIndex
                 )
             }
+            syncContextToSession(forceWhenDifferentBook = false)
             if (_uiState.value.isBilingualEnabled && (changed || state.bilingualTranslations.isEmpty())) {
-                translateCurrentChapter()
+                sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = false)
             }
         }
     }
@@ -1015,7 +1121,7 @@ class ReaderViewModel @Inject constructor(
                     val title = (obj["title"] as? String)?.takeIf { it.isNotBlank() } ?: "Chapter ${idx + 1}"
                     val cfi = (obj["cfi"] as? String)?.takeIf { it.isNotBlank() }
                         ?: (obj["href"] as? String)?.takeIf { it.startsWith("pdf:page:") || it.startsWith("epubcfi(") }
-                        ?: defaultChapterCfi(idx, isPdf)
+                        ?: sessionManager.defaultChapterCfi(idx, isPdf)
                     add(
                         ChapterEntity(
                             id = "${currentBookId}_chap_$idx",
@@ -1093,24 +1199,9 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
-    private fun buildParagraphsForChapter(
-        extracted: EbookContentExtractor.ExtractedBook,
-        chapterIndex: Int,
-        formatHint: String
-    ): List<ReaderParagraph> {
-        val chapter = extracted.chapters.getOrNull(chapterIndex) ?: return emptyList()
-        val isPdf = extracted.format.equals("PDF", ignoreCase = true) ||
-            formatHint.equals("PDF", ignoreCase = true)
-        return chapter.paragraphs.mapIndexedNotNull { pIndex, text ->
-            val trimmed = text.trim()
-            if (trimmed.isEmpty()) null
-            else ReaderParagraph(
-                index = pIndex,
-                id = "p_${chapterIndex}_$pIndex",
-                text = trimmed,
-                cfi = defaultParagraphCfi(chapterIndex, pIndex, isPdf)
-            )
-        }
+    private fun parseNarrationEngine(name: String): NarrationEngine {
+        return NarrationEngine.values().firstOrNull { it.name.equals(name, ignoreCase = true) }
+            ?: NarrationEngine.GEMINI_FLASH_TTS
     }
 
     private fun parseParagraphsJson(
@@ -1128,7 +1219,7 @@ class ReaderViewModel @Inject constructor(
                             if (text.isNotEmpty()) {
                                 val cfi = (item["cfiRange"] as? String).orEmpty()
                                     .ifBlank { (item["cfi"] as? String).orEmpty() }
-                                    .ifBlank { defaultParagraphCfi(chapterIndex, i, isPdf) }
+                                    .ifBlank { sessionManager.defaultParagraphCfi(chapterIndex, i, isPdf) }
                                 val id = (item["id"] as? String)?.takeIf { it.isNotBlank() }
                                     ?: "p_${chapterIndex}_$i"
                                 add(ReaderParagraph(index = i, id = id, text = text, cfi = cfi))
@@ -1142,7 +1233,7 @@ class ReaderViewModel @Inject constructor(
                                         index = i,
                                         id = "p_${chapterIndex}_$i",
                                         text = text,
-                                        cfi = defaultParagraphCfi(chapterIndex, i, isPdf)
+                                        cfi = sessionManager.defaultParagraphCfi(chapterIndex, i, isPdf)
                                     )
                                 )
                             }
@@ -1153,58 +1244,6 @@ class ReaderViewModel @Inject constructor(
         } catch (_: Exception) {
             emptyList()
         }
-    }
-
-    private fun defaultChapterCfi(chapterIndex: Int, isPdf: Boolean): String {
-        return if (isPdf) {
-            "pdf:page:$chapterIndex"
-        } else {
-            "epubcfi(/6/${(chapterIndex + 1) * 2}!/4/2/1:0)"
-        }
-    }
-
-    private fun defaultParagraphCfi(chapterIndex: Int, paragraphIndex: Int, isPdf: Boolean): String {
-        return if (isPdf) {
-            "pdf:page:$chapterIndex:p:$paragraphIndex"
-        } else {
-            "epubcfi(/6/${(chapterIndex + 1) * 2}!/4/2/${paragraphIndex + 1}:0)"
-        }
-    }
-
-    private fun resolveSpeakerVoiceAndStyle(
-        paragraphText: String,
-        characters: List<CharacterEntity>,
-        defaultNarratorVoice: String
-    ): Pair<String, String?> {
-        if (characters.isEmpty()) return defaultNarratorVoice to null
-        val colonPrefix = COLON_SPEAKER_REGEX.find(paragraphText)?.groupValues?.get(1)?.trim()
-        if (!colonPrefix.isNullOrBlank()) {
-            val match = characters.firstOrNull {
-                it.name.equals(colonPrefix, ignoreCase = true) ||
-                    it.aliases.split(",").any { alias -> alias.trim().equals(colonPrefix, ignoreCase = true) }
-            }
-            val matchVoice = match?.assignedVoiceId?.takeIf { it.isNotBlank() }
-            if (match != null && matchVoice != null) {
-                return matchVoice to match.voiceTraits.ifBlank { null }
-            }
-        }
-
-        val hasQuote = paragraphText.contains('"') || paragraphText.contains('“')
-        if (hasQuote) {
-            val nonNarrator = characters.firstOrNull { char ->
-                !char.name.equals("Narrator", ignoreCase = true) &&
-                    (paragraphText.contains(char.name, ignoreCase = true) ||
-                        char.aliases.split(",").any { alias ->
-                            val trimmed = alias.trim()
-                            trimmed.isNotEmpty() && paragraphText.contains(trimmed, ignoreCase = true)
-                        })
-            }
-            val nonNarratorVoice = nonNarrator?.assignedVoiceId?.takeIf { it.isNotBlank() }
-            if (nonNarrator != null && nonNarratorVoice != null) {
-                return nonNarratorVoice to nonNarrator.voiceTraits.ifBlank { null }
-            }
-        }
-        return defaultNarratorVoice to null
     }
 
     private fun detectSpeakersHeuristically(paragraphs: List<String>, targetBookId: String): List<Character> {
