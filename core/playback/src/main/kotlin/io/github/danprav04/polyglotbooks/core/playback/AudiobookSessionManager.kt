@@ -42,6 +42,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -183,6 +184,32 @@ class AudiobookSessionManager @Inject constructor(
     @Volatile
     private var pendingUserSeekUntilMs: Long = 0L
 
+    private data class AudioProgressSnapshot(
+        val bookId: String,
+        val chapterIndex: Int,
+        val positionMs: Long,
+        val durationMs: Long,
+        val updatedAt: Long,
+        val pauseTimestamp: Long? = null
+    )
+
+    private data class AudioSettingsSnapshot(
+        val bookId: String,
+        val chapterIndex: Int,
+        val positionMs: Long,
+        val durationMs: Long,
+        val playbackSpeed: Float,
+        val isLiveTranslationActive: Boolean,
+        val isDuckingEnabled: Boolean,
+        val targetLanguageCode: String,
+        val updatedAt: Long
+    )
+
+    @Volatile
+    private var isBookHandoffInProgress: Boolean = false
+
+    private val pendingPersistJobs = ConcurrentHashMap<String, Job>()
+
     private var loadBookJob: Job? = null
     private var chaptersObserverJob: Job? = null
     private var positionPollingJob: Job? = null
@@ -203,6 +230,14 @@ class AudiobookSessionManager @Inject constructor(
 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (isBookHandoffInProgress) {
+                if (!isPlaying && _state.value.isPlaying) {
+                    _state.update { it.copy(isPlaying = false) }
+                }
+                attachedService?.updateStreamingLocks()
+                return
+            }
+
             val prevPlaying = _state.value.isPlaying
             _state.update { it.copy(isPlaying = isPlaying) }
             attachedService?.updateStreamingLocks()
@@ -212,8 +247,11 @@ class AudiobookSessionManager @Inject constructor(
                 lastPauseTimestamp = 0L
                 val bookId = _state.value.bookId
                 if (bookId.isNotBlank()) {
-                    applicationScope.launch(NonCancellable) {
-                        playbackStateDao?.saveLastPauseTimestamp(bookId, 0L, now)
+                    enqueueBookPersist(bookId) {
+                        try {
+                            playbackStateDao?.saveLastPauseTimestamp(bookId, 0L, now)
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
                 if (!prevPlaying) {
@@ -237,6 +275,7 @@ class AudiobookSessionManager @Inject constructor(
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            if (isBookHandoffInProgress) return
             val player = exoPlayer ?: return
             when (playbackState) {
                 Player.STATE_READY -> {
@@ -273,7 +312,7 @@ class AudiobookSessionManager @Inject constructor(
                             val snapshot = _state.value
                             val chapterEntity = updatedLastChapter?.let { ChapterEntity.fromDomain(it) }
                             val now = clock()
-                            applicationScope.launch(NonCancellable) {
+                            enqueueBookPersist(bookIdToPersist) {
                                 if (chapterEntity != null) {
                                     try {
                                         chapterDao?.insertChapters(listOf(chapterEntity))
@@ -289,7 +328,7 @@ class AudiobookSessionManager @Inject constructor(
                                         updatedAt = now
                                     )
                                 } catch (_: Throwable) {
-                                    }
+                                }
                             }
                         }
                     }
@@ -334,6 +373,7 @@ class AudiobookSessionManager @Inject constructor(
             newPosition: Player.PositionInfo,
             reason: Int
         ) {
+            if (isBookHandoffInProgress) return
             val newPosMs = newPosition.positionMs.coerceAtLeast(0L)
             if (isInitialSeekPending && pendingRestorePositionMs > 0L && newPosMs < pendingRestorePositionMs - SEEK_TOLERANCE_MS) {
                 // Guard against pre-seek 0L discontinuity before initial restore seek finishes
@@ -374,6 +414,7 @@ class AudiobookSessionManager @Inject constructor(
         }
 
         override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            if (isBookHandoffInProgress) return
             val clamped = playbackParameters.speed.coerceIn(MIN_SPEED, MAX_SPEED)
             if (_state.value.playbackSpeed != clamped) {
                 _state.update { it.copy(playbackSpeed = clamped) }
@@ -383,6 +424,7 @@ class AudiobookSessionManager @Inject constructor(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            if (isBookHandoffInProgress) return
             stopPeriodicCheckpointing()
             _state.update {
                 it.copy(
@@ -618,6 +660,7 @@ class AudiobookSessionManager @Inject constructor(
             postToPlayerThread(target) { it.removeListener(playerListener) }
             exoPlayer = null
             playerPreparedForBookId = null
+            isBookHandoffInProgress = false
             _state.update { it.copy(isPrepared = false, isPlaying = false) }
         }
     }
@@ -637,29 +680,82 @@ class AudiobookSessionManager @Inject constructor(
             return
         }
 
-        // If switching away from an already loaded book, flush its progress and stop translation first
+        // If switching away from an already loaded book, synchronously snapshot & persist its
+        // progress BEFORE _state.update replaces bookId, and suppress stale ExoPlayer callbacks
+        // during the handoff before the new book's MediaItem is set.
         if (current.bookId.isNotBlank() && current.bookId != bookId) {
             cancelPendingSeekRestart()
-            flushProgressNow()
+
+            val shouldPersistOldBook = !current.isLoading || current.isPrepared
+            val oldSnapshot = if (shouldPersistOldBook) {
+                val now = clock()
+                val snapshotPosMs = getEffectivePositionMs()
+                val snapshotChapterIdx = findChapterIndex(current.chapters, snapshotPosMs)
+                val snapshotPauseTimestamp = if (current.isPlaying) {
+                    now
+                } else {
+                    lastPauseTimestamp.takeIf { it > 0L }
+                }
+                AudioProgressSnapshot(
+                    bookId = current.bookId,
+                    chapterIndex = snapshotChapterIdx,
+                    positionMs = snapshotPosMs,
+                    durationMs = current.durationMs,
+                    updatedAt = now,
+                    pauseTimestamp = snapshotPauseTimestamp
+                )
+            } else {
+                null
+            }
+
+            isBookHandoffInProgress = true
+            lastPauseTimestamp = 0L
+            isInitialSeekPending = false
+            pendingRestorePositionMs = 0L
+            pendingUserSeekTargetMs = -1L
+            internalSeekTargetMs = -1L
+            playerPreparedForBookId = null
+            currentFilePath = ""
+
             liveTranslationBackend.stop()
             stopPositionPolling()
             stopPeriodicCheckpointing()
+            oldSnapshot?.let { persistAudioSnapshot(it) }
             postToPlayerThread { it.pause() }
-            playerPreparedForBookId = null
         }
 
         if (attachedService == null && exoPlayer == null) {
             pendingBookId = bookId
             startPlaybackServiceIfPossible()
             if (bookDao == null) {
+                isBookHandoffInProgress = false
                 _state.update {
-                    it.copy(
-                        bookId = bookId,
-                        isLoading = true,
-                        isPrepared = false,
-                        errorMessage = null
-                    )
+                    if (it.bookId != bookId) {
+                        it.copy(
+                            bookId = bookId,
+                            chapters = emptyList(),
+                            currentChapterIndex = 0,
+                            currentPositionMs = 0L,
+                            durationMs = 0L,
+                            isPlaying = false,
+                            sourceSubtitle = "",
+                            targetSubtitle = "",
+                            bufferAheadMs = 0L,
+                            isLoading = true,
+                            isPrepared = false,
+                            errorMessage = null
+                        )
+                    } else {
+                        it.copy(
+                            bookId = bookId,
+                            isPlaying = false,
+                            isLoading = true,
+                            isPrepared = false,
+                            errorMessage = null
+                        )
+                    }
                 }
+                attachedService?.updateStreamingLocks()
                 return
             }
         }
@@ -667,13 +763,32 @@ class AudiobookSessionManager @Inject constructor(
         loadBookJob?.cancel()
         loadBookJob = applicationScope.launch(start = CoroutineStart.UNDISPATCHED) {
             _state.update {
-                it.copy(
-                    bookId = bookId,
-                    isLoading = true,
-                    isPrepared = false,
-                    errorMessage = null
-                )
+                if (it.bookId != bookId) {
+                    it.copy(
+                        bookId = bookId,
+                        chapters = emptyList(),
+                        currentChapterIndex = 0,
+                        currentPositionMs = 0L,
+                        durationMs = 0L,
+                        isPlaying = false,
+                        sourceSubtitle = "",
+                        targetSubtitle = "",
+                        bufferAheadMs = 0L,
+                        isLoading = true,
+                        isPrepared = false,
+                        errorMessage = null
+                    )
+                } else {
+                    it.copy(
+                        bookId = bookId,
+                        isPlaying = false,
+                        isLoading = true,
+                        isPrepared = false,
+                        errorMessage = null
+                    )
+                }
             }
+            attachedService?.updateStreamingLocks()
 
             val book = try {
                 bookDao?.getBookById(bookId)
@@ -682,9 +797,15 @@ class AudiobookSessionManager @Inject constructor(
             }
 
             if (bookDao != null && book == null) {
+                if (exoPlayer != null) {
+                    postToPlayerThread { isBookHandoffInProgress = false }
+                } else {
+                    isBookHandoffInProgress = false
+                }
                 _state.update {
                     it.copy(
                         bookId = bookId,
+                        isPlaying = false,
                         isLoading = false,
                         isPrepared = false,
                         errorMessage = "Book not found: $bookId"
@@ -736,6 +857,7 @@ class AudiobookSessionManager @Inject constructor(
                 }
             }
 
+            awaitPendingPersist(bookId)
             val savedState = try {
                 playbackStateDao?.getPlaybackState(bookId)
             } catch (_: Throwable) {
@@ -850,6 +972,8 @@ class AudiobookSessionManager @Inject constructor(
                 withPlayerThread(player) {
                     preparePlayerForCurrentBook(player)
                 }
+            } else {
+                isBookHandoffInProgress = false
             }
 
             observeChaptersForBook(bookId)
@@ -892,8 +1016,10 @@ class AudiobookSessionManager @Inject constructor(
                     if (targetPos > 0L) {
                         p.seekTo(targetPos)
                     }
+                    isBookHandoffInProgress = false
                     p.prepare()
                 } catch (_: Throwable) {
+                    isBookHandoffInProgress = false
                     try {
                         if (targetPos > 0L) {
                             p.seekTo(targetPos)
@@ -902,6 +1028,8 @@ class AudiobookSessionManager @Inject constructor(
                     } catch (_: Throwable) {
                     }
                 }
+            } else {
+                isBookHandoffInProgress = false
             }
         }
 
@@ -1037,15 +1165,21 @@ class AudiobookSessionManager @Inject constructor(
         val bookId = _state.value.bookId
         if (bookId.isNotBlank()) {
             val s = _state.value
-            applicationScope.launch(NonCancellable) {
-                playbackStateDao?.saveLastPauseTimestamp(bookId, 0L, now)
-                playbackStateDao?.saveAudioProgress(
-                    bookId = bookId,
-                    chapterIndex = s.currentChapterIndex,
-                    positionMs = currentPos,
-                    durationMs = s.durationMs,
-                    updatedAt = now
-                )
+            enqueueBookPersist(bookId) {
+                try {
+                    playbackStateDao?.saveLastPauseTimestamp(bookId, 0L, now)
+                } catch (_: Throwable) {
+                }
+                try {
+                    playbackStateDao?.saveAudioProgress(
+                        bookId = bookId,
+                        chapterIndex = s.currentChapterIndex,
+                        positionMs = currentPos,
+                        durationMs = s.durationMs,
+                        updatedAt = now
+                    )
+                } catch (_: Throwable) {
+                }
             }
         }
     }
@@ -1241,48 +1375,127 @@ class AudiobookSessionManager @Inject constructor(
 
         val initialPosMs = getEffectivePositionMs()
         val initialChapterIdx = findChapterIndex(s.chapters, initialPosMs)
-        val now = clock()
+        val snapshot = AudioProgressSnapshot(
+            bookId = bookId,
+            chapterIndex = initialChapterIdx,
+            positionMs = initialPosMs,
+            durationMs = s.durationMs,
+            updatedAt = clock(),
+            pauseTimestamp = pauseTimestamp
+        )
 
         if (initialPosMs != s.currentPositionMs || initialChapterIdx != s.currentChapterIndex) {
             _state.update {
-                it.copy(
-                    currentPositionMs = initialPosMs,
-                    currentChapterIndex = initialChapterIdx
-                )
+                if (it.bookId == bookId) {
+                    it.copy(
+                        currentPositionMs = initialPosMs,
+                        currentChapterIndex = initialChapterIdx
+                    )
+                } else {
+                    it
+                }
             }
         }
 
-        applicationScope.launch(NonCancellable) {
-            val latestState = _state.value
-            if (latestState.bookId != bookId) return@launch
-            val effectivePosMs = try {
-                withPlayerThread { getEffectivePositionMs() }
+        persistAudioSnapshot(snapshot, refreshFromPlayerIfCurrent = true)
+    }
+
+    private suspend fun awaitPendingPersist(bookId: String) {
+        val job = pendingPersistJobs[bookId]
+        if (job != null && job.isActive) {
+            try {
+                job.join()
             } catch (_: Throwable) {
-                initialPosMs
             }
-            val effectiveChapterIdx = findChapterIndex(latestState.chapters, effectivePosMs)
+        }
+    }
+
+    private fun enqueueBookPersist(bookId: String, block: suspend () -> Unit) {
+        val prevJob = pendingPersistJobs[bookId]
+        val job = applicationScope.launch(NonCancellable, start = CoroutineStart.LAZY) {
+            val selfJob = coroutineContext[Job]
+            try {
+                if (prevJob != null && prevJob.isActive) {
+                    try {
+                        prevJob.join()
+                    } catch (_: Throwable) {
+                    }
+                }
+                block()
+            } finally {
+                if (selfJob != null) {
+                    pendingPersistJobs.remove(bookId, selfJob)
+                }
+            }
+        }
+        pendingPersistJobs[bookId] = job
+        job.start()
+    }
+
+    private suspend fun resolveLatestProgressIfCurrent(
+        bookId: String,
+        fallbackChapterIdx: Int,
+        fallbackPosMs: Long,
+        fallbackDurationMs: Long
+    ): Triple<Long, Int, Long> {
+        if (_state.value.bookId != bookId || isBookHandoffInProgress) {
+            return Triple(fallbackPosMs, fallbackChapterIdx, fallbackDurationMs)
+        }
+        val refreshed = try {
+            withPlayerThread {
+                if (_state.value.bookId == bookId && !isBookHandoffInProgress) {
+                    val st = _state.value
+                    val pos = getEffectivePositionMs()
+                    Triple(pos, findChapterIndex(st.chapters, pos), st.durationMs)
+                } else {
+                    null
+                }
+            }
+        } catch (_: Throwable) {
+            null
+        }
+        return refreshed ?: Triple(fallbackPosMs, fallbackChapterIdx, fallbackDurationMs)
+    }
+
+    private fun persistAudioSnapshot(
+        snapshot: AudioProgressSnapshot,
+        refreshFromPlayerIfCurrent: Boolean = false
+    ) {
+        enqueueBookPersist(snapshot.bookId) {
+            val (effectivePosMs, effectiveChapterIdx, effectiveDurationMs) = if (refreshFromPlayerIfCurrent) {
+                resolveLatestProgressIfCurrent(
+                    bookId = snapshot.bookId,
+                    fallbackChapterIdx = snapshot.chapterIndex,
+                    fallbackPosMs = snapshot.positionMs,
+                    fallbackDurationMs = snapshot.durationMs
+                )
+            } else {
+                Triple(snapshot.positionMs, snapshot.chapterIndex, snapshot.durationMs)
+            }
+
             try {
                 playbackStateDao?.saveAudioProgress(
-                    bookId = bookId,
+                    bookId = snapshot.bookId,
                     chapterIndex = effectiveChapterIdx,
                     positionMs = effectivePosMs,
-                    durationMs = latestState.durationMs,
-                    updatedAt = now
+                    durationMs = effectiveDurationMs,
+                    updatedAt = snapshot.updatedAt
                 )
             } catch (_: Throwable) {
             }
-            if (pauseTimestamp != null) {
+            val pauseTs = snapshot.pauseTimestamp
+            if (pauseTs != null) {
                 try {
                     playbackStateDao?.saveLastPauseTimestamp(
-                        bookId = bookId,
-                        timestamp = pauseTimestamp,
-                        updatedAt = now
+                        bookId = snapshot.bookId,
+                        timestamp = pauseTs,
+                        updatedAt = snapshot.updatedAt
                     )
                 } catch (_: Throwable) {
                 }
             }
             try {
-                bookDao?.updateLastReadDate(bookId, now)
+                bookDao?.updateLastReadDate(snapshot.bookId, snapshot.updatedAt)
             } catch (_: Throwable) {
             }
         }
@@ -1294,35 +1507,44 @@ class AudiobookSessionManager @Inject constructor(
         if (bookId.isBlank()) return
 
         val initialPosMs = getEffectivePositionMs()
-        val now = clock()
+        val snapshot = AudioSettingsSnapshot(
+            bookId = bookId,
+            chapterIndex = findChapterIndex(s.chapters, initialPosMs),
+            positionMs = initialPosMs,
+            durationMs = s.durationMs,
+            playbackSpeed = s.playbackSpeed,
+            isLiveTranslationActive = s.isLiveTranslationActive,
+            isDuckingEnabled = s.isDuckingEnabled,
+            targetLanguageCode = s.targetLanguage.code,
+            updatedAt = clock()
+        )
 
-        applicationScope.launch(NonCancellable) {
-            val latestState = _state.value
-            if (latestState.bookId != bookId) return@launch
-            val effectivePosMs = try {
-                withPlayerThread { getEffectivePositionMs() }
-            } catch (_: Throwable) {
-                initialPosMs
-            }
-            val effectiveChapterIdx = findChapterIndex(latestState.chapters, effectivePosMs)
+        enqueueBookPersist(bookId) {
+            val (effectivePosMs, effectiveChapterIdx, effectiveDurationMs) = resolveLatestProgressIfCurrent(
+                bookId = snapshot.bookId,
+                fallbackChapterIdx = snapshot.chapterIndex,
+                fallbackPosMs = snapshot.positionMs,
+                fallbackDurationMs = snapshot.durationMs
+            )
+
             try {
                 playbackStateDao?.savePlaybackSettings(
-                    bookId = bookId,
-                    playbackSpeed = latestState.playbackSpeed,
-                    isLiveTranslationActive = latestState.isLiveTranslationActive,
-                    isDuckingEnabled = latestState.isDuckingEnabled,
-                    targetLanguageCode = latestState.targetLanguage.code,
-                    updatedAt = now
+                    bookId = snapshot.bookId,
+                    playbackSpeed = snapshot.playbackSpeed,
+                    isLiveTranslationActive = snapshot.isLiveTranslationActive,
+                    isDuckingEnabled = snapshot.isDuckingEnabled,
+                    targetLanguageCode = snapshot.targetLanguageCode,
+                    updatedAt = snapshot.updatedAt
                 )
             } catch (_: Throwable) {
             }
             try {
                 playbackStateDao?.saveAudioProgress(
-                    bookId = bookId,
+                    bookId = snapshot.bookId,
                     chapterIndex = effectiveChapterIdx,
                     positionMs = effectivePosMs,
-                    durationMs = latestState.durationMs,
-                    updatedAt = now
+                    durationMs = effectiveDurationMs,
+                    updatedAt = snapshot.updatedAt
                 )
             } catch (_: Throwable) {
             }
@@ -1434,6 +1656,7 @@ class AudiobookSessionManager @Inject constructor(
     }
 
     private fun pollPlayerPositionOnceOnPlayerThread(player: ExoPlayer) {
+        if (isBookHandoffInProgress || _state.value.isLoading) return
         val pos = getEffectivePositionMs()
         val rawDuration = try {
             player.duration
@@ -1492,35 +1715,45 @@ class AudiobookSessionManager @Inject constructor(
         checkpointJob = applicationScope.launch {
             while (isActive && _state.value.isPlaying) {
                 delay(CHECKPOINT_INTERVAL_MS)
-                if (_state.value.isPlaying && _state.value.bookId.isNotBlank()) {
+                if (!isBookHandoffInProgress && _state.value.isPlaying && _state.value.bookId.isNotBlank()) {
                     val snapshot = try {
                         withPlayerThread {
-                            exoPlayer?.let { pollPlayerPositionOnceOnPlayerThread(it) }
-                            val st = _state.value
-                            val pos = getEffectivePositionMs()
-                            Triple(pos, findChapterIndex(st.chapters, pos), st.durationMs)
+                            if (isBookHandoffInProgress || !_state.value.isPlaying) {
+                                null
+                            } else {
+                                exoPlayer?.let { pollPlayerPositionOnceOnPlayerThread(it) }
+                                val st = _state.value
+                                val pos = getEffectivePositionMs()
+                                if (st.bookId.isNotBlank()) {
+                                    AudioProgressSnapshot(
+                                        bookId = st.bookId,
+                                        chapterIndex = findChapterIndex(st.chapters, pos),
+                                        positionMs = pos,
+                                        durationMs = st.durationMs,
+                                        updatedAt = clock()
+                                    )
+                                } else {
+                                    null
+                                }
+                            }
                         }
                     } catch (_: Throwable) {
                         val st = _state.value
-                        val pos = st.currentPositionMs
-                        Triple(pos, findChapterIndex(st.chapters, pos), st.durationMs)
-                    }
-                    val (pos, chIdx, dur) = snapshot
-                    val bookId = _state.value.bookId
-                    if (bookId.isNotBlank()) {
-                        val now = clock()
-                        withContext(NonCancellable) {
-                            try {
-                                playbackStateDao?.saveAudioProgress(
-                                    bookId = bookId,
-                                    chapterIndex = chIdx,
-                                    positionMs = pos,
-                                    durationMs = dur,
-                                    updatedAt = now
-                                )
-                            } catch (_: Throwable) {
-                            }
+                        if (!isBookHandoffInProgress && st.isPlaying && st.bookId.isNotBlank()) {
+                            val pos = st.currentPositionMs
+                            AudioProgressSnapshot(
+                                bookId = st.bookId,
+                                chapterIndex = findChapterIndex(st.chapters, pos),
+                                positionMs = pos,
+                                durationMs = st.durationMs,
+                                updatedAt = clock()
+                            )
+                        } else {
+                            null
                         }
+                    }
+                    if (snapshot != null) {
+                        persistAudioSnapshot(snapshot, refreshFromPlayerIfCurrent = false)
                     }
                 }
             }

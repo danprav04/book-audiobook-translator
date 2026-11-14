@@ -137,6 +137,96 @@ class PlaybackStateAndMigrationTest {
     }
 
     @Test
+    fun testReaderProgressPersistsChapterIndexAcrossMultipleBooks() = runTest {
+        val dao = InMemoryPlaybackStateDao()
+
+        // Book 1 saved via 5-arg saveReaderProgress with chapterIndex = 5
+        dao.saveReaderProgress(
+            bookId = "book-1",
+            lastCfi = "epubcfi(/6/12!/4/2/3:0)",
+            chapterIndex = 5,
+            readingProgress = 0.42f,
+            updatedAt = 100L
+        )
+        val book1Initial = dao.getPlaybackState("book-1")!!
+        assertEquals(5, book1Initial.chapterIndex)
+        assertEquals("epubcfi(/6/12!/4/2/3:0)", book1Initial.lastCfi)
+        assertEquals(0.42f, book1Initial.readingProgress, 0.001f)
+
+        // Book 2 saved with chapterIndex = 2 does not clobber Book 1
+        dao.saveReaderProgress(
+            bookId = "book-2",
+            lastCfi = "epubcfi(/6/6!/4/2/2:0)",
+            chapterIndex = 2,
+            readingProgress = 0.18f,
+            updatedAt = 200L
+        )
+        assertEquals(5, dao.getPlaybackState("book-1")!!.chapterIndex)
+        assertEquals(2, dao.getPlaybackState("book-2")!!.chapterIndex)
+
+        // Updating Book 1 settings then saving new reader chapter preserves settings & updates chapterIndex
+        dao.savePlaybackSettings(
+            bookId = "book-1",
+            playbackSpeed = 1.5f,
+            isLiveTranslationActive = false,
+            isDuckingEnabled = true,
+            targetLanguageCode = "fr",
+            updatedAt = 250L
+        )
+        dao.saveReaderProgress(
+            bookId = "book-1",
+            lastCfi = "epubcfi(/6/16!/4/2/1:0)",
+            chapterIndex = 7,
+            readingProgress = 0.60f,
+            updatedAt = 300L
+        )
+        val book1Updated = dao.getPlaybackState("book-1")!!
+        assertEquals(7, book1Updated.chapterIndex)
+        assertEquals("epubcfi(/6/16!/4/2/1:0)", book1Updated.lastCfi)
+        assertEquals(0.60f, book1Updated.readingProgress, 0.001f)
+        assertEquals(1.5f, book1Updated.playbackSpeed, 0.001f)
+        assertFalse(book1Updated.isLiveTranslationActive)
+        assertTrue(book1Updated.isDuckingEnabled)
+        assertEquals("fr", book1Updated.targetLanguageCode)
+
+        // 5-arg updateReaderProgress returns 0 for missing book and 1 when updating existing book
+        assertEquals(
+            0,
+            dao.updateReaderProgress(
+                bookId = "missing-book",
+                lastCfi = "epubcfi(/6/2!/4/2/1:0)",
+                chapterIndex = 1,
+                readingProgress = 0.1f,
+                updatedAt = 350L
+            )
+        )
+        assertEquals(
+            1,
+            dao.updateReaderProgress(
+                bookId = "book-2",
+                lastCfi = "epubcfi(/6/8!/4/2/4:0)",
+                chapterIndex = 3,
+                readingProgress = 0.33f,
+                updatedAt = 400L
+            )
+        )
+        val book2Updated = dao.getPlaybackState("book-2")!!
+        assertEquals(3, book2Updated.chapterIndex)
+        assertEquals("epubcfi(/6/8!/4/2/4:0)", book2Updated.lastCfi)
+        assertEquals(0.33f, book2Updated.readingProgress, 0.001f)
+
+        // 4-arg compatibility overload still compiles and preserves existing chapterIndex on update
+        dao.saveReaderProgress(
+            bookId = "book-1",
+            lastCfi = "epubcfi(/6/16!/4/2/4:0)",
+            readingProgress = 0.62f,
+            updatedAt = 450L
+        )
+        assertEquals(7, dao.getPlaybackState("book-1")!!.chapterIndex)
+        assertEquals("epubcfi(/6/16!/4/2/4:0)", dao.getPlaybackState("book-1")!!.lastCfi)
+    }
+
+    @Test
     fun testBookDaoUpdateLastReadDateAndBookmarkObserveAlias() = runTest {
         val books = mutableMapOf(
             "b1" to BookEntity(

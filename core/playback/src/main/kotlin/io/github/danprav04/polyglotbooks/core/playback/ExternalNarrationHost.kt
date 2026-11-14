@@ -154,6 +154,33 @@ class PlaybackCoordinator @Inject constructor() {
         onServiceCommand?.invoke(ACTION_RELEASE_EXTERNAL_NARRATION)
     }
 
+    /**
+     * Cleanly pauses whichever playback source is currently active or playing
+     * (audiobook via [onPauseAudiobook] and/or external ebook narration via [externalDelegate]),
+     * without releasing the active session.
+     */
+    fun pauseActivePlayback() {
+        val delegate = externalDelegate
+        val currentExt = _externalState.value
+        val delegatePlaying = try {
+            delegate?.externalState?.value?.let { it.isPlaying || it.isBuffering } == true
+        } catch (_: Throwable) {
+            false
+        }
+        if (delegate != null && (currentExt.isPlaying || currentExt.isBuffering || delegatePlaying)) {
+            try {
+                delegate.pause()
+            } catch (_: Throwable) {
+            }
+        }
+        if (_activeSource.value != ActivePlaybackSource.EBOOK_NARRATION) {
+            try {
+                onPauseAudiobook?.invoke()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     companion object {
         const val ACTION_ACTIVATE_AUDIOBOOK =
             "io.github.danprav04.polyglotbooks.action.ACTIVATE_AUDIOBOOK"

@@ -1,5 +1,6 @@
 package io.github.danprav04.polyglotbooks.core.playback
 
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
@@ -19,6 +20,7 @@ import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -26,6 +28,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -589,5 +592,280 @@ class AudiobookSessionManagerTest {
         coVerify {
             chapterDao.insertChapters(match { list -> list.size == 1 && list[0].endMs == 125_000L })
         }
+    }
+
+    private class InMemoryPlaybackStateDao(
+        initial: Map<String, PlaybackStateEntity> = emptyMap()
+    ) : PlaybackStateDao {
+        private val store = MutableStateFlow(initial)
+        val audioProgressSaves = mutableListOf<PlaybackStateEntity>()
+
+        override suspend fun getPlaybackState(bookId: String): PlaybackStateEntity? =
+            store.value[bookId]
+
+        override fun observePlaybackState(bookId: String): Flow<PlaybackStateEntity?> =
+            store.map { it[bookId] }
+
+        override fun observeAllPlaybackStates(): Flow<List<PlaybackStateEntity>> =
+            store.map { it.values.toList() }
+
+        override suspend fun upsertPlaybackState(state: PlaybackStateEntity) {
+            store.value = store.value + (state.bookId to state)
+            audioProgressSaves += state
+        }
+
+        override suspend fun updateAudioProgress(
+            bookId: String,
+            chapterIndex: Int,
+            positionMs: Long,
+            durationMs: Long,
+            updatedAt: Long
+        ): Int {
+            val existing = store.value[bookId] ?: return 0
+            val updated = existing.copy(
+                chapterIndex = chapterIndex,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                updatedAt = updatedAt
+            )
+            store.value = store.value + (bookId to updated)
+            audioProgressSaves += updated
+            return 1
+        }
+
+        override suspend fun updateReaderProgress(
+            bookId: String,
+            lastCfi: String?,
+            readingProgress: Float,
+            updatedAt: Long
+        ): Int {
+            val existing = store.value[bookId] ?: return 0
+            store.value = store.value + (
+                bookId to existing.copy(
+                    lastCfi = lastCfi,
+                    readingProgress = readingProgress,
+                    updatedAt = updatedAt
+                )
+            )
+            return 1
+        }
+
+        override suspend fun updatePlaybackSettings(
+            bookId: String,
+            playbackSpeed: Float,
+            isLiveTranslationActive: Boolean,
+            isDuckingEnabled: Boolean,
+            targetLanguageCode: String?,
+            updatedAt: Long
+        ): Int {
+            val existing = store.value[bookId] ?: return 0
+            store.value = store.value + (
+                bookId to existing.copy(
+                    playbackSpeed = playbackSpeed,
+                    isLiveTranslationActive = isLiveTranslationActive,
+                    isDuckingEnabled = isDuckingEnabled,
+                    targetLanguageCode = targetLanguageCode,
+                    updatedAt = updatedAt
+                )
+            )
+            return 1
+        }
+
+        override suspend fun updateLastPauseTimestamp(
+            bookId: String,
+            timestamp: Long,
+            updatedAt: Long
+        ): Int {
+            val existing = store.value[bookId] ?: return 0
+            store.value = store.value + (
+                bookId to existing.copy(
+                    lastPauseTimestamp = timestamp,
+                    updatedAt = updatedAt
+                )
+            )
+            return 1
+        }
+
+        override suspend fun deletePlaybackState(bookId: String) {
+            store.value = store.value - bookId
+        }
+    }
+
+    @Test
+    fun `switching Book1 to Book2 and back preserves Book1 exact position and pauseTimestamp`() = runTest {
+        val bookDao = mockk<BookDao>(relaxed = true)
+        val chapterDao = mockk<ChapterDao>(relaxed = true)
+        val playbackStateDao = InMemoryPlaybackStateDao()
+        val settingsRepo = FakeSettingsRepository()
+        val backend = FakeLiveTranslationBackend()
+        val exoPlayer = mockk<ExoPlayer>(relaxed = true)
+        val listenerSlot = slot<Player.Listener>()
+        every { exoPlayer.addListener(capture(listenerSlot)) } returns Unit
+
+        coEvery { bookDao.getBookById("book-1") } returns sampleBook("book-1").copy(title = "First Book")
+        coEvery { bookDao.getBookById("book-2") } returns sampleBook("book-2").copy(title = "Second Book")
+        every { chapterDao.getChaptersForBook("book-1") } returns flowOf(sampleChapters("book-1"))
+        every { chapterDao.getChaptersForBook("book-2") } returns flowOf(sampleChapters("book-2"))
+
+        var activeMediaId = ""
+        var activePlayerPosMs = 0L
+        var activePlayerDurMs = 90_000L
+        every { exoPlayer.setMediaItem(any(), any<Long>()) } answers {
+            val item = firstArg<MediaItem>()
+            activeMediaId = item.mediaId
+            activePlayerPosMs = secondArg()
+            activePlayerDurMs = if (activeMediaId == "book-1") 90_000L else 120_000L
+        }
+        every { exoPlayer.seekTo(any<Long>()) } answers {
+            activePlayerPosMs = firstArg()
+        }
+        every { exoPlayer.currentPosition } answers { activePlayerPosMs }
+        every { exoPlayer.duration } answers { activePlayerDurMs }
+        every { exoPlayer.playbackState } returns Player.STATE_READY
+
+        var currentTimeMs = 100_000L
+        val manager = AudiobookSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            settingsRepository = settingsRepo,
+            liveTranslationBackend = backend,
+            applicationScope = backgroundScope
+        )
+        manager.clock = { currentTimeMs }
+        manager.attachPlayer(exoPlayer)
+
+        // 1. Open Book 1 and listen until 45_000L (Chapter 1)
+        manager.loadBook("book-1")
+        runCurrent()
+        manager.play()
+        runCurrent()
+        activePlayerPosMs = 45_000L
+        currentTimeMs = 110_000L
+
+        // 2. Switch directly to Book 2 while Book 1 is playing -> Book 1's 45_000L & pauseTimestamp must persist
+        manager.loadBook("book-2")
+        runCurrent()
+
+        val savedBook1AfterSwitch = playbackStateDao.getPlaybackState("book-1")!!
+        assertEquals(45_000L, savedBook1AfterSwitch.positionMs)
+        assertEquals(1, savedBook1AfterSwitch.chapterIndex)
+        assertEquals(90_000L, savedBook1AfterSwitch.durationMs)
+        assertEquals(110_000L, savedBook1AfterSwitch.lastPauseTimestamp)
+        assertEquals("book-2", manager.state.value.bookId)
+        assertEquals(0L, manager.state.value.currentPositionMs)
+        assertFalse(manager.state.value.isPlaying)
+
+        // 3. Listen to Book 2 until 22_000L (Chapter 0), pause explicitly at t=120_000L
+        manager.play()
+        runCurrent()
+        activePlayerPosMs = 22_000L
+        currentTimeMs = 120_000L
+        manager.pause()
+        runCurrent()
+
+        // 4. Reload Book 1 at t=130_000L (20s since Book 1 paused < 60s rewind threshold -> exact 45_000L)
+        currentTimeMs = 130_000L
+        manager.loadBook("book-1")
+        runCurrent()
+
+        // Book 2 retained its position and preserved its earlier pause timestamp (120_000L, not 130_000L)
+        val savedBook2AfterSwitch = playbackStateDao.getPlaybackState("book-2")!!
+        assertEquals(22_000L, savedBook2AfterSwitch.positionMs)
+        assertEquals(0, savedBook2AfterSwitch.chapterIndex)
+        assertEquals(120_000L, savedBook2AfterSwitch.lastPauseTimestamp)
+
+        // Book 1 restored exact position, chapter, duration, and pause timestamp
+        assertEquals("book-1", manager.state.value.bookId)
+        assertEquals(45_000L, manager.state.value.currentPositionMs)
+        assertEquals(1, manager.state.value.currentChapterIndex)
+        assertEquals(90_000L, manager.state.value.durationMs)
+        assertEquals(110_000L, manager.lastPauseTimestamp)
+        assertEquals("book-1", activeMediaId)
+        assertEquals(45_000L, activePlayerPosMs)
+    }
+
+    @Test
+    fun `onIsPlayingChanged false during book handoff does not flush Book1 position under Book2 ID`() = runTest {
+        val bookDao = mockk<BookDao>(relaxed = true)
+        val chapterDao = mockk<ChapterDao>(relaxed = true)
+        val playbackStateDao = InMemoryPlaybackStateDao(
+            initial = mapOf(
+                "book-2" to PlaybackStateEntity(
+                    bookId = "book-2",
+                    chapterIndex = 0,
+                    positionMs = 12_000L,
+                    durationMs = 80_000L,
+                    updatedAt = 1_000L
+                )
+            )
+        )
+        val settingsRepo = FakeSettingsRepository()
+        val backend = FakeLiveTranslationBackend()
+        val exoPlayer = mockk<ExoPlayer>(relaxed = true)
+        val listenerSlot = slot<Player.Listener>()
+        every { exoPlayer.addListener(capture(listenerSlot)) } returns Unit
+
+        val book2LoadGate = CompletableDeferred<BookEntity>()
+        coEvery { bookDao.getBookById("book-1") } returns sampleBook("book-1")
+        coEvery { bookDao.getBookById("book-2") } coAnswers { book2LoadGate.await() }
+        every { chapterDao.getChaptersForBook("book-1") } returns flowOf(sampleChapters("book-1"))
+        every { chapterDao.getChaptersForBook("book-2") } returns flowOf(sampleChapters("book-2"))
+
+        var simulatedPlayerPos = 0L
+        var simulatedDuration = 90_000L
+        every { exoPlayer.setMediaItem(any(), any<Long>()) } answers {
+            val item = firstArg<MediaItem>()
+            simulatedPlayerPos = secondArg()
+            simulatedDuration = if (item.mediaId == "book-1") 90_000L else 80_000L
+        }
+        every { exoPlayer.seekTo(any<Long>()) } answers {
+            simulatedPlayerPos = firstArg()
+        }
+        every { exoPlayer.currentPosition } answers { simulatedPlayerPos }
+        every { exoPlayer.duration } answers { simulatedDuration }
+        every { exoPlayer.playbackState } returns Player.STATE_READY
+
+        val manager = AudiobookSessionManager(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            playbackStateDao = playbackStateDao,
+            settingsRepository = settingsRepo,
+            liveTranslationBackend = backend,
+            applicationScope = backgroundScope
+        )
+        manager.clock = { 200_000L }
+        manager.attachPlayer(exoPlayer)
+
+        // Load and play Book 1 up to 45_000L
+        manager.loadBook("book-1")
+        runCurrent()
+        manager.play()
+        runCurrent()
+        simulatedPlayerPos = 45_000L
+
+        // Start switching to Book 2 while book-2 DB lookup is still suspended
+        manager.loadBook("book-2")
+
+        // Synchronously inside UNDISPATCHED loadBook block: bookId updated and isPlaying cleared
+        assertEquals("book-2", manager.state.value.bookId)
+        assertFalse(manager.state.value.isPlaying)
+
+        // Simulate stale ExoPlayer onIsPlayingChanged(false) arriving during handoff before setMediaItem
+        listenerSlot.captured.onIsPlayingChanged(false)
+        runCurrent()
+
+        // Complete Book 2 DB load
+        book2LoadGate.complete(sampleBook("book-2"))
+        runCurrent()
+
+        // Book 1 saved its 45_000L, and Book 2 NEVER got overwritten with Book 1's 45_000L
+        assertEquals(45_000L, playbackStateDao.getPlaybackState("book-1")?.positionMs)
+        assertEquals(12_000L, playbackStateDao.getPlaybackState("book-2")?.positionMs)
+        assertEquals(12_000L, manager.state.value.currentPositionMs)
+        assertTrue(
+            "Book 2 must never receive Book 1's 45_000L position",
+            playbackStateDao.audioProgressSaves.none { it.bookId == "book-2" && it.positionMs == 45_000L }
+        )
     }
 }

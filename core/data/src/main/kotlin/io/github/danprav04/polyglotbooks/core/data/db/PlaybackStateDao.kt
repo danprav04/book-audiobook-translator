@@ -43,6 +43,26 @@ interface PlaybackStateDao {
         updatedAt: Long = System.currentTimeMillis()
     ): Int
 
+    @Transaction
+    suspend fun updateReaderProgress(
+        bookId: String,
+        lastCfi: String?,
+        chapterIndex: Int,
+        readingProgress: Float,
+        updatedAt: Long = System.currentTimeMillis()
+    ): Int {
+        val existing = getPlaybackState(bookId) ?: return 0
+        upsertPlaybackState(
+            existing.copy(
+                chapterIndex = chapterIndex,
+                lastCfi = lastCfi,
+                readingProgress = readingProgress,
+                updatedAt = updatedAt
+            )
+        )
+        return 1
+    }
+
     @Query(
         "UPDATE playback_state SET playbackSpeed = :playbackSpeed, " +
             "isLiveTranslationActive = :isLiveTranslationActive, " +
@@ -104,6 +124,27 @@ interface PlaybackStateDao {
             upsertPlaybackState(
                 PlaybackStateEntity(
                     bookId = bookId,
+                    lastCfi = lastCfi,
+                    readingProgress = readingProgress,
+                    updatedAt = updatedAt
+                )
+            )
+        }
+    }
+
+    @Transaction
+    suspend fun saveReaderProgress(
+        bookId: String,
+        lastCfi: String?,
+        chapterIndex: Int,
+        readingProgress: Float,
+        updatedAt: Long = System.currentTimeMillis()
+    ) {
+        if (updateReaderProgress(bookId, lastCfi, chapterIndex, readingProgress, updatedAt) == 0) {
+            upsertPlaybackState(
+                PlaybackStateEntity(
+                    bookId = bookId,
+                    chapterIndex = chapterIndex,
                     lastCfi = lastCfi,
                     readingProgress = readingProgress,
                     updatedAt = updatedAt
