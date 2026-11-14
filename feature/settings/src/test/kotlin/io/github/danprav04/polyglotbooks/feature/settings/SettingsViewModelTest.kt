@@ -4,6 +4,7 @@ import app.cash.turbine.test
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.ModelItem
 import io.github.danprav04.polyglotbooks.core.gemini.ModelListResponse
@@ -73,11 +74,14 @@ class SettingsViewModelTest {
         Dispatchers.resetMain()
     }
 
-    private fun createViewModel(): SettingsViewModel {
+    private fun createViewModel(
+        quotaTracker: GeminiQuotaTracker? = null
+    ): SettingsViewModel {
         return SettingsViewModel(
             settingsRepository = settingsRepository,
             secureKeyStore = secureKeyStore,
-            modelCatalogService = modelCatalogService
+            modelCatalogService = modelCatalogService,
+            quotaTracker = quotaTracker
         )
     }
 
@@ -222,5 +226,162 @@ class SettingsViewModelTest {
         viewModel.setEchoTargetLanguage(true)
         advanceUntilIdle()
         coVerify { settingsRepository.setEchoTargetLanguage(true) }
+    }
+
+    @Test
+    fun testSetFreeTierUpdatesRepositoryAndUiState() = runTest {
+        val viewModel = createViewModel()
+        advanceUntilIdle()
+
+        viewModel.setFreeTier(true)
+        advanceUntilIdle()
+        coVerify { settingsRepository.setFreeTier(true) }
+
+        featureUsageStatsFlow.value = FeatureUsageStats(isFreeTier = true)
+        advanceUntilIdle()
+        assertTrue(viewModel.uiState.value.featureUsageStats.isFreeTier)
+
+        viewModel.setFreeTier(false)
+        advanceUntilIdle()
+        coVerify { settingsRepository.setFreeTier(false) }
+    }
+
+    @Test
+    fun testCatalogRegistrationInQuotaTrackerOnInitAndTestKey() = runTest {
+        val quotaTracker = GeminiQuotaTracker(clockMs = { 1_000_000L })
+        val initModels = listOf(
+            ModelItem(
+                name = "models/gemini-3.5-flash-lite",
+                supportedGenerationMethods = listOf("generateContent")
+            ),
+            ModelItem(
+                name = "models/gemini-2.0-flash",
+                supportedGenerationMethods = listOf("generateContent")
+            )
+        )
+        coEvery { secureKeyStore.getApiKey() } returns "AIzaSySavedKey"
+        coEvery { modelCatalogService.listModels("AIzaSySavedKey") } returns ModelListResponse(models = initModels)
+
+        val viewModel = createViewModel(quotaTracker = quotaTracker)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.quotaSnapshots.containsKey("gemini-3.5-flash-lite"))
+        val zeroQuotaSnapshot = viewModel.uiState.value.quotaSnapshots["gemini-2.0-flash"]
+        assertTrue(zeroQuotaSnapshot?.permanentlyUnavailable == true)
+
+        val testedModels = initModels + ModelItem(
+            name = "models/gemini-2.5-flash-native-audio-dialog",
+            supportedGenerationMethods = listOf("bidiGenerateContent")
+        )
+        coEvery { modelCatalogService.listModels("AIzaSyNewTestedKey") } returns ModelListResponse(models = testedModels)
+
+        viewModel.onApiKeyInputChanged("AIzaSyNewTestedKey")
+        viewModel.testApiKey()
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.quotaSnapshots.containsKey("gemini-2.5-flash-native-audio-dialog"))
+    }
+
+    @Test
+    fun testApplyFreeTierRecommendedPresetDefaultAndCataloged() = runTest {
+        val viewModel = createViewModel()
+        advanceUntilIdle()
+
+        viewModel.applyFreeTierRecommendedPreset()
+        advanceUntilIdle()
+
+        coVerify { settingsRepository.setFreeTier(true) }
+        coVerify { settingsRepository.setModel(ModelRole.TEXT_TRANSLATION, "gemini-3.5-flash-lite") }
+        coVerify { settingsRepository.setModel(ModelRole.TEXT_ANALYSIS, "gemini-3.5-flash-lite") }
+        coVerify { settingsRepository.setModel(ModelRole.LIVE_NARRATION, "gemini-2.5-flash-native-audio-dialog") }
+        coVerify { settingsRepository.setModel(ModelRole.LIVE_TRANSLATE, "gemini-3.5-live-translate-preview") }
+        assertEquals("Applied free-tier multi-model preset", viewModel.uiState.value.userMessage)
+
+        val catalogWithoutNativeAudio = listOf(
+            ModelItem(
+                name = "models/gemini-3.1-flash-lite",
+                supportedGenerationMethods = listOf("generateContent")
+            ),
+            ModelItem(
+                name = "models/gemini-3.8-live",
+                supportedGenerationMethods = listOf("bidiGenerateContent")
+            ),
+            ModelItem(
+                name = "models/gemini-3.5-live-translate-preview",
+                supportedGenerationMethods = listOf("bidiGenerateContent")
+            )
+        )
+        coEvery { modelCatalogService.listModels("AIzaSyCatalogKey") } returns ModelListResponse(models = catalogWithoutNativeAudio)
+
+        viewModel.onApiKeyInputChanged("AIzaSyCatalogKey")
+        viewModel.testApiKey()
+        advanceUntilIdle()
+
+        viewModel.applyFreeTierRecommendedPreset()
+        advanceUntilIdle()
+
+        coVerify { settingsRepository.setModel(ModelRole.TEXT_TRANSLATION, "gemini-3.1-flash-lite") }
+        coVerify { settingsRepository.setModel(ModelRole.TEXT_ANALYSIS, "gemini-3.1-flash-lite") }
+        coVerify { settingsRepository.setModel(ModelRole.LIVE_NARRATION, "gemini-3.8-live") }
+        coVerify { settingsRepository.setModel(ModelRole.LIVE_TRANSLATE, "gemini-3.5-live-translate-preview") }
+    }
+
+    @Test
+    fun testResetQuotaCooldownsClearsRateLimitAndShowsMessage() = runTest {
+        var nowMs = 1_000_000L
+        val quotaTracker = GeminiQuotaTracker(clockMs = { nowMs })
+        quotaTracker.recordHttpError(
+            modelId = "gemini-3.5-flash-lite",
+            httpCode = 429,
+            responseBody = """{"error":{"message":"Please retry in 30s."}}"""
+        )
+
+        val viewModel = createViewModel(quotaTracker = quotaTracker)
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.quotaSnapshots["gemini-3.5-flash-lite"]!!.cooldownRemainingMs > 0L)
+
+        viewModel.resetQuotaCooldowns()
+        advanceUntilIdle()
+
+        val clearedSnapshot = viewModel.uiState.value.quotaSnapshots["gemini-3.5-flash-lite"]!!
+        assertEquals(0L, clearedSnapshot.cooldownRemainingMs)
+        assertFalse(clearedSnapshot.exhaustedForDay)
+        assertEquals("Cleared model rate-limit cooldowns", viewModel.uiState.value.userMessage)
+    }
+
+    @Test
+    fun testGetRecommendedModelsForRoleIncludesCuratedAndCatalogModels() = runTest {
+        val catalogModels = listOf(
+            ModelItem(
+                name = "models/gemma-4-31b-it",
+                supportedGenerationMethods = listOf("generateContent")
+            ),
+            ModelItem(
+                name = "models/gemini-2.0-flash",
+                supportedGenerationMethods = listOf("generateContent")
+            ),
+            ModelItem(
+                name = "models/gemini-custom-live-audio",
+                supportedGenerationMethods = listOf("bidiGenerateContent")
+            )
+        )
+        coEvery { modelCatalogService.listModels("AIzaSyRecKey") } returns ModelListResponse(models = catalogModels)
+
+        val viewModel = createViewModel()
+        advanceUntilIdle()
+
+        viewModel.onApiKeyInputChanged("AIzaSyRecKey")
+        viewModel.testApiKey()
+        advanceUntilIdle()
+
+        val textModels = viewModel.getRecommendedModelsForRole(ModelRole.TEXT_TRANSLATION)
+        assertTrue(textModels.contains("gemini-3.5-flash-lite"))
+        assertTrue(textModels.contains("gemma-4-31b-it"))
+        assertFalse(textModels.contains("gemini-2.0-flash"))
+
+        val liveModels = viewModel.getRecommendedModelsForRole(ModelRole.LIVE_NARRATION)
+        assertTrue(liveModels.contains("gemini-2.5-flash-native-audio-dialog"))
+        assertTrue(liveModels.contains("gemini-custom-live-audio"))
     }
 }

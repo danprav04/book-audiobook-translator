@@ -7,9 +7,11 @@ import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.CostEstimator
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.ModelItem
+import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,6 +41,7 @@ data class SettingsUiState(
     val echoTargetLanguage: Boolean = false,
     val featureUsageStats: FeatureUsageStats = FeatureUsageStats(),
     val estimatedTotalCost: Double = 0.0,
+    val quotaSnapshots: Map<String, ModelQuotaSnapshot> = emptyMap(),
     val userMessage: String? = null
 )
 
@@ -46,7 +49,8 @@ data class SettingsUiState(
 class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val secureKeyStore: SecureKeyStore,
-    private val modelCatalogService: ModelCatalogService
+    private val modelCatalogService: ModelCatalogService,
+    private val quotaTracker: GeminiQuotaTracker? = null
 ) : ViewModel() {
 
     private val _apiKeyInput = MutableStateFlow("")
@@ -54,6 +58,8 @@ class SettingsViewModel @Inject constructor(
     private val _testKeyStatus = MutableStateFlow<TestKeyStatus>(TestKeyStatus.Idle)
     private val _availableModels = MutableStateFlow<List<ModelItem>>(emptyList())
     private val _userMessage = MutableStateFlow<String?>(null)
+    private val quotaSnapshotsFlow: StateFlow<Map<String, ModelQuotaSnapshot>> =
+        quotaTracker?.quotaSnapshots ?: MutableStateFlow(emptyMap())
 
     private val baseRepoSettings = combine(
         settingsRepository.apiKey,
@@ -98,8 +104,9 @@ class SettingsViewModel @Inject constructor(
     // Combine into a single unified UI state
     val uiState: StateFlow<SettingsUiState> = combine(
         repoSettings,
-        internalState
-    ) { repo, internal ->
+        internalState,
+        quotaSnapshotsFlow
+    ) { repo, internal, snapshots ->
         val liveTranslateCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_TRANSLATE, repo.usageStats.liveTranslateMinutes * 60.0, repo.usageStats.isFreeTier)
         val ttsCost = CostEstimator.estimateAudioCost(ModelRole.TTS, repo.usageStats.ttsCharactersOrMinutes * 60.0, repo.usageStats.isFreeTier)
         val liveNarrationCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_NARRATION, repo.usageStats.liveNarrationMinutes * 60.0, repo.usageStats.isFreeTier)
@@ -118,6 +125,7 @@ class SettingsViewModel @Inject constructor(
             echoTargetLanguage = repo.echoTargetLanguage,
             featureUsageStats = repo.usageStats,
             estimatedTotalCost = totalCost,
+            quotaSnapshots = snapshots,
             userMessage = internal.message
         )
     }.stateIn(
@@ -153,6 +161,7 @@ class SettingsViewModel @Inject constructor(
                 try {
                     val response = modelCatalogService.listModels(key)
                     _availableModels.value = response.models
+                    quotaTracker?.registerCatalogModels(response.models)
                 } catch (_: Exception) {
                     // Ignore background catalog load failure on init
                 }
@@ -212,6 +221,7 @@ class SettingsViewModel @Inject constructor(
             try {
                 val response = modelCatalogService.listModels(keyToTest)
                 _availableModels.value = response.models
+                quotaTracker?.registerCatalogModels(response.models)
                 _testKeyStatus.value = TestKeyStatus.Success(
                     message = "Key verified successfully!",
                     modelCount = response.models.size
@@ -269,6 +279,69 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun applyFreeTierRecommendedPreset() {
+        viewModelScope.launch {
+            settingsRepository.setFreeTier(true)
+            val catalog = _availableModels.value
+            val bestText = selectBestFreeTierModel(
+                role = ModelRole.TEXT_TRANSLATION,
+                catalog = catalog,
+                preferredOrder = listOf(
+                    "gemini-3.5-flash-lite",
+                    "gemini-3.1-flash-lite",
+                    "gemini-2.5-flash-lite",
+                    "gemma-4-31b-it",
+                    "gemma-4-26b-a4b-it"
+                ),
+                fallback = "gemini-3.5-flash-lite"
+            )
+            val bestAnalysis = selectBestFreeTierModel(
+                role = ModelRole.TEXT_ANALYSIS,
+                catalog = catalog,
+                preferredOrder = listOf(
+                    "gemini-3.5-flash-lite",
+                    "gemini-3.1-flash-lite",
+                    "gemini-2.5-flash-lite",
+                    "gemma-4-31b-it",
+                    "gemma-4-26b-a4b-it"
+                ),
+                fallback = bestText
+            )
+            val bestLiveNarration = selectBestFreeTierModel(
+                role = ModelRole.LIVE_NARRATION,
+                catalog = catalog,
+                preferredOrder = listOf(
+                    "gemini-2.5-flash-native-audio-dialog",
+                    "gemini-3.8-live",
+                    "gemini-3-flash-live"
+                ),
+                fallback = "gemini-2.5-flash-native-audio-dialog",
+                prefixMatchFallback = "gemini-2.5-flash-native-audio"
+            )
+            val bestLiveTranslate = selectBestFreeTierModel(
+                role = ModelRole.LIVE_TRANSLATE,
+                catalog = catalog,
+                preferredOrder = listOf(
+                    "gemini-3.5-live-translate-preview",
+                    "gemini-2.5-flash-native-audio-dialog",
+                    "gemini-3.8-live"
+                ),
+                fallback = "gemini-3.5-live-translate-preview"
+            )
+
+            settingsRepository.setModel(ModelRole.TEXT_TRANSLATION, bestText)
+            settingsRepository.setModel(ModelRole.TEXT_ANALYSIS, bestAnalysis)
+            settingsRepository.setModel(ModelRole.LIVE_NARRATION, bestLiveNarration)
+            settingsRepository.setModel(ModelRole.LIVE_TRANSLATE, bestLiveTranslate)
+            _userMessage.value = "Applied free-tier multi-model preset"
+        }
+    }
+
+    fun resetQuotaCooldowns() {
+        quotaTracker?.resetCooldowns()
+        _userMessage.value = "Cleared model rate-limit cooldowns"
+    }
+
     fun resetUsageStats() {
         viewModelScope.launch {
             settingsRepository.resetUsageStats()
@@ -285,5 +358,36 @@ class SettingsViewModel @Inject constructor(
      */
     fun getCatalogModelsForRole(role: ModelRole): List<ModelItem> {
         return ModelCatalog.filterModelsForRole(_availableModels.value, role)
+    }
+
+    /**
+     * Return recommended model IDs for [role], combining defaults, curated free-tier/Gemma 4/Live
+     * models, and discovered catalog models.
+     */
+    fun getRecommendedModelsForRole(role: ModelRole): List<String> {
+        return ModelCatalog.recommendedModelsForRole(role, _availableModels.value)
+    }
+
+    private fun selectBestFreeTierModel(
+        role: ModelRole,
+        catalog: List<ModelItem>,
+        preferredOrder: List<String>,
+        fallback: String,
+        prefixMatchFallback: String? = null
+    ): String {
+        if (catalog.isEmpty()) return fallback
+        val roleCatalogIds = ModelCatalog.filterModelsForRole(catalog, role).map { it.id }
+        if (roleCatalogIds.isEmpty()) return fallback
+        for (candidate in preferredOrder) {
+            val exact = roleCatalogIds.firstOrNull { it.equals(candidate, ignoreCase = true) }
+            if (exact != null) return exact
+        }
+        if (prefixMatchFallback != null) {
+            val prefix = roleCatalogIds.firstOrNull {
+                it.startsWith(prefixMatchFallback, ignoreCase = true)
+            }
+            if (prefix != null) return prefix
+        }
+        return fallback
     }
 }

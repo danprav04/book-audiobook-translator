@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -70,7 +71,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
+import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import java.util.Locale
@@ -126,7 +130,17 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
-            // Section 2: Model per Role Configuration
+            // Section 2: Free-Tier Quota & Multi-Model Pool
+            FreeTierQuotaSection(
+                uiState = uiState,
+                onFreeTierChange = viewModel::setFreeTier,
+                onApplyFreeTierPreset = viewModel::applyFreeTierRecommendedPreset,
+                onResetCooldowns = viewModel::resetQuotaCooldowns
+            )
+
+            HorizontalDivider()
+
+            // Section 3: Model per Role Configuration
             ModelConfigurationSection(
                 uiState = uiState,
                 viewModel = viewModel
@@ -321,6 +335,183 @@ private fun ApiKeySection(
 }
 
 @Composable
+private fun FreeTierQuotaSection(
+    uiState: SettingsUiState,
+    onFreeTierChange: (Boolean) -> Unit,
+    onApplyFreeTierPreset: () -> Unit,
+    onResetCooldowns: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f))
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Speed,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Free-Tier Quota & Multi-Model Pool",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Free-Tier Quota Saver",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Text(
+                        text = "Enable conservative batching, disk caching, and free-tier quota tracking.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(
+                    checked = uiState.featureUsageStats.isFreeTier,
+                    onCheckedChange = onFreeTierChange
+                )
+            }
+
+            Text(
+                text = "• Automatic chapter batching & on-device disk caching minimize repeat API calls.\n" +
+                    "• Text requests rotate across Flash Lite (gemini-3.5-flash-lite, gemini-3.1-flash-lite) and Gemma 4 (31B/26B — 30 RPM / 14.4K RPD) on 429 limits.\n" +
+                    "• Narration prefers Live Audio (gemini-2.5-flash-native-audio-dialog 1M TPM, gemini-3.8-live, gemini-3-flash-live — Unlimited RPM/RPD) to avoid exhausting the gemini-3.8-flash-tts 3 RPM / 10 RPD cap.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onApplyFreeTierPreset,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Apply Free-Tier Preset", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+
+                OutlinedButton(
+                    onClick = onResetCooldowns,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Reset Cooldowns", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+
+            if (uiState.quotaSnapshots.isNotEmpty()) {
+                HorizontalDivider()
+                Text(
+                    text = "Session Model Usage & Cooldowns",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                val allSnapshots = uiState.quotaSnapshots.values.toList()
+                val activeSnapshots = allSnapshots.filter {
+                    it.rpmUsedLastMinute > 0 ||
+                        it.rpdUsedToday > 0 ||
+                        it.cooldownRemainingMs > 0L ||
+                        it.exhaustedForDay ||
+                        it.permanentlyUnavailable ||
+                        it.quotaNote != null
+                }
+                val idleSnapshots = allSnapshots.filterNot { snapshot ->
+                    activeSnapshots.any { it.modelId == snapshot.modelId }
+                }
+                val visibleSnapshots = activeSnapshots +
+                    idleSnapshots.take((6 - activeSnapshots.size).coerceAtLeast(0))
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (snapshot in visibleSnapshots) {
+                        QuotaSnapshotRow(snapshot = snapshot)
+                    }
+                    val remainingIdleCount = allSnapshots.size - visibleSnapshots.size
+                    if (remainingIdleCount > 0) {
+                        Text(
+                            text = "+$remainingIdleCount more cataloged models ready",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuotaSnapshotRow(snapshot: ModelQuotaSnapshot) {
+    val rpmText = if (snapshot.rpmLimit == Int.MAX_VALUE) {
+        "${snapshot.rpmUsedLastMinute}/∞ RPM"
+    } else {
+        "${snapshot.rpmUsedLastMinute}/${snapshot.rpmLimit} RPM"
+    }
+    val rpdText = if (snapshot.rpdLimit == Int.MAX_VALUE) {
+        "${snapshot.rpdUsedToday}/∞ RPD"
+    } else {
+        "${snapshot.rpdUsedToday}/${snapshot.rpdLimit} RPD"
+    }
+    val statusText = when {
+        snapshot.permanentlyUnavailable -> snapshot.quotaNote ?: "Unavailable"
+        snapshot.exhaustedForDay -> "Daily limit reached"
+        snapshot.cooldownRemainingMs > 0L -> {
+            val secs = (snapshot.cooldownRemainingMs + 999L) / 1000L
+            "Cooldown ${secs}s"
+        }
+        snapshot.quotaNote != null -> snapshot.quotaNote!!
+        else -> "Ready"
+    }
+    val isWarning = snapshot.permanentlyUnavailable ||
+        snapshot.exhaustedForDay ||
+        snapshot.cooldownRemainingMs > 0L
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = snapshot.modelId,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "$rpmText · $rpdText",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = statusText,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = if (isWarning) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+        )
+    }
+}
+
+@Composable
 private fun ModelConfigurationSection(
     uiState: SettingsUiState,
     viewModel: SettingsViewModel
@@ -374,12 +565,12 @@ private fun ModelConfigurationSection(
             // Iterate over all 6 roles
             for (role in ModelRole.entries) {
                 val currentModel = uiState.modelPerRole[role] ?: DefaultModels.get(role)
-                val catalogModels = viewModel.getCatalogModelsForRole(role)
+                val recommendedModels = viewModel.getRecommendedModelsForRole(role)
 
                 RoleModelSelector(
                     role = role,
                     currentModel = currentModel,
-                    catalogModels = catalogModels,
+                    suggestedModels = recommendedModels,
                     onModelSelected = { newModel -> viewModel.setModelForRole(role, newModel) }
                 )
             }
@@ -392,7 +583,7 @@ private fun ModelConfigurationSection(
 private fun RoleModelSelector(
     role: ModelRole,
     currentModel: String,
-    catalogModels: List<io.github.danprav04.polyglotbooks.core.gemini.ModelItem>,
+    suggestedModels: List<String>,
     onModelSelected: (String) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
@@ -427,6 +618,9 @@ private fun RoleModelSelector(
                     onModelSelected(it)
                 },
                 label = { Text("Model ID") },
+                supportingText = {
+                    Text(text = ModelCatalog.freeTierHint(customInput))
+                },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
                 singleLine = true,
@@ -435,32 +629,28 @@ private fun RoleModelSelector(
                     .fillMaxWidth()
             )
 
-            val suggestedModels = buildList {
-                // Add default
-                add(DefaultModels.get(role))
-                // Add catalog models matching role
-                for (item in catalogModels) {
-                    if (!contains(item.id)) add(item.id)
-                }
-            }
-
             if (suggestedModels.isNotEmpty()) {
                 ExposedDropdownMenu(
                     expanded = expanded,
                     onDismissRequest = { expanded = false }
                 ) {
                     suggestedModels.forEach { modelId ->
+                        val hint = ModelCatalog.freeTierHint(modelId)
+                        val isDefault = modelId == DefaultModels.get(role)
+                        val subtitle = if (isDefault) "Default · $hint" else hint
                         DropdownMenuItem(
                             text = {
                                 Column {
                                     Text(text = modelId, fontWeight = FontWeight.Medium)
-                                    if (modelId == DefaultModels.get(role)) {
-                                        Text(
-                                            text = "Default",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.secondary
-                                        )
-                                    }
+                                    Text(
+                                        text = subtitle,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (isDefault) {
+                                            MaterialTheme.colorScheme.secondary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
                                 }
                             },
                             onClick = {
