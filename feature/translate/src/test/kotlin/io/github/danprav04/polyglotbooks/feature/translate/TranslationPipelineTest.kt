@@ -376,9 +376,20 @@ class TranslationPipelineTest {
         withContext(Dispatchers.Default) {
             firstStopDone.await()
         }
+        // The mutex is released by the real Dispatchers.IO cleanup thread, which re-queues the
+        // follow-up start("de") continuation onto this test scheduler. A single blocking
+        // secondStartDone.await(...) would starve the scheduler (the queued continuation can
+        // never run while the test thread blocks), so poll in short wall-clock slices and pump
+        // the scheduler between them.
+        val deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        var secondSessionStarted = false
+        while (!secondSessionStarted && System.nanoTime() < deadlineNs) {
+            secondSessionStarted = secondStartDone.await(10, TimeUnit.MILLISECONDS)
+            advanceUntilIdle()
+        }
         assertTrue(
             "New session client start() must run after the old stop() cleanup releases clientMutex",
-            secondStartDone.await(10, TimeUnit.SECONDS)
+            secondSessionStarted
         )
         advanceUntilIdle()
 
