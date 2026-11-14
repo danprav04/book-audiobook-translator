@@ -22,7 +22,8 @@ interface ModelCatalogService {
  * Concrete implementation of [ModelCatalogService] using OkHttp.
  */
 class OkHttpModelCatalogService(
-    private val okHttpClient: OkHttpClient = OkHttpClient()
+    private val okHttpClient: OkHttpClient = OkHttpClient(),
+    private val quotaTracker: GeminiQuotaTracker? = null
 ) : ModelCatalogService {
 
     override suspend fun listModels(apiKey: String): ModelListResponse = withContext(Dispatchers.IO) {
@@ -42,7 +43,9 @@ class OkHttpModelCatalogService(
             }
             val bodyString = response.body?.string()
                 ?: throw IOException("Empty response body from models.list")
-            ModelCatalog.parseModelsJson(bodyString)
+            val parsed = ModelCatalog.parseModelsJson(bodyString)
+            quotaTracker?.markCatalogLoadedForKey(trimmedKey, parsed.models)
+            parsed
         }
     }
 }

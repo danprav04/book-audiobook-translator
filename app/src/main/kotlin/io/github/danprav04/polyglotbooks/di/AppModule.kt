@@ -39,6 +39,7 @@ import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.data.security.TinkSecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveSessionFactory
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveTranslateClient
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveSessionFactory
 import io.github.danprav04.polyglotbooks.core.gemini.LiveTranslateClient
@@ -181,20 +182,45 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideModelCatalogService(okHttpClient: OkHttpClient): ModelCatalogService {
-        return OkHttpModelCatalogService(okHttpClient)
+    fun provideGeminiQuotaTracker(): GeminiQuotaTracker {
+        return GeminiQuotaTracker()
     }
 
     @Provides
     @Singleton
-    fun provideInteractionsTtsClient(okHttpClient: OkHttpClient): InteractionsTtsClient {
-        return OkHttpInteractionsTtsClient(okHttpClient)
+    fun provideModelCatalogService(
+        okHttpClient: OkHttpClient,
+        quotaTracker: GeminiQuotaTracker
+    ): ModelCatalogService {
+        return OkHttpModelCatalogService(okHttpClient, quotaTracker)
     }
 
     @Provides
     @Singleton
-    fun provideTextModelClient(okHttpClient: OkHttpClient): TextModelClient {
-        return OkHttpTextModelClient(okHttpClient)
+    fun provideInteractionsTtsClient(
+        okHttpClient: OkHttpClient,
+        quotaTracker: GeminiQuotaTracker,
+        modelCatalogService: ModelCatalogService
+    ): InteractionsTtsClient {
+        return OkHttpInteractionsTtsClient(
+            okHttpClient = okHttpClient,
+            quotaTracker = quotaTracker,
+            modelCatalogService = modelCatalogService
+        )
+    }
+
+    @Provides
+    @Singleton
+    fun provideTextModelClient(
+        okHttpClient: OkHttpClient,
+        quotaTracker: GeminiQuotaTracker,
+        modelCatalogService: ModelCatalogService
+    ): TextModelClient {
+        return OkHttpTextModelClient(
+            okHttpClient = okHttpClient,
+            quotaTracker = quotaTracker,
+            modelCatalogService = modelCatalogService
+        )
     }
 
     @Provides
@@ -207,11 +233,13 @@ object AppModule {
     @Singleton
     fun provideLiveTranslateClient(
         liveSessionFactory: LiveSessionFactory,
-        modelCatalogService: ModelCatalogService
+        modelCatalogService: ModelCatalogService,
+        quotaTracker: GeminiQuotaTracker
     ): LiveTranslateClient {
         return DefaultLiveTranslateClient(
             sessionFactory = liveSessionFactory,
-            modelCatalogService = modelCatalogService
+            modelCatalogService = modelCatalogService,
+            quotaTracker = quotaTracker
         )
     }
 

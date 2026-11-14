@@ -3,7 +3,9 @@ package io.github.danprav04.polyglotbooks.core.gemini
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flow
@@ -13,6 +15,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -62,11 +65,14 @@ class StubInteractionsTtsClient : InteractionsTtsClient {
 
 /**
  * Production OkHttp implementation of [InteractionsTtsClient] calling the Gemini REST
- * `generateContent` endpoint with audio response modality and automatic model fallback.
+ * `generateContent` endpoint with quota-aware TTS model rotation.
  */
 class OkHttpInteractionsTtsClient(
     private val okHttpClient: OkHttpClient = OkHttpClient(),
-    private val baseUrl: String = "https://generativelanguage.googleapis.com"
+    private val baseUrl: String = "https://generativelanguage.googleapis.com",
+    private val quotaTracker: GeminiQuotaTracker = GeminiQuotaTracker(),
+    private val modelCatalogService: ModelCatalogService? = null,
+    private val maxCooldownWaitMs: Long = 8_000L
 ) : InteractionsTtsClient {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -76,23 +82,47 @@ class OkHttpInteractionsTtsClient(
             val trimmedKey = apiKey.trim()
             require(trimmedKey.isNotEmpty()) { "API key must not be blank" }
 
+            ensureCatalogLoaded(trimmedKey)
+
             val primaryModel = request.model
                 .trim()
                 .removePrefix("models/")
                 .ifEmpty { DefaultModels.get(ModelRole.TTS) }
 
-            val modelsToTry = listOf(
-                primaryModel,
-                "gemini-2.5-flash-preview-tts",
-                "gemini-2.0-flash"
-            ).distinct()
-
+            val candidates = quotaTracker.ttsCandidatePool(primaryModel)
+            val estimatedTokens = (request.text.length / 4).coerceAtLeast(50)
             val payload = buildRequestJson(request)
             val cleanBase = baseUrl.trimEnd('/')
             val mediaType = "application/json; charset=utf-8".toMediaType()
-            var lastFallbackError: IOException? = null
 
-            for (modelId in modelsToTry) {
+            val attemptedModels = mutableListOf<String>()
+            val triedThisPass = mutableSetOf<String>()
+            var didCooldownWait = false
+            var lastErrorBody = ""
+
+            while (true) {
+                val remainingCandidates = candidates.filterNot { it in triedThisPass }
+                val modelId = quotaTracker.selectNextReadyModel(remainingCandidates, estimatedTokens)
+
+                if (modelId == null) {
+                    val shortestCooldown = quotaTracker.shortestCooldownMs(candidates)
+                    if (!didCooldownWait && shortestCooldown != null && shortestCooldown <= maxCooldownWaitMs) {
+                        didCooldownWait = true
+                        delay(shortestCooldown + 100L)
+                        triedThisPass.clear()
+                        continue
+                    }
+                    val failed = if (attemptedModels.isNotEmpty()) attemptedModels else candidates
+                    throw QuotaExhaustedException(
+                        message = quotaTracker.formatConciseError(failed, shortestCooldown, lastErrorBody),
+                        retryAfterMs = shortestCooldown,
+                        attemptedModels = failed.distinct()
+                    )
+                }
+
+                triedThisPass.add(modelId)
+                attemptedModels.add(modelId)
+
                 val url = "$cleanBase/v1beta/models/$modelId:generateContent"
                 val httpRequest = Request.Builder()
                     .url(url)
@@ -100,23 +130,32 @@ class OkHttpInteractionsTtsClient(
                     .post(payload.toRequestBody(mediaType))
                     .build()
 
+                quotaTracker.recordRequestStarted(modelId, estimatedTokens)
                 okHttpClient.newCall(httpRequest).execute().use { response ->
                     val responseBody = response.body?.string().orEmpty()
                     if (response.isSuccessful) {
-                        return@withContext extractAudioBytes(responseBody)
+                        val (audioBytes, totalTokens) = extractAudioBytesAndTokens(responseBody)
+                        quotaTracker.recordSuccess(modelId, totalTokens)
+                        return@withContext audioBytes
                     }
-                    val err = IOException(
-                        "Gemini TTS API error (HTTP ${response.code}) for model $modelId: $responseBody"
+
+                    if (response.code == 401 || response.code == 403) {
+                        throw IOException(
+                            "Gemini API authentication error (HTTP ${response.code}). Check your API key in Settings."
+                        )
+                    }
+
+                    lastErrorBody = responseBody
+                    quotaTracker.recordHttpError(
+                        modelId = modelId,
+                        httpCode = response.code,
+                        responseBody = responseBody,
+                        retryAfterHeader = response.header("Retry-After")
                     )
-                    if (response.code == 404 || response.code == 400) {
-                        lastFallbackError = err
-                    } else {
-                        throw err
-                    }
                 }
             }
-
-            throw lastFallbackError ?: IOException("Gemini TTS API failed for all candidate models")
+            @Suppress("UNREACHABLE_CODE")
+            throw IOException("Unreachable")
         }
 
     override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
@@ -132,6 +171,18 @@ class OkHttpInteractionsTtsClient(
                 )
             )
             offset = end
+        }
+    }
+
+    private suspend fun ensureCatalogLoaded(apiKey: String) {
+        if (modelCatalogService == null || quotaTracker.hasRegisteredCatalogForKey(apiKey)) return
+        try {
+            val catalog = modelCatalogService.listModels(apiKey)
+            quotaTracker.markCatalogLoadedForKey(apiKey, catalog.models)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Throwable) {
+            quotaTracker.markCatalogLoadedForKey(apiKey, emptyList())
         }
     }
 
@@ -181,7 +232,7 @@ class OkHttpInteractionsTtsClient(
         }
     }
 
-    private fun extractAudioBytes(responseBody: String): ByteArray {
+    private fun extractAudioBytesAndTokens(responseBody: String): Pair<ByteArray, Int> {
         val root = try {
             json.parseToJsonElement(responseBody).jsonObject
         } catch (e: Exception) {
@@ -216,7 +267,14 @@ class OkHttpInteractionsTtsClient(
         if (bytes.isEmpty()) {
             throw IOException("No inline audio data returned from Gemini TTS API")
         }
-        return bytes
+        val totalTokens = root["usageMetadata"]
+            ?.jsonObject
+            ?.get("totalTokenCount")
+            ?.jsonPrimitive
+            ?.intOrNull
+            ?: 0
+
+        return bytes to totalTokens
     }
 
     private fun stripWavHeaderIfPresent(bytes: ByteArray): ByteArray {

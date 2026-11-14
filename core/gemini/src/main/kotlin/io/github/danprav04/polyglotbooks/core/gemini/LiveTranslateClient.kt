@@ -56,7 +56,8 @@ interface LiveTranslateClient {
 class DefaultLiveTranslateClient(
     private val sessionFactory: LiveSessionFactory = DefaultLiveSessionFactory(),
     dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
-    private val modelCatalogService: ModelCatalogService? = null
+    private val modelCatalogService: ModelCatalogService? = null,
+    private val quotaTracker: GeminiQuotaTracker? = null
 ) : LiveTranslateClient {
 
     private enum class SetupMode {
@@ -213,6 +214,9 @@ class DefaultLiveTranslateClient(
                         else -> {
                             val output = parseServerMessage(serverMsg)
                             if (output != null) {
+                                if (!ctx.hasReceivedContent) {
+                                    quotaTracker?.recordSuccess(ctx.currentModel)
+                                }
                                 ctx.hasReceivedContent = true
                                 hasReceivedContent = true
                                 _translationStream.emit(output)
@@ -256,6 +260,7 @@ class DefaultLiveTranslateClient(
         }
 
         try {
+            quotaTracker?.recordRequestStarted(ctx.currentModel)
             session.connect(ctx.apiKey, setup)
             synchronized(stateLock) {
                 if (sessionGeneration.get() == ctx.generation && liveSession === session) {
@@ -290,6 +295,18 @@ class DefaultLiveTranslateClient(
         throwable: Throwable?
     ) {
         if (sessionGeneration.get() != ctx.generation) return
+
+        val errCode = serverError?.code ?: when {
+            isModelUnsupportedOrNotFound(serverError, throwable) -> 404
+            isAuthOrQuotaError(serverError, throwable) -> 429
+            isInvalidArgumentOrSetupError(serverError, throwable) -> 400
+            else -> 503
+        }
+        quotaTracker?.recordHttpError(
+            modelId = ctx.currentModel,
+            httpCode = errCode,
+            responseBody = serverError?.message ?: throwable?.message.orEmpty()
+        )
 
         if (!ctx.hasReceivedContent) {
             val isModelError = isModelUnsupportedOrNotFound(serverError, throwable)
