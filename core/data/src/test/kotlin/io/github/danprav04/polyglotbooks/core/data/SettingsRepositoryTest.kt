@@ -13,6 +13,7 @@ import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -206,5 +207,40 @@ class SettingsRepositoryTest {
 
             cancelAndIgnoreRemainingEvents()
         }
+    }
+
+    @Test
+    fun testReaderPreferencesPersistAndClamp() = runTest {
+        assertEquals("GEMINI_FLASH_TTS", repository.readerNarrationEngine.first())
+        assertFalse(repository.readerReadTranslated.first())
+        assertEquals(1.0f, repository.readerNarrationSpeed.first(), 0.001f)
+        assertEquals("LIGHT", repository.readerTheme.first())
+        assertEquals(18, repository.readerFontSizeSp.first())
+        assertEquals("Serif", repository.readerFontFamily.first())
+
+        repository.setReaderNarrationEngine("GEMINI_LIVE")
+        repository.setReaderReadTranslated(true)
+        repository.setReaderNarrationSpeed(1.5f)
+        repository.setReaderTheme("DARK")
+        repository.setReaderFontSizeSp(24)
+        repository.setReaderFontFamily("Sans-Serif")
+
+        assertEquals("GEMINI_LIVE", repository.readerNarrationEngine.first())
+        assertTrue(repository.readerReadTranslated.first())
+        assertEquals(1.5f, repository.readerNarrationSpeed.first(), 0.001f)
+        assertEquals("DARK", repository.readerTheme.first())
+        assertEquals(24, repository.readerFontSizeSp.first())
+        assertEquals("Sans-Serif", repository.readerFontFamily.first())
+
+        // Verify clamping bounds
+        repository.setReaderNarrationSpeed(5.0f)
+        assertEquals(2.5f, repository.readerNarrationSpeed.first(), 0.001f)
+        repository.setReaderNarrationSpeed(0.1f)
+        assertEquals(0.5f, repository.readerNarrationSpeed.first(), 0.001f)
+
+        repository.setReaderFontSizeSp(50)
+        assertEquals(32, repository.readerFontSizeSp.first())
+        repository.setReaderFontSizeSp(6)
+        assertEquals(12, repository.readerFontSizeSp.first())
     }
 }

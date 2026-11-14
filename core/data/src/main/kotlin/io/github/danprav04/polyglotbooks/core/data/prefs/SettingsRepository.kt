@@ -3,6 +3,7 @@ package io.github.danprav04.polyglotbooks.core.data.prefs
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 
 /**
  * Usage stats data model for feature tracking.
@@ -29,6 +30,19 @@ interface SettingsRepository {
     val featureUsageStats: Flow<FeatureUsageStats>
     val lastOpenedBookId: Flow<String?>
 
+    val readerNarrationEngine: Flow<String>
+        get() = flowOf("GEMINI_FLASH_TTS")
+    val readerReadTranslated: Flow<Boolean>
+        get() = flowOf(false)
+    val readerNarrationSpeed: Flow<Float>
+        get() = flowOf(1.0f)
+    val readerTheme: Flow<String>
+        get() = flowOf("LIGHT")
+    val readerFontSizeSp: Flow<Int>
+        get() = flowOf(18)
+    val readerFontFamily: Flow<String>
+        get() = flowOf("Serif")
+
     suspend fun saveApiKey(key: String)
     suspend fun clearApiKey()
     suspend fun setModel(role: ModelRole, modelId: String)
@@ -47,5 +61,12 @@ interface SettingsRepository {
         textTranslationTokensDelta: Long = 0L
     )
     suspend fun resetUsageStats()
+
+    suspend fun setReaderNarrationEngine(engineName: String) {}
+    suspend fun setReaderReadTranslated(readTranslated: Boolean) {}
+    suspend fun setReaderNarrationSpeed(speed: Float) {}
+    suspend fun setReaderTheme(themeName: String) {}
+    suspend fun setReaderFontSizeSp(sizeSp: Int) {}
+    suspend fun setReaderFontFamily(family: String) {}
 }
 

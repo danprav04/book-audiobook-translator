@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.doublePreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -68,6 +69,30 @@ class DataStoreSettingsRepository(
 
     override val lastOpenedBookId: Flow<String?> = dataStore.data.map { preferences ->
         preferences[KEY_LAST_OPENED_BOOK_ID]?.takeIf { it.isNotBlank() }
+    }
+
+    override val readerNarrationEngine: Flow<String> = dataStore.data.map { preferences ->
+        preferences[KEY_READER_NARRATION_ENGINE]?.takeIf { it.isNotBlank() } ?: DEFAULT_READER_NARRATION_ENGINE
+    }
+
+    override val readerReadTranslated: Flow<Boolean> = dataStore.data.map { preferences ->
+        preferences[KEY_READER_READ_TRANSLATED] ?: false
+    }
+
+    override val readerNarrationSpeed: Flow<Float> = dataStore.data.map { preferences ->
+        (preferences[KEY_READER_NARRATION_SPEED] ?: DEFAULT_READER_NARRATION_SPEED).coerceIn(0.5f, 2.5f)
+    }
+
+    override val readerTheme: Flow<String> = dataStore.data.map { preferences ->
+        preferences[KEY_READER_THEME]?.takeIf { it.isNotBlank() } ?: DEFAULT_READER_THEME
+    }
+
+    override val readerFontSizeSp: Flow<Int> = dataStore.data.map { preferences ->
+        (preferences[KEY_READER_FONT_SIZE_SP] ?: DEFAULT_READER_FONT_SIZE_SP).coerceIn(12, 32)
+    }
+
+    override val readerFontFamily: Flow<String> = dataStore.data.map { preferences ->
+        preferences[KEY_READER_FONT_FAMILY]?.takeIf { it.isNotBlank() } ?: DEFAULT_READER_FONT_FAMILY
     }
 
     override suspend fun saveApiKey(key: String) {
@@ -166,6 +191,48 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override suspend fun setReaderNarrationEngine(engineName: String) {
+        val trimmed = engineName.trim()
+        if (trimmed.isEmpty()) return
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_NARRATION_ENGINE] = trimmed
+        }
+    }
+
+    override suspend fun setReaderReadTranslated(readTranslated: Boolean) {
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_READ_TRANSLATED] = readTranslated
+        }
+    }
+
+    override suspend fun setReaderNarrationSpeed(speed: Float) {
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_NARRATION_SPEED] = speed.coerceIn(0.5f, 2.5f)
+        }
+    }
+
+    override suspend fun setReaderTheme(themeName: String) {
+        val trimmed = themeName.trim()
+        if (trimmed.isEmpty()) return
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_THEME] = trimmed
+        }
+    }
+
+    override suspend fun setReaderFontSizeSp(sizeSp: Int) {
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_FONT_SIZE_SP] = sizeSp.coerceIn(12, 32)
+        }
+    }
+
+    override suspend fun setReaderFontFamily(family: String) {
+        val trimmed = family.trim()
+        if (trimmed.isEmpty()) return
+        dataStore.edit { preferences ->
+            preferences[KEY_READER_FONT_FAMILY] = trimmed
+        }
+    }
+
     companion object {
         val KEY_TARGET_LANGUAGE = stringPreferencesKey("target_language_code")
         val KEY_CACHE_LIMIT_BYTES = longPreferencesKey("cache_limit_bytes")
@@ -173,6 +240,13 @@ class DataStoreSettingsRepository(
         val KEY_ECHO_TARGET_LANGUAGE = booleanPreferencesKey("echo_target_language")
         val KEY_IS_FREE_TIER = booleanPreferencesKey("is_free_tier")
         val KEY_LAST_OPENED_BOOK_ID = stringPreferencesKey("last_opened_book_id")
+
+        val KEY_READER_NARRATION_ENGINE = stringPreferencesKey("reader_narration_engine")
+        val KEY_READER_READ_TRANSLATED = booleanPreferencesKey("reader_read_translated")
+        val KEY_READER_NARRATION_SPEED = floatPreferencesKey("reader_narration_speed")
+        val KEY_READER_THEME = stringPreferencesKey("reader_theme")
+        val KEY_READER_FONT_SIZE_SP = intPreferencesKey("reader_font_size_sp")
+        val KEY_READER_FONT_FAMILY = stringPreferencesKey("reader_font_family")
 
         val KEY_USAGE_LIVE_TRANSLATE = doublePreferencesKey("usage_live_translate_minutes")
         val KEY_USAGE_TTS = doublePreferencesKey("usage_tts_minutes")
@@ -182,6 +256,11 @@ class DataStoreSettingsRepository(
 
         const val DEFAULT_CACHE_LIMIT_BYTES: Long = 1024L * 1024L * 1024L // 1 GB
         const val DEFAULT_DUCK_LEVEL: Float = 0.15f // 15% volume
+        const val DEFAULT_READER_NARRATION_ENGINE: String = "GEMINI_FLASH_TTS"
+        const val DEFAULT_READER_NARRATION_SPEED: Float = 1.0f
+        const val DEFAULT_READER_THEME: String = "LIGHT"
+        const val DEFAULT_READER_FONT_SIZE_SP: Int = 18
+        const val DEFAULT_READER_FONT_FAMILY: String = "Serif"
 
         fun modelRoleKey(role: ModelRole) = stringPreferencesKey("model_role_${role.name}")
     }
