@@ -39,10 +39,14 @@ import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.data.security.TinkSecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveSessionFactory
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveTranslateClient
+import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveSessionFactory
 import io.github.danprav04.polyglotbooks.core.gemini.LiveTranslateClient
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
+import io.github.danprav04.polyglotbooks.core.gemini.OkHttpInteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.OkHttpModelCatalogService
+import io.github.danprav04.polyglotbooks.core.gemini.OkHttpTextModelClient
+import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.playback.ApplicationScope
 import io.github.danprav04.polyglotbooks.core.playback.LiveTranslationBackend
@@ -179,6 +183,18 @@ object AppModule {
     @Singleton
     fun provideModelCatalogService(okHttpClient: OkHttpClient): ModelCatalogService {
         return OkHttpModelCatalogService(okHttpClient)
+    }
+
+    @Provides
+    @Singleton
+    fun provideInteractionsTtsClient(okHttpClient: OkHttpClient): InteractionsTtsClient {
+        return OkHttpInteractionsTtsClient(okHttpClient)
+    }
+
+    @Provides
+    @Singleton
+    fun provideTextModelClient(okHttpClient: OkHttpClient): TextModelClient {
+        return OkHttpTextModelClient(okHttpClient)
     }
 
     @Provides
