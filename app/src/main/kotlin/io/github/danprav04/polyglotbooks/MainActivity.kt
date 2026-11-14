@@ -9,12 +9,14 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.OptIn
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import dagger.hilt.android.AndroidEntryPoint
 import io.github.danprav04.polyglotbooks.core.playback.PlaybackNotificationManager
+import androidx.media3.common.util.UnstableApi
 import io.github.danprav04.polyglotbooks.nav.AppNavHost
 import io.github.danprav04.polyglotbooks.nav.NotificationNavTarget
 import io.github.danprav04.polyglotbooks.ui.theme.PolyglotTheme
@@ -54,6 +56,7 @@ class MainActivity : ComponentActivity() {
         extractNotificationNavTarget(intent)?.let { pendingNavTarget = it }
     }
 
+    @OptIn(UnstableApi::class)
     private fun extractNotificationNavTarget(intent: Intent?): NotificationNavTarget? {
         val bookId = intent?.getStringExtra(PlaybackNotificationManager.EXTRA_NAV_BOOK_ID)
             ?.takeIf { it.isNotBlank() }
