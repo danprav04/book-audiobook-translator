@@ -12,7 +12,7 @@ class ModelCatalogTest {
     private fun loadFixture(filename: String): String {
         val stream = javaClass.classLoader?.getResourceAsStream("fixtures/$filename")
             ?: throw IllegalArgumentException("Fixture not found: $filename")
-        return InputStreamReader(stream).readText()
+        return InputStreamReader(stream, Charsets.UTF_8).readText()
     }
 
     @Test
