@@ -1,5 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.narration
 
+import io.github.danprav04.polyglotbooks.core.gemini.BatchBudget
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
@@ -34,12 +36,13 @@ data class TranslationResult(
 
 /**
  * ChapterTranslator handles Phase 6 Ebook Translation, translating paragraphs and narration lines
- * into a target language while preserving metadata.
+ * into a target language using quota-aware adaptive batching and source-text deduplication.
  */
 class ChapterTranslator(
     private val textModelClient: TextModelClient? = null,
     private val apiKeyProvider: (suspend () -> String?)? = null,
-    private val modelProvider: (suspend () -> String)? = null
+    private val modelProvider: (suspend () -> String)? = null,
+    private val quotaTracker: GeminiQuotaTracker? = null
 ) {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -49,7 +52,8 @@ class ChapterTranslator(
     suspend fun translateChapter(
         paragraphs: Map<String, String>,
         lines: List<NarrationLine>,
-        targetLanguageCode: String
+        targetLanguageCode: String,
+        onBatchTranslated: (suspend (Map<String, String>) -> Unit)? = null
     ): TranslationResult {
         val translatedLines = lines.map { line ->
             line.copy(
@@ -70,6 +74,7 @@ class ChapterTranslator(
             val translatedParas = paragraphs.mapValues { (_, text) ->
                 if (targetLanguageCode == "es") "[$text]" else "Translated($targetLanguageCode): $text"
             }
+            onBatchTranslated?.invoke(translatedParas)
             return TranslationResult(
                 bilingualParagraphs = translatedParas,
                 translatedLines = translatedLines
@@ -78,7 +83,7 @@ class ChapterTranslator(
 
         val language = LanguageCode.fromCode(targetLanguageCode)
         val languageLabel = "${language.displayName} (${language.code})"
-        val model = modelProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
+        val primaryModel = modelProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
             ?: DefaultModels.get(ModelRole.TEXT_TRANSLATION)
 
         val systemInstruction = "You are a literary translator. Translate each string in the input " +
@@ -86,27 +91,48 @@ class ChapterTranslator(
             "Return ONLY a JSON array of translated strings matching the exact length and order of the input array."
 
         val translatedParas = LinkedHashMap<String, String>(paragraphs.size)
-        val entries = paragraphs.entries.toList()
+        val uniqueGroups = LinkedHashMap<String, MutableList<String>>()
+        val blankBatch = LinkedHashMap<String, String>()
 
-        for (batch in entries.chunked(BATCH_SIZE)) {
-            val sourceTexts = batch.map { it.value }
-            val prompt = "Translate the following JSON array of ${sourceTexts.size} paragraphs into $languageLabel:\n" +
-                json.encodeToString(sourceTexts)
+        for ((key, rawText) in paragraphs) {
+            if (rawText.isBlank()) {
+                translatedParas[key] = rawText
+                blankBatch[key] = rawText
+            } else {
+                uniqueGroups.getOrPut(rawText) { mutableListOf() }.add(key)
+            }
+        }
+        if (blankBatch.isNotEmpty()) {
+            onBatchTranslated?.invoke(blankBatch)
+        }
 
-            val rawResponse = textModelClient.generateContent(
+        val uniqueSources = uniqueGroups.keys.toList()
+        var cursor = 0
+        while (cursor < uniqueSources.size) {
+            val budget = currentBatchBudget(primaryModel)
+            val batchSources = takeAdaptiveBatch(uniqueSources, cursor, budget)
+            cursor += batchSources.size
+
+            val translatedBatch = translateBatchWithSplitFallback(
                 apiKey = apiKey,
-                prompt = prompt,
+                sourceTexts = batchSources,
+                languageLabel = languageLabel,
                 systemInstruction = systemInstruction,
-                responseJsonSchema = TRANSLATION_ARRAY_SCHEMA,
-                model = model
+                model = primaryModel
             )
 
-            val parsedTranslations = parseTranslatedArray(rawResponse)
-            for (index in batch.indices) {
-                val key = batch[index].key
-                val translated = parsedTranslations.getOrNull(index)?.takeIf { it.isNotBlank() }
-                    ?: batch[index].value
-                translatedParas[key] = translated
+            val batchResult = LinkedHashMap<String, String>(batchSources.size)
+            for (i in batchSources.indices) {
+                val src = batchSources[i]
+                val translated = translatedBatch.getOrNull(i)?.takeIf { it.isNotBlank() } ?: src
+                val keysForSource = uniqueGroups[src].orEmpty()
+                for (key in keysForSource) {
+                    translatedParas[key] = translated
+                    batchResult[key] = translated
+                }
+            }
+            if (batchResult.isNotEmpty()) {
+                onBatchTranslated?.invoke(batchResult)
             }
         }
 
@@ -116,6 +142,83 @@ class ChapterTranslator(
         )
     }
 
+    private fun currentBatchBudget(primaryModel: String): BatchBudget {
+        if (quotaTracker == null) {
+            return BatchBudget(
+                maxChars = DEFAULT_BATCH_CHARS,
+                maxItems = DEFAULT_BATCH_ITEMS,
+                targetModel = primaryModel
+            )
+        }
+        val candidates = quotaTracker.textCandidatePool(primaryModel)
+        return quotaTracker.recommendedBatchBudget(candidates)
+    }
+
+    private fun takeAdaptiveBatch(
+        sources: List<String>,
+        startIndex: Int,
+        budget: BatchBudget
+    ): List<String> {
+        val batch = mutableListOf<String>()
+        var chars = 0
+        var idx = startIndex
+        while (idx < sources.size && batch.size < budget.maxItems) {
+            val next = sources[idx]
+            if (batch.isNotEmpty() && chars + next.length > budget.maxChars) {
+                break
+            }
+            batch.add(next)
+            chars += next.length
+            idx++
+        }
+        return batch
+    }
+
+    private suspend fun translateBatchWithSplitFallback(
+        apiKey: String,
+        sourceTexts: List<String>,
+        languageLabel: String,
+        systemInstruction: String,
+        model: String
+    ): List<String> {
+        val prompt = "Translate the following JSON array of ${sourceTexts.size} paragraphs into $languageLabel:\n" +
+            json.encodeToString(sourceTexts)
+
+        val rawResponse = textModelClient!!.generateContent(
+            apiKey = apiKey,
+            prompt = prompt,
+            systemInstruction = systemInstruction,
+            responseJsonSchema = TRANSLATION_ARRAY_SCHEMA,
+            model = model
+        )
+
+        val parsed = runCatching { parseTranslatedArray(rawResponse) }.getOrNull()
+        if (parsed != null && parsed.size >= sourceTexts.size) {
+            return parsed.take(sourceTexts.size)
+        }
+
+        if (sourceTexts.size > SPLIT_THRESHOLD) {
+            val mid = sourceTexts.size / 2
+            val left = translateBatchWithSplitFallback(
+                apiKey = apiKey,
+                sourceTexts = sourceTexts.subList(0, mid),
+                languageLabel = languageLabel,
+                systemInstruction = systemInstruction,
+                model = model
+            )
+            val right = translateBatchWithSplitFallback(
+                apiKey = apiKey,
+                sourceTexts = sourceTexts.subList(mid, sourceTexts.size),
+                languageLabel = languageLabel,
+                systemInstruction = systemInstruction,
+                model = model
+            )
+            return left + right
+        }
+
+        return parsed ?: sourceTexts
+    }
+
     private fun parseTranslatedArray(rawResponse: String): List<String> {
         val cleaned = rawResponse.trim()
             .removePrefix("```json")
@@ -123,7 +226,18 @@ class ChapterTranslator(
             .removeSuffix("```")
             .trim()
 
-        val element = json.parseToJsonElement(cleaned)
+        val element = try {
+            json.parseToJsonElement(cleaned)
+        } catch (e: Exception) {
+            val start = cleaned.indexOf('[')
+            val end = cleaned.lastIndexOf(']')
+            if (start >= 0 && end > start) {
+                json.parseToJsonElement(cleaned.substring(start, end + 1))
+            } else {
+                throw e
+            }
+        }
+
         val arrayElement = when (element) {
             is JsonArray -> element
             is JsonObject -> {
@@ -141,7 +255,9 @@ class ChapterTranslator(
     }
 
     private companion object {
-        const val BATCH_SIZE = 25
+        const val DEFAULT_BATCH_CHARS = 12_000
+        const val DEFAULT_BATCH_ITEMS = 80
+        const val SPLIT_THRESHOLD = 12
         const val TRANSLATION_ARRAY_SCHEMA = """{"type":"array","items":{"type":"string"}}"""
     }
 }

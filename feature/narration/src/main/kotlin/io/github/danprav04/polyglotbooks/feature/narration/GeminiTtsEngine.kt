@@ -1,8 +1,11 @@
 package io.github.danprav04.polyglotbooks.feature.narration
 
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
+import io.github.danprav04.polyglotbooks.core.gemini.QuotaExhaustedException
 import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.flow.Flow
@@ -16,7 +19,8 @@ import kotlinx.coroutines.flow.flow
 class GeminiTtsEngine(
     private val ttsClient: InteractionsTtsClient? = null,
     private val apiKeyProvider: (suspend () -> String?)? = null,
-    private val modelProvider: (suspend () -> String)? = null
+    private val modelProvider: (suspend () -> String)? = null,
+    private val quotaTracker: GeminiQuotaTracker? = null
 ) : NarrationEngine {
     override val id: EngineId = EngineId.GEMINI_TTS
     override val capabilities: EngineCapabilities = EngineCapabilities(
@@ -48,8 +52,17 @@ class GeminiTtsEngine(
         val model = modelProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
             ?: DefaultModels.get(ModelRole.TTS)
 
+        if (quotaTracker != null && quotaTracker.isTtsQuotaLikelyExhausted()) {
+            val pool = quotaTracker.ttsCandidatePool(model)
+            throw QuotaExhaustedException(
+                message = "Free-tier TTS quota limit reached for ${pool.joinToString(", ")}. Switch to Gemini Live or try again later.",
+                retryAfterMs = quotaTracker.shortestCooldownMs(pool),
+                attemptedModels = pool
+            )
+        }
+
         val ttsRequest = TtsRequest(
-            text = request.text,
+            text = formatTextForLanguage(request.text, request.languageCode),
             voiceName = request.voiceId.takeIf { it.isNotBlank() },
             style = request.style,
             model = model
@@ -78,6 +91,15 @@ class GeminiTtsEngine(
         } else {
             emitAll(synthesize(turn1))
             emitAll(synthesize(turn2))
+        }
+    }
+
+    internal companion object {
+        internal fun formatTextForLanguage(text: String, languageCode: String?): String {
+            val code = languageCode?.trim()?.takeIf { it.isNotEmpty() } ?: return text
+            val language = LanguageCode.fromCode(code)
+            val label = "${language.displayName} (${language.code})"
+            return "Read aloud verbatim in $label without translating it or adding commentary:\n$text"
         }
     }
 }

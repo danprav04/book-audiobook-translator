@@ -33,7 +33,8 @@ data class SynthesisRequest(
     val text: String,
     val voiceId: String,
     val style: String? = null,
-    val speed: Float = 1.0f
+    val speed: Float = 1.0f,
+    val languageCode: String? = null
 )
 
 /**

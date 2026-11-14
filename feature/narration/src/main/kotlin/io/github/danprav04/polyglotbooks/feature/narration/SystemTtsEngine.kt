@@ -15,6 +15,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.IOException
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
@@ -67,6 +68,7 @@ class SystemTtsEngine(
 
         try {
             withContext(Dispatchers.Main) {
+                applyLanguage(tts, request.languageCode)
                 tts.setSpeechRate(request.speed.coerceIn(0.25f, 4.0f))
                 val result = tts.synthesizeToFile(request.text, Bundle(), tempFile, utteranceId)
                 if (result != TextToSpeech.SUCCESS) {
@@ -164,11 +166,54 @@ class SystemTtsEngine(
         }
     }
 
+    private fun applyLanguage(tts: TextToSpeech, languageCode: String?) {
+        try {
+            if (languageCode.isNullOrBlank()) {
+                val defaultLocale = Locale.getDefault()
+                if (tts.isLanguageAvailable(defaultLocale) >= TextToSpeech.LANG_AVAILABLE) {
+                    tts.language = defaultLocale
+                }
+                return
+            }
+            for (tag in candidateLanguageTags(languageCode)) {
+                val locale = Locale.forLanguageTag(tag)
+                if (locale.language.isNotBlank() &&
+                    tts.isLanguageAvailable(locale) >= TextToSpeech.LANG_AVAILABLE
+                ) {
+                    tts.language = locale
+                    return
+                }
+            }
+        } catch (_: Throwable) {
+            // Graceful fallback to current/default TTS language if engine query fails
+        }
+    }
+
     internal companion object {
         const val TARGET_SAMPLE_RATE = 24000
         private const val STREAM_CHUNK_BYTES = 8192
         private const val INIT_TIMEOUT_MS = 10_000L
         private const val SYNTHESIS_TIMEOUT_MS = 30_000L
+
+        internal fun candidateLanguageTags(languageCode: String): List<String> {
+            val cleaned = languageCode.trim().replace('_', '-')
+            if (cleaned.isEmpty()) return emptyList()
+            val lower = cleaned.lowercase()
+            val mapped = when (lower) {
+                "zh-hans", "zh-cn" -> listOf("zh-CN", "zh")
+                "zh-hant", "zh-tw" -> listOf("zh-TW", "zh")
+                "fil" -> listOf("fil-PH", "tl-PH", "tl", "fil")
+                "nb" -> listOf("nb-NO", "no-NO", "no", "nb")
+                "he", "iw" -> listOf("he-IL", "iw-IL", "he", "iw")
+                "pt-br" -> listOf("pt-BR", "pt")
+                "pt-pt" -> listOf("pt-PT", "pt")
+                else -> {
+                    val base = cleaned.substringBefore('-')
+                    if (base != cleaned) listOf(cleaned, base) else listOf(cleaned)
+                }
+            }
+            return mapped.distinct()
+        }
 
         internal fun parseAndResampleWav(wavBytes: ByteArray, targetSampleRate: Int = TARGET_SAMPLE_RATE): ByteArray {
             if (wavBytes.size < 44) {

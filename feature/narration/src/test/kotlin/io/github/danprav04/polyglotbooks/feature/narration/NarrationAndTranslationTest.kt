@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.narration
 
 import io.github.danprav04.polyglotbooks.core.gemini.Blob
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveClientMessage
 import io.github.danprav04.polyglotbooks.core.gemini.LiveErrorData
@@ -24,6 +25,8 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -171,6 +174,72 @@ class NarrationAndTranslationTest {
     }
 
     @Test
+    fun `ChapterTranslator adaptive batching deduplicates inputs and shrinks budget for Gemma 4`() = runTest {
+        val json = Json { ignoreUnknownKeys = true }
+        var callCount = 0
+        val callSizes = mutableListOf<Int>()
+
+        val echoTranslatorClient = object : TextModelClient {
+            override suspend fun generateContent(
+                apiKey: String,
+                prompt: String,
+                systemInstruction: String?,
+                responseJsonSchema: String?,
+                model: String
+            ): String {
+                callCount++
+                val start = prompt.indexOf('[')
+                val end = prompt.lastIndexOf(']')
+                val inputArray = json.decodeFromString<List<String>>(prompt.substring(start, end + 1))
+                callSizes.add(inputArray.size)
+                return json.encodeToString(inputArray.map { "ES:$it" })
+            }
+        }
+
+        val tracker = GeminiQuotaTracker()
+        val flashTranslator = ChapterTranslator(
+            textModelClient = echoTranslatorClient,
+            apiKeyProvider = { "key" },
+            modelProvider = { "gemini-3.5-flash-lite" },
+            quotaTracker = tracker
+        )
+
+        // 30 paragraphs where 10 are duplicates -> only 20 unique strings, fits in 1 Flash-Lite batch!
+        val paragraphs = linkedMapOf<String, String>()
+        for (i in 0 until 30) {
+            val text = if (i >= 20) "Unique paragraph ${i - 20}" else "Unique paragraph $i"
+            paragraphs["p$i"] = text
+        }
+        val batchCallbacks = mutableListOf<Map<String, String>>()
+        val res = flashTranslator.translateChapter(
+            paragraphs = paragraphs,
+            lines = emptyList(),
+            targetLanguageCode = "es",
+            onBatchTranslated = { batchCallbacks.add(it) }
+        )
+
+        assertEquals(1, callCount)
+        assertEquals(listOf(20), callSizes)
+        assertEquals(1, batchCallbacks.size)
+        assertEquals("ES:Unique paragraph 0", res.bilingualParagraphs["p0"])
+        assertEquals("ES:Unique paragraph 0", res.bilingualParagraphs["p20"])
+
+        // Cool down all Flash models so Gemma 4 (3200 chars / 35 items) becomes active
+        callCount = 0
+        callSizes.clear()
+        listOf("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-2.5-flash").forEach {
+            tracker.recordHttpError(it, 429, "Please retry in 60s")
+        }
+        val largeParas = linkedMapOf<String, String>()
+        for (i in 0 until 10) {
+            largeParas["k$i"] = "Paragraph $i " + "x".repeat(900) // ~912 chars each -> ~4 items per 3200-char Gemma batch
+        }
+        flashTranslator.translateChapter(largeParas, emptyList(), "es")
+        assertTrue("Expected multiple smaller Gemma batches, got $callCount", callCount >= 3)
+        assertTrue(callSizes.all { it <= 4 })
+    }
+
+    @Test
     fun `GeminiTtsEngine streams audio from InteractionsTtsClient and rejects missing API key`() = runTest {
         var capturedRequest: TtsRequest? = null
         val expectedBytes1 = byteArrayOf(1, 2, 3, 4)
@@ -219,42 +288,11 @@ class NarrationAndTranslationTest {
     }
 
     @Test
-    fun `GeminiLiveEngine collects audio and transcription from LiveSession and falls back on error`() = runTest {
+    fun `GeminiLiveEngine collects audio and transcription from LiveSession and rotates across Live models`() = runTest {
         val rawAudio = byteArrayOf(10, 20, 30, 40)
         val base64Audio = Base64.getEncoder().encodeToString(rawAudio)
-        val incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
-        var disconnected = false
-
-        val fakeSession = object : LiveSession {
-            override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
-            override var isConnected: Boolean = false
-                private set
-
-            override suspend fun connect(apiKey: String, setup: SetupConfig) {
-                isConnected = true
-            }
-
-            override suspend fun send(message: LiveClientMessage) {
-                incoming.emit(
-                    LiveServerMessage.ServerContentMessage(
-                        ServerContentData(
-                            modelTurn = ModelTurn(
-                                parts = listOf(
-                                    Part(inlineData = Blob("audio/pcm;rate=24000", base64Audio))
-                                )
-                            ),
-                            outputTranscription = TranscriptionData("Call me Ishmael"),
-                            turnComplete = true
-                        )
-                    )
-                )
-            }
-
-            override suspend fun disconnect() {
-                isConnected = false
-                disconnected = true
-            }
-        }
+        val attemptedModels = mutableListOf<String>()
+        val tracker = GeminiQuotaTracker()
 
         val fallbackMarker = byteArrayOf(77, 88)
         val fallbackEngine = object : NarrationEngine {
@@ -265,41 +303,82 @@ class NarrationAndTranslationTest {
                 flowOf(PcmChunk(fallbackMarker, 24000, 1))
         }
 
-        val liveEngine = GeminiLiveEngine(
+        // First Live model returns 429; second Live model (native-audio-dialog) succeeds!
+        val rotatingEngine = GeminiLiveEngine(
             fallbackEngine = fallbackEngine,
-            liveSessionFactory = { fakeSession },
-            apiKeyProvider = { "live-key" }
+            liveSessionFactory = {
+                object : LiveSession {
+                    private val incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 8)
+                    override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
+                    override var isConnected: Boolean = false
+                        private set
+                    private var modelName: String = ""
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        modelName = setup.model
+                        attemptedModels.add(modelName)
+                        isConnected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        if (modelName.contains("3.8-live")) {
+                            incoming.emit(LiveServerMessage.ErrorMessage(LiveErrorData(code = 429, message = "Please retry in 30s")))
+                        } else {
+                            incoming.emit(
+                                LiveServerMessage.ServerContentMessage(
+                                    ServerContentData(
+                                        modelTurn = ModelTurn(
+                                            parts = listOf(
+                                                Part(inlineData = Blob("audio/pcm;rate=24000", base64Audio))
+                                            )
+                                        ),
+                                        outputTranscription = TranscriptionData("Call me Ishmael"),
+                                        turnComplete = true
+                                    )
+                                )
+                            )
+                        }
+                    }
+
+                    override suspend fun disconnect() {
+                        isConnected = false
+                    }
+                }
+            },
+            apiKeyProvider = { "live-key" },
+            quotaTracker = tracker
         )
 
-        val chunks = liveEngine.synthesize(
+        val chunks = rotatingEngine.synthesize(
             SynthesisRequest(text = "Call me Ishmael", voiceId = "Charon")
         ).toList()
 
         assertEquals(1, chunks.size)
         assertTrue(rawAudio.contentEquals(chunks[0].data))
-        assertTrue(disconnected)
-        assertFalse(fakeSession.isConnected)
+        assertEquals(2, attemptedModels.size)
+        assertTrue(attemptedModels[0].contains("gemini-3.8-live"))
+        assertTrue(attemptedModels[1].contains("gemini-2.5-flash-native-audio-dialog"))
+        assertFalse(tracker.isModelAvailable("gemini-3.8-live"))
 
-        val errorIncoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
-        val errorSession = object : LiveSession {
-            override val incomingMessages: Flow<LiveServerMessage> = errorIncoming.asSharedFlow()
-            override val isConnected: Boolean = true
-            override suspend fun connect(apiKey: String, setup: SetupConfig) {}
-            override suspend fun send(message: LiveClientMessage) {
-                errorIncoming.emit(
-                    LiveServerMessage.ErrorMessage(LiveErrorData(code = 500, message = "Live error"))
-                )
-            }
-            override suspend fun disconnect() {}
-        }
-
-        val errorLiveEngine = GeminiLiveEngine(
+        // If all Live candidates error, fall back to fallbackEngine
+        val errorEngine = GeminiLiveEngine(
             fallbackEngine = fallbackEngine,
-            liveSessionFactory = { errorSession },
+            liveSessionFactory = {
+                object : LiveSession {
+                    private val incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 8)
+                    override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
+                    override val isConnected: Boolean = true
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {}
+                    override suspend fun send(message: LiveClientMessage) {
+                        incoming.emit(LiveServerMessage.ErrorMessage(LiveErrorData(code = 500, message = "Live error")))
+                    }
+                    override suspend fun disconnect() {}
+                }
+            },
             apiKeyProvider = { "live-key" }
         )
 
-        val fallbackChunks = errorLiveEngine.synthesize(
+        val fallbackChunks = errorEngine.synthesize(
             SynthesisRequest(text = "Call me Ishmael", voiceId = "Charon")
         ).toList()
         assertEquals(1, fallbackChunks.size)
@@ -308,7 +387,6 @@ class NarrationAndTranslationTest {
 
     @Test
     fun `SystemTtsEngine resamples WAV PCM to 24000 Hz mono and NarrationCoordinator uses lineTexts`() = runTest {
-        // Build a tiny 16kHz mono 16-bit WAV (16 samples -> resampled to 24 samples at 24kHz)
         val pcmSamples = ByteArray(32) { i -> (i % 64).toByte() }
         val wavOut = ByteArrayOutputStream()
         fun writeLeInt(v: Int) {
@@ -326,18 +404,18 @@ class NarrationAndTranslationTest {
         wavOut.write("WAVE".toByteArray(Charsets.US_ASCII))
         wavOut.write("fmt ".toByteArray(Charsets.US_ASCII))
         writeLeInt(16)
-        writeLeShort(1) // PCM
-        writeLeShort(1) // mono
-        writeLeInt(16000) // sampleRate
-        writeLeInt(32000) // byteRate
-        writeLeShort(2) // blockAlign
-        writeLeShort(16) // bitsPerSample
+        writeLeShort(1)
+        writeLeShort(1)
+        writeLeInt(16000)
+        writeLeInt(32000)
+        writeLeShort(2)
+        writeLeShort(16)
         wavOut.write("data".toByteArray(Charsets.US_ASCII))
         writeLeInt(pcmSamples.size)
         wavOut.write(pcmSamples)
 
         val resampled = SystemTtsEngine.parseAndResampleWav(wavOut.toByteArray(), 24000)
-        assertEquals(48, resampled.size) // 24 samples * 2 bytes
+        assertEquals(48, resampled.size)
 
         var capturedText: String? = null
         val capturingEngine = object : NarrationEngine {
@@ -364,5 +442,110 @@ class NarrationAndTranslationTest {
             lineTexts = mapOf("line-1" to "Actual prose")
         )
         assertEquals("Actual prose", capturedText)
+    }
+
+    @Test
+    fun `SystemTtsEngine normalizes BCP-47 tags and emits PCM when context is null`() = runTest {
+        assertEquals(listOf("zh-CN", "zh"), SystemTtsEngine.candidateLanguageTags("zh-Hans"))
+        assertEquals(listOf("zh-TW", "zh"), SystemTtsEngine.candidateLanguageTags("zh-Hant"))
+        assertEquals(listOf("fil-PH", "tl-PH", "tl", "fil"), SystemTtsEngine.candidateLanguageTags("fil"))
+        assertEquals(listOf("nb-NO", "no-NO", "no", "nb"), SystemTtsEngine.candidateLanguageTags("nb"))
+
+        val chunks = SystemTtsEngine().synthesize(
+            SynthesisRequest(text = "Hola mundo", voiceId = "default", languageCode = "es")
+        ).toList()
+        assertEquals(1, chunks.size)
+        assertEquals(16000, chunks[0].data.size)
+        assertEquals(16000, chunks[0].sampleRate)
+    }
+
+    @Test
+    fun `GeminiTtsEngine applies verbatim target-language prompt only when languageCode is present`() = runTest {
+        assertEquals("Hello world", GeminiTtsEngine.formatTextForLanguage("Hello world", null))
+        assertEquals("Hello world", GeminiTtsEngine.formatTextForLanguage("Hello world", "   "))
+        val frenchPrompt = GeminiTtsEngine.formatTextForLanguage("Bonjour le monde", "fr")
+        assertTrue(frenchPrompt.contains("French (fr)"))
+        assertTrue(frenchPrompt.contains("without translating"))
+        assertTrue(frenchPrompt.endsWith("Bonjour le monde"))
+
+        val capturedRequests = mutableListOf<TtsRequest>()
+        val fakeClient = object : InteractionsTtsClient {
+            override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
+                return byteArrayOf(1, 2, 3, 4)
+            }
+
+            override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> {
+                capturedRequests.add(request)
+                return flowOf(PcmChunk(byteArrayOf(1, 2, 3, 4), 24000, 1))
+            }
+        }
+        val engine = GeminiTtsEngine(
+            ttsClient = fakeClient,
+            apiKeyProvider = { "test-key" }
+        )
+
+        engine.synthesize(SynthesisRequest(text = "Plain text", voiceId = "Charon", languageCode = null)).toList()
+        engine.synthesize(SynthesisRequest(text = "Bonjour le monde", voiceId = "Charon", languageCode = "fr")).toList()
+
+        assertEquals(2, capturedRequests.size)
+        assertEquals("Plain text", capturedRequests[0].text)
+        assertEquals(frenchPrompt, capturedRequests[1].text)
+    }
+
+    @Test
+    fun `GeminiLiveEngine includes verbatim target-language instruction in SetupConfig when languageCode is set`() = runTest {
+        val defaultRequest = SynthesisRequest(text = "Hello", voiceId = "Charon", languageCode = null)
+        val defaultInstruction = GeminiLiveEngine.buildSystemInstruction(defaultRequest)
+        assertFalse(defaultInstruction.contains("without translating"))
+
+        val jaRequest = SynthesisRequest(text = "こんにちは", voiceId = "Charon", languageCode = "ja")
+        val jaInstruction = GeminiLiveEngine.buildSystemInstruction(jaRequest)
+        assertTrue(jaInstruction.startsWith(defaultInstruction))
+        assertTrue(jaInstruction.contains("Japanese (ja)"))
+        assertTrue(jaInstruction.contains("without translating"))
+
+        val capturedSetups = mutableListOf<SetupConfig>()
+        val rawAudio = byteArrayOf(5, 6, 7, 8)
+        val base64Audio = Base64.getEncoder().encodeToString(rawAudio)
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                object : LiveSession {
+                    private val incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 8)
+                    override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
+                    override var isConnected: Boolean = false
+                        private set
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        capturedSetups.add(setup)
+                        isConnected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        incoming.emit(
+                            LiveServerMessage.ServerContentMessage(
+                                ServerContentData(
+                                    modelTurn = ModelTurn(
+                                        parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", base64Audio)))
+                                    ),
+                                    outputTranscription = TranscriptionData("こんにちは"),
+                                    turnComplete = true
+                                )
+                            )
+                        )
+                    }
+
+                    override suspend fun disconnect() {
+                        isConnected = false
+                    }
+                }
+            },
+            apiKeyProvider = { "live-key" }
+        )
+
+        val chunks = engine.synthesize(jaRequest).toList()
+        assertEquals(1, chunks.size)
+        assertTrue(rawAudio.contentEquals(chunks[0].data))
+        assertEquals(1, capturedSetups.size)
+        assertEquals(jaInstruction, capturedSetups[0].systemInstruction?.parts?.firstOrNull()?.text)
     }
 }
