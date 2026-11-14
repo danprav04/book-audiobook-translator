@@ -460,14 +460,7 @@ class NarrationAndTranslationTest {
     }
 
     @Test
-    fun `GeminiTtsEngine applies verbatim target-language prompt only when languageCode is present`() = runTest {
-        assertEquals("Hello world", GeminiTtsEngine.formatTextForLanguage("Hello world", null))
-        assertEquals("Hello world", GeminiTtsEngine.formatTextForLanguage("Hello world", "   "))
-        val frenchPrompt = GeminiTtsEngine.formatTextForLanguage("Bonjour le monde", "fr")
-        assertTrue(frenchPrompt.contains("French (fr)"))
-        assertTrue(frenchPrompt.contains("without translating"))
-        assertTrue(frenchPrompt.endsWith("Bonjour le monde"))
-
+    fun `GeminiTtsEngine sends clean book text without spoken prompt instructions regardless of languageCode or neutral style`() = runTest {
         val capturedRequests = mutableListOf<TtsRequest>()
         val fakeClient = object : InteractionsTtsClient {
             override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
@@ -484,19 +477,95 @@ class NarrationAndTranslationTest {
             apiKeyProvider = { "test-key" }
         )
 
-        engine.synthesize(SynthesisRequest(text = "Plain text", voiceId = "Charon", languageCode = null)).toList()
-        engine.synthesize(SynthesisRequest(text = "Bonjour le monde", voiceId = "Charon", languageCode = "fr")).toList()
+        engine.synthesize(SynthesisRequest(text = "Plain text", voiceId = "Charon", style = null, languageCode = null)).toList()
+        engine.synthesize(SynthesisRequest(text = "Call me Ishmael.", voiceId = "Charon", style = "neutral", languageCode = "en")).toList()
+        engine.synthesize(SynthesisRequest(text = "Bonjour le monde", voiceId = "Charon", style = "NEUTRAL", languageCode = "fr")).toList()
+        engine.synthesize(SynthesisRequest(text = "こんにちは", voiceId = "Charon", style = "warm", languageCode = "ja")).toList()
 
-        assertEquals(2, capturedRequests.size)
+        // Blank text emits nothing; punctuation-only divider emits brief silence without calling TTS client
+        val blankChunks = engine.synthesize(SynthesisRequest(text = "   ", voiceId = "Charon", languageCode = "en")).toList()
+        val dividerChunks = engine.synthesize(SynthesisRequest(text = "* * *", voiceId = "Charon", languageCode = "en")).toList()
+        assertTrue(blankChunks.isEmpty())
+        assertEquals(1, dividerChunks.size)
+        assertTrue(dividerChunks[0].data.all { it == 0.toByte() })
+
+        assertEquals(4, capturedRequests.size)
         assertEquals("Plain text", capturedRequests[0].text)
-        assertEquals(frenchPrompt, capturedRequests[1].text)
+        assertEquals(null, capturedRequests[0].style)
+        assertEquals(null, capturedRequests[0].languageCode)
+
+        assertEquals("Call me Ishmael.", capturedRequests[1].text)
+        assertEquals(null, capturedRequests[1].style)
+        assertEquals("en", capturedRequests[1].languageCode)
+
+        assertEquals("Bonjour le monde", capturedRequests[2].text)
+        assertEquals(null, capturedRequests[2].style)
+        assertEquals("fr", capturedRequests[2].languageCode)
+
+        assertEquals("こんにちは", capturedRequests[3].text)
+        assertEquals("warm", capturedRequests[3].style)
+        assertEquals("ja", capturedRequests[3].languageCode)
+
+        capturedRequests.forEach { req ->
+            assertFalse("Spoken text must never inject 'Read aloud'", req.text.contains("Read aloud", ignoreCase = true))
+            assertFalse("Spoken text must never inject 'without translating'", req.text.contains("without translating", ignoreCase = true))
+            assertFalse("Spoken text must never inject 'commentary'", req.text.contains("commentary", ignoreCase = true))
+        }
+    }
+
+    @Test
+    fun `GeminiLiveEngine fallback to GeminiTtsEngine passes clean text without spoken instructions`() = runTest {
+        val capturedTtsRequests = mutableListOf<TtsRequest>()
+        val fakeTtsClient = object : InteractionsTtsClient {
+            override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = byteArrayOf(9, 9)
+            override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> {
+                capturedTtsRequests.add(request)
+                return flowOf(PcmChunk(byteArrayOf(9, 9), 24000, 1))
+            }
+        }
+        val realFallback = GeminiTtsEngine(
+            ttsClient = fakeTtsClient,
+            apiKeyProvider = { "tts-key" }
+        )
+        val liveEngine = GeminiLiveEngine(
+            fallbackEngine = realFallback,
+            liveSessionFactory = {
+                object : LiveSession {
+                    private val incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 4)
+                    override val incomingMessages: Flow<LiveServerMessage> = incoming.asSharedFlow()
+                    override val isConnected: Boolean = true
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {}
+                    override suspend fun send(message: LiveClientMessage) {
+                        incoming.emit(LiveServerMessage.ErrorMessage(LiveErrorData(code = 503, message = "Unavailable")))
+                    }
+                    override suspend fun disconnect() {}
+                }
+            },
+            apiKeyProvider = { "live-key" }
+        )
+
+        val chunks = liveEngine.synthesize(
+            SynthesisRequest(
+                text = "It was a bright cold day in April.",
+                voiceId = "Charon",
+                style = "neutral",
+                languageCode = "en"
+            )
+        ).toList()
+
+        assertEquals(1, chunks.size)
+        assertEquals(1, capturedTtsRequests.size)
+        assertEquals("It was a bright cold day in April.", capturedTtsRequests[0].text)
+        assertEquals(null, capturedTtsRequests[0].style)
+        assertEquals("en", capturedTtsRequests[0].languageCode)
     }
 
     @Test
     fun `GeminiLiveEngine includes verbatim target-language instruction in SetupConfig when languageCode is set`() = runTest {
-        val defaultRequest = SynthesisRequest(text = "Hello", voiceId = "Charon", languageCode = null)
+        val defaultRequest = SynthesisRequest(text = "Hello", voiceId = "Charon", style = "neutral", languageCode = null)
         val defaultInstruction = GeminiLiveEngine.buildSystemInstruction(defaultRequest)
         assertFalse(defaultInstruction.contains("without translating"))
+        assertFalse(defaultInstruction.contains("Tone: neutral"))
 
         val jaRequest = SynthesisRequest(text = "こんにちは", voiceId = "Charon", languageCode = "ja")
         val jaInstruction = GeminiLiveEngine.buildSystemInstruction(jaRequest)
@@ -505,6 +574,7 @@ class NarrationAndTranslationTest {
         assertTrue(jaInstruction.contains("without translating"))
 
         val capturedSetups = mutableListOf<SetupConfig>()
+        val capturedClientTurns = mutableListOf<String>()
         val rawAudio = byteArrayOf(5, 6, 7, 8)
         val base64Audio = Base64.getEncoder().encodeToString(rawAudio)
         val engine = GeminiLiveEngine(
@@ -521,6 +591,9 @@ class NarrationAndTranslationTest {
                     }
 
                     override suspend fun send(message: LiveClientMessage) {
+                        val text = (message as LiveClientMessage.ClientContentMessage)
+                            .clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text.orEmpty()
+                        capturedClientTurns.add(text)
                         incoming.emit(
                             LiveServerMessage.ServerContentMessage(
                                 ServerContentData(
@@ -547,5 +620,18 @@ class NarrationAndTranslationTest {
         assertTrue(rawAudio.contentEquals(chunks[0].data))
         assertEquals(1, capturedSetups.size)
         assertEquals(jaInstruction, capturedSetups[0].systemInstruction?.parts?.firstOrNull()?.text)
+        assertEquals(listOf("こんにちは"), capturedClientTurns)
+
+        // Blank and punctuation-only turns must not be sent to Live model
+        val liveSession = engine.openStreamingSession()
+        try {
+            assertTrue(liveSession.synthesizeTurnStreaming(SynthesisRequest(text = "   ", voiceId = "Charon")).toList().isEmpty())
+            val divider = liveSession.synthesizeTurnStreaming(SynthesisRequest(text = "---", voiceId = "Charon")).toList()
+            assertEquals(1, divider.size)
+            assertTrue(divider[0].data.all { it == 0.toByte() })
+            assertEquals(1, capturedClientTurns.size)
+        } finally {
+            liveSession.close()
+        }
     }
 }

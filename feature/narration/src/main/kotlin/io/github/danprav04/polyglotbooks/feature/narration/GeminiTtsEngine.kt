@@ -5,7 +5,6 @@ import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.QuotaExhaustedException
 import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
-import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.flow.Flow
@@ -49,6 +48,15 @@ class GeminiTtsEngine(
             throw IllegalStateException("Missing API key")
         }
 
+        if (request.text.isBlank()) {
+            return@flow
+        }
+        if (request.text.none { it.isLetterOrDigit() }) {
+            // Punctuation-only dividers (e.g. "* * *", "---") should pause briefly rather than being sent to TTS.
+            emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
+            return@flow
+        }
+
         val model = modelProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
             ?: DefaultModels.get(ModelRole.TTS)
 
@@ -61,11 +69,16 @@ class GeminiTtsEngine(
             )
         }
 
+        val normalizedStyle = request.style
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) }
+
         val ttsRequest = TtsRequest(
-            text = formatTextForLanguage(request.text, request.languageCode),
+            text = request.text,
             voiceName = request.voiceId.takeIf { it.isNotBlank() },
-            style = request.style,
-            model = model
+            style = normalizedStyle,
+            model = model,
+            languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() }
         )
 
         var emittedCount = 0
@@ -91,15 +104,6 @@ class GeminiTtsEngine(
         } else {
             emitAll(synthesize(turn1))
             emitAll(synthesize(turn2))
-        }
-    }
-
-    internal companion object {
-        internal fun formatTextForLanguage(text: String, languageCode: String?): String {
-            val code = languageCode?.trim()?.takeIf { it.isNotEmpty() } ?: return text
-            val language = LanguageCode.fromCode(code)
-            val label = "${language.displayName} (${language.code})"
-            return "Read aloud verbatim in $label without translating it or adding commentary:\n$text"
         }
     }
 }

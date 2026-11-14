@@ -38,7 +38,8 @@ data class TtsRequest(
     val voiceName: String? = null,
     val speaker: String? = null,
     val style: String? = null,
-    val model: String = DefaultModels.get(ModelRole.TTS)
+    val model: String = DefaultModels.get(ModelRole.TTS),
+    val languageCode: String? = null
 )
 
 /**
@@ -186,7 +187,7 @@ class OkHttpInteractionsTtsClient(
         }
     }
 
-    private fun buildRequestJson(request: TtsRequest): String {
+    internal fun buildRequestJson(request: TtsRequest): String {
         val promptText = buildPromptText(request)
         val voiceName = request.voiceName?.trim()?.takeIf { it.isNotEmpty() } ?: "Puck"
 
@@ -216,20 +217,43 @@ class OkHttpInteractionsTtsClient(
         }.toString()
     }
 
-    private fun buildPromptText(request: TtsRequest): String {
-        val style = request.style?.trim()?.takeIf { it.isNotEmpty() }
-        val speaker = request.speaker?.trim()?.takeIf { it.isNotEmpty() }
-        return if (style != null || speaker != null) {
-            buildString {
-                append("Say")
-                if (speaker != null) append(" as $speaker")
-                if (style != null) append(" in a $style tone")
-                append(": ")
-                append(request.text)
-            }
-        } else {
-            request.text
+    internal fun buildPromptText(request: TtsRequest): String {
+        if (request.text.isBlank() || request.text.none { it.isLetterOrDigit() }) {
+            return request.text
         }
+        val speaker = sanitizeDirectiveValue(request.speaker)
+        val style = sanitizeStyle(request.style)
+        if (speaker == null && style == null) {
+            return request.text
+        }
+        return buildString {
+            append("Say")
+            if (speaker != null) append(" as $speaker")
+            if (style != null) {
+                if (style.endsWith("tone", ignoreCase = true)) {
+                    append(" in a $style")
+                } else {
+                    append(" in a $style tone")
+                }
+            }
+            append(": ")
+            append(request.text)
+        }
+    }
+
+    private fun sanitizeStyle(raw: String?): String? {
+        val cleaned = sanitizeDirectiveValue(raw) ?: return null
+        return if (cleaned.equals("neutral", ignoreCase = true)) null else cleaned
+    }
+
+    private fun sanitizeDirectiveValue(raw: String?): String? {
+        val cleaned = raw
+            ?.replace(Regex("""[\r\n:]+"""), " ")
+            ?.replace(Regex("""\s+"""), " ")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return null
+        return if (META_INSTRUCTION_PATTERN.containsMatchIn(cleaned)) null else cleaned
     }
 
     private fun extractAudioBytesAndTokens(responseBody: String): Pair<ByteArray, Int> {
@@ -310,5 +334,8 @@ class OkHttpInteractionsTtsClient(
     private companion object {
         const val STREAM_CHUNK_BYTES = 8192
         const val OUTPUT_SAMPLE_RATE = 24000
+        val META_INSTRUCTION_PATTERN = Regex(
+            """(?i)\b(?:read\s+aloud|without\s+translat\w*|without\s+(?:adding\s+)?commentary|no\s+commentary|do\s+not\s+(?:translate|add\s+commentary)|verbatim)\b"""
+        )
     }
 }
