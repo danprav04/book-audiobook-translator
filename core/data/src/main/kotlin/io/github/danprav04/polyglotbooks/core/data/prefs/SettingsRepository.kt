@@ -1,5 +1,6 @@
 package io.github.danprav04.polyglotbooks.core.data.prefs
 
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.flow.Flow
@@ -42,6 +43,8 @@ interface SettingsRepository {
         get() = flowOf(18)
     val readerFontFamily: Flow<String>
         get() = flowOf("Serif")
+    val defaultNarratorVoiceId: Flow<String>
+        get() = flowOf(GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID)
 
     suspend fun saveApiKey(key: String)
     suspend fun clearApiKey()
@@ -68,5 +71,6 @@ interface SettingsRepository {
     suspend fun setReaderTheme(themeName: String) {}
     suspend fun setReaderFontSizeSp(sizeSp: Int) {}
     suspend fun setReaderFontFamily(family: String) {}
+    suspend fun setDefaultNarratorVoiceId(voiceId: String) {}
 }
 

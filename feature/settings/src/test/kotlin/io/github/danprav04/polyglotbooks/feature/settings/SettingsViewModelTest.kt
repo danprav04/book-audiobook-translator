@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.feature.settings
 
 import app.cash.turbine.test
+import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -11,12 +12,16 @@ import io.github.danprav04.polyglotbooks.core.gemini.ModelListResponse
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -46,6 +51,7 @@ class SettingsViewModelTest {
     private val cacheLimitBytesFlow = MutableStateFlow(1024L * 1024L * 1024L)
     private val duckLevelFlow = MutableStateFlow(0.15f)
     private val echoTargetLanguageFlow = MutableStateFlow(false)
+    private val defaultNarratorVoiceIdFlow = MutableStateFlow("Charon")
     private val featureUsageStatsFlow = MutableStateFlow(FeatureUsageStats())
 
     @Before
@@ -59,6 +65,7 @@ class SettingsViewModelTest {
             coEvery { cacheLimitBytes } returns cacheLimitBytesFlow
             coEvery { duckLevel } returns duckLevelFlow
             coEvery { echoTargetLanguage } returns echoTargetLanguageFlow
+            coEvery { defaultNarratorVoiceId } returns defaultNarratorVoiceIdFlow
             coEvery { featureUsageStats } returns featureUsageStatsFlow
         }
 
@@ -75,13 +82,17 @@ class SettingsViewModelTest {
     }
 
     private fun createViewModel(
-        quotaTracker: GeminiQuotaTracker? = null
+        quotaTracker: GeminiQuotaTracker? = null,
+        voicePreviewPlayer: VoicePreviewPlayer? = null,
+        playbackCoordinator: PlaybackCoordinator? = null
     ): SettingsViewModel {
         return SettingsViewModel(
             settingsRepository = settingsRepository,
             secureKeyStore = secureKeyStore,
             modelCatalogService = modelCatalogService,
-            quotaTracker = quotaTracker
+            quotaTracker = quotaTracker,
+            voicePreviewPlayer = voicePreviewPlayer,
+            playbackCoordinator = playbackCoordinator
         )
     }
 
@@ -98,6 +109,9 @@ class SettingsViewModelTest {
         assertEquals(0.15f, state.duckLevel, 0.001f)
         assertEquals(1024L * 1024L * 1024L, state.cacheLimitBytes)
         assertFalse(state.echoTargetLanguage)
+        assertEquals("Charon", state.defaultNarratorVoiceId)
+        assertNull(state.playingPreviewVoiceId)
+        assertNull(state.previewErrorMessage)
         assertEquals(DefaultModels.map, state.modelPerRole)
     }
 
@@ -383,5 +397,85 @@ class SettingsViewModelTest {
         val liveModels = viewModel.getRecommendedModelsForRole(ModelRole.LIVE_NARRATION)
         assertTrue(liveModels.contains("gemini-2.5-flash-native-audio-dialog"))
         assertTrue(liveModels.contains("gemini-custom-live-audio"))
+    }
+
+    @Test
+    fun testSelectDefaultNarratorVoicePersistsCanonicalVoiceAndIgnoresBlank() = runTest {
+        val viewModel = createViewModel()
+        advanceUntilIdle()
+
+        viewModel.selectDefaultNarratorVoice("   ")
+        advanceUntilIdle()
+        coVerify(exactly = 0) { settingsRepository.setDefaultNarratorVoiceId(any()) }
+
+        viewModel.selectDefaultNarratorVoice("kore")
+        advanceUntilIdle()
+        coVerify { settingsRepository.setDefaultNarratorVoiceId("Kore") }
+
+        defaultNarratorVoiceIdFlow.value = "Kore"
+        advanceUntilIdle()
+        assertEquals("Kore", viewModel.uiState.value.defaultNarratorVoiceId)
+    }
+
+    @Test
+    fun testToggleVoicePreviewPausesActivePlaybackExposesStateAndStopsCleanly() = runTest {
+        val fakePreviewPlayer = object : VoicePreviewPlayer {
+            private val _playing = MutableStateFlow<String?>(null)
+            override val playingVoiceId: StateFlow<String?> = _playing.asStateFlow()
+
+            private val _error = MutableStateFlow<String?>(null)
+            override val previewError: StateFlow<String?> = _error.asStateFlow()
+
+            var stopCount = 0
+
+            override fun togglePreview(voiceId: String, onBeforeStart: (() -> Unit)?) {
+                if (_playing.value == voiceId) {
+                    _playing.value = null
+                } else {
+                    onBeforeStart?.invoke()
+                    _error.value = null
+                    _playing.value = voiceId
+                }
+            }
+
+            override fun stop() {
+                stopCount++
+                _playing.value = null
+                _error.value = null
+            }
+
+            fun emitError(msg: String) {
+                _playing.value = null
+                _error.value = msg
+            }
+        }
+        val coordinator = mockk<PlaybackCoordinator>(relaxed = true)
+
+        val viewModel = createViewModel(
+            voicePreviewPlayer = fakePreviewPlayer,
+            playbackCoordinator = coordinator
+        )
+        advanceUntilIdle()
+
+        viewModel.toggleVoicePreview("Aoede")
+        advanceUntilIdle()
+        verify(exactly = 1) { coordinator.pauseActivePlayback() }
+        assertEquals("Aoede", viewModel.uiState.value.playingPreviewVoiceId)
+        assertNull(viewModel.uiState.value.previewErrorMessage)
+
+        fakePreviewPlayer.emitError("Missing voice asset")
+        advanceUntilIdle()
+        assertNull(viewModel.uiState.value.playingPreviewVoiceId)
+        assertEquals("Missing voice asset", viewModel.uiState.value.previewErrorMessage)
+
+        viewModel.toggleVoicePreview("Charon")
+        advanceUntilIdle()
+        verify(exactly = 2) { coordinator.pauseActivePlayback() }
+        assertEquals("Charon", viewModel.uiState.value.playingPreviewVoiceId)
+
+        viewModel.stopVoicePreview()
+        advanceUntilIdle()
+        assertEquals(1, fakePreviewPlayer.stopCount)
+        assertNull(viewModel.uiState.value.playingPreviewVoiceId)
     }
 }

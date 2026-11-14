@@ -34,6 +34,8 @@ dependencies {
     implementation(project(":core:model"))
     implementation(project(":core:data"))
     implementation(project(":core:gemini"))
+    implementation(project(":core:audio"))
+    implementation(project(":core:playback"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

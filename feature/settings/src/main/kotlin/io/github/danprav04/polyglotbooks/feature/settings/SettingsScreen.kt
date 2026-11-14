@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.settings
 
 import android.content.Intent
 import android.net.Uri
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +14,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -24,6 +26,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
+import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Security
@@ -52,6 +55,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -76,6 +80,7 @@ import androidx.compose.ui.unit.dp
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
 import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -89,6 +94,7 @@ fun SettingsScreen(
     val uiState by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
+    var showVoicePickerDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(uiState.userMessage) {
         uiState.userMessage?.let { msg ->
@@ -151,6 +157,7 @@ fun SettingsScreen(
             // Section 3: Audio & Storage Section
             AudioAndStorageSection(
                 uiState = uiState,
+                onOpenVoicePicker = { showVoicePickerDialog = true },
                 onDuckLevelChange = viewModel::setDuckLevel,
                 onCacheLimitChange = viewModel::setCacheLimitBytes,
                 onEchoChange = viewModel::setEchoTargetLanguage
@@ -172,6 +179,27 @@ fun SettingsScreen(
 
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+
+    if (showVoicePickerDialog) {
+        VoicePickerDialog(
+            selectedVoiceId = uiState.defaultNarratorVoiceId,
+            playingVoiceId = uiState.playingPreviewVoiceId,
+            previewErrorMessage = uiState.previewErrorMessage,
+            onSelectVoice = { voiceId ->
+                viewModel.selectDefaultNarratorVoice(voiceId)
+                viewModel.stopVoicePreview()
+                showVoicePickerDialog = false
+            },
+            onTogglePreview = viewModel::toggleVoicePreview,
+            onStopPreview = viewModel::stopVoicePreview,
+            onDismiss = {
+                viewModel.stopVoicePreview()
+                showVoicePickerDialog = false
+            },
+            title = "Default Narrator Voice",
+            subtitle = "Used for narrator parts and unassigned reading voices across books."
+        )
     }
 }
 
@@ -669,6 +697,7 @@ private fun RoleModelSelector(
 @Composable
 private fun AudioAndStorageSection(
     uiState: SettingsUiState,
+    onOpenVoicePicker: () -> Unit,
     onDuckLevelChange: (Float) -> Unit,
     onCacheLimitChange: (Long) -> Unit,
     onEchoChange: (Boolean) -> Unit
@@ -693,6 +722,64 @@ private fun AudioAndStorageSection(
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
+            }
+
+            // Default narrator voice row
+            val selectedProfile = GeminiStudioVoices.getVoice(uiState.defaultNarratorVoiceId)
+            val voiceDescription = if (selectedProfile != null) {
+                val genderAge = "${selectedProfile.gender.replaceFirstChar { it.uppercase() }}, " +
+                    selectedProfile.age.replaceFirstChar { it.uppercase() }
+                val traits = selectedProfile.traits.joinToString(", ")
+                "${selectedProfile.name} ($genderAge • $traits)"
+            } else {
+                uiState.defaultNarratorVoiceId
+            }
+
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenVoicePicker),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        modifier = Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RecordVoiceOver,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = "Default Narrator Voice",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = voiceDescription,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedButton(onClick = onOpenVoicePicker) {
+                        Text("Choose")
+                    }
+                }
             }
 
             // Ducking volume slider (0% to 30%)

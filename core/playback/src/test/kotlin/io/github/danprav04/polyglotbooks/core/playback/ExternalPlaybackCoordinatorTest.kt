@@ -251,4 +251,76 @@ class ExternalPlaybackCoordinatorTest {
         assertEquals("extra_nav_book_id", PlaybackNotificationManager.EXTRA_NAV_BOOK_ID)
         assertEquals("extra_nav_is_audiobook", PlaybackNotificationManager.EXTRA_NAV_IS_AUDIOBOOK)
     }
+
+    @Test
+    fun `pauseActivePlayback pauses active audiobook without pausing idle external delegate`() {
+        val coordinator = PlaybackCoordinator()
+        var audiobookPauseCalls = 0
+        coordinator.onPauseAudiobook = { audiobookPauseCalls++ }
+
+        val delegate = FakeExternalNarrationDelegate(
+            ExternalNarrationState(
+                isActiveSession = true,
+                bookId = "ebook-1",
+                isPlaying = false
+            )
+        )
+        coordinator.registerExternalDelegate(delegate)
+        coordinator.activateAudiobook()
+
+        coordinator.pauseActivePlayback()
+
+        assertEquals(1, audiobookPauseCalls)
+        assertEquals(0, delegate.pauseCalls)
+        assertEquals(ActivePlaybackSource.AUDIOBOOK, coordinator.activeSource.value)
+    }
+
+    @Test
+    fun `pauseActivePlayback pauses active ebook narration without clearing activeSource or calling audiobook pause`() {
+        val coordinator = PlaybackCoordinator()
+        val delegate = FakeExternalNarrationDelegate(
+            ExternalNarrationState(
+                isActiveSession = true,
+                bookId = "ebook-1",
+                isPlaying = true
+            )
+        )
+        coordinator.registerExternalDelegate(delegate)
+        coordinator.updateExternalState(delegate.externalState.value)
+        coordinator.activateExternalNarration(context = null)
+
+        var audiobookPauseCalls = 0
+        coordinator.onPauseAudiobook = { audiobookPauseCalls++ }
+
+        coordinator.pauseActivePlayback()
+
+        assertEquals(1, delegate.pauseCalls)
+        assertEquals(0, audiobookPauseCalls)
+        assertFalse(delegate.externalState.value.isPlaying)
+        assertEquals(ActivePlaybackSource.EBOOK_NARRATION, coordinator.activeSource.value)
+    }
+
+    @Test
+    fun `pauseActivePlayback pauses playing AudiobookSessionManager`() = runTest {
+        val coordinator = PlaybackCoordinator()
+        val sessionManager = AudiobookSessionManager(
+            bookDao = null,
+            chapterDao = null,
+            playbackStateDao = null,
+            settingsRepository = null,
+            liveTranslationBackend = NoOpLiveTranslationBackend(),
+            applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
+            context = null,
+            playbackCoordinator = coordinator
+        )
+
+        sessionManager.play()
+        assertTrue(sessionManager.state.value.isPlaying)
+        assertEquals(ActivePlaybackSource.AUDIOBOOK, coordinator.activeSource.value)
+
+        coordinator.pauseActivePlayback()
+
+        assertFalse(sessionManager.state.value.isPlaying)
+        assertEquals(ActivePlaybackSource.AUDIOBOOK, coordinator.activeSource.value)
+    }
 }

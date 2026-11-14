@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.narration
 
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.NarrationLine
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.flow.Flow
@@ -12,17 +13,23 @@ import kotlinx.coroutines.flow.Flow
  */
 class NarrationCoordinator(
     private val engine: NarrationEngine,
-    private val prefetchAheadCount: Int = 3
+    private val prefetchAheadCount: Int = 3,
+    defaultNarratorVoiceId: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
 ) {
+    private val defaultNarratorVoiceId: String =
+        defaultNarratorVoiceId.trim().ifEmpty { GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID }
+
     private val pcmCache = mutableMapOf<String, Flow<PcmChunk>>()
 
     fun prepareLines(
         lines: List<NarrationLine>,
         voiceMap: Map<String, String>,
-        lineTexts: Map<String, String> = emptyMap()
+        lineTexts: Map<String, String> = emptyMap(),
+        fallbackVoiceId: String = defaultNarratorVoiceId
     ) {
+        val resolvedFallback = fallbackVoiceId.trim().ifEmpty { defaultNarratorVoiceId }
         for (line in lines.take(prefetchAheadCount)) {
-            val voiceId = voiceMap[line.speakerId] ?: "Charon"
+            val voiceId = voiceMap[line.speakerId]?.takeIf { it.isNotBlank() } ?: resolvedFallback
             val request = SynthesisRequest(
                 text = lineTexts[line.id] ?: "Line ${line.id}",
                 voiceId = voiceId,
@@ -36,15 +43,18 @@ class NarrationCoordinator(
     fun prepareLines(
         lines: List<NarrationLineEntity>,
         characters: List<CharacterEntity>,
-        lineTexts: Map<String, String> = emptyMap()
+        lineTexts: Map<String, String> = emptyMap(),
+        fallbackVoiceId: String = defaultNarratorVoiceId
     ) {
+        val resolvedFallback = fallbackVoiceId.trim().ifEmpty { defaultNarratorVoiceId }
         val voiceMap = characters.associate { character ->
-            character.id to (character.assignedVoiceId ?: "Charon")
+            character.id to (character.assignedVoiceId?.takeIf { it.isNotBlank() } ?: resolvedFallback)
         }
         prepareLines(
             lines = lines.map { it.toDomain() },
             voiceMap = voiceMap,
-            lineTexts = lineTexts
+            lineTexts = lineTexts,
+            fallbackVoiceId = resolvedFallback
         )
     }
 

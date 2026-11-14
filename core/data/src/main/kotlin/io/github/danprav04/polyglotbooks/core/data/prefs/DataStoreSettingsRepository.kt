@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.flow.Flow
@@ -93,6 +94,15 @@ class DataStoreSettingsRepository(
 
     override val readerFontFamily: Flow<String> = dataStore.data.map { preferences ->
         preferences[KEY_READER_FONT_FAMILY]?.takeIf { it.isNotBlank() } ?: DEFAULT_READER_FONT_FAMILY
+    }
+
+    override val defaultNarratorVoiceId: Flow<String> = dataStore.data.map { preferences ->
+        val stored = preferences[KEY_DEFAULT_NARRATOR_VOICE_ID]?.trim()?.takeIf { it.isNotEmpty() }
+        if (stored == null) {
+            DEFAULT_NARRATOR_VOICE_ID
+        } else {
+            GeminiStudioVoices.getVoice(stored)?.id ?: stored
+        }
     }
 
     override suspend fun saveApiKey(key: String) {
@@ -233,6 +243,15 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override suspend fun setDefaultNarratorVoiceId(voiceId: String) {
+        val trimmed = voiceId.trim()
+        if (trimmed.isEmpty()) return
+        val canonical = GeminiStudioVoices.getVoice(trimmed)?.id ?: trimmed
+        dataStore.edit { preferences ->
+            preferences[KEY_DEFAULT_NARRATOR_VOICE_ID] = canonical
+        }
+    }
+
     companion object {
         val KEY_TARGET_LANGUAGE = stringPreferencesKey("target_language_code")
         val KEY_CACHE_LIMIT_BYTES = longPreferencesKey("cache_limit_bytes")
@@ -247,6 +266,7 @@ class DataStoreSettingsRepository(
         val KEY_READER_THEME = stringPreferencesKey("reader_theme")
         val KEY_READER_FONT_SIZE_SP = intPreferencesKey("reader_font_size_sp")
         val KEY_READER_FONT_FAMILY = stringPreferencesKey("reader_font_family")
+        val KEY_DEFAULT_NARRATOR_VOICE_ID = stringPreferencesKey("default_narrator_voice_id")
 
         val KEY_USAGE_LIVE_TRANSLATE = doublePreferencesKey("usage_live_translate_minutes")
         val KEY_USAGE_TTS = doublePreferencesKey("usage_tts_minutes")
@@ -261,6 +281,7 @@ class DataStoreSettingsRepository(
         const val DEFAULT_READER_THEME: String = "LIGHT"
         const val DEFAULT_READER_FONT_SIZE_SP: Int = 18
         const val DEFAULT_READER_FONT_FAMILY: String = "Serif"
+        const val DEFAULT_NARRATOR_VOICE_ID: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
 
         fun modelRoleKey(role: ModelRole) = stringPreferencesKey("model_role_${role.name}")
     }

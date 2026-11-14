@@ -3,6 +3,7 @@ package io.github.danprav04.polyglotbooks.feature.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -13,7 +14,9 @@ import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.ModelItem
 import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +42,9 @@ data class SettingsUiState(
     val duckLevel: Float = 0.15f,
     val cacheLimitBytes: Long = 1024L * 1024L * 1024L, // 1 GB
     val echoTargetLanguage: Boolean = false,
+    val defaultNarratorVoiceId: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID,
+    val playingPreviewVoiceId: String? = null,
+    val previewErrorMessage: String? = null,
     val featureUsageStats: FeatureUsageStats = FeatureUsageStats(),
     val estimatedTotalCost: Double = 0.0,
     val quotaSnapshots: Map<String, ModelQuotaSnapshot> = emptyMap(),
@@ -50,7 +56,9 @@ class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val secureKeyStore: SecureKeyStore,
     private val modelCatalogService: ModelCatalogService,
-    private val quotaTracker: GeminiQuotaTracker? = null
+    private val quotaTracker: GeminiQuotaTracker? = null,
+    private val voicePreviewPlayer: VoicePreviewPlayer? = null,
+    private val playbackCoordinator: PlaybackCoordinator? = null
 ) : ViewModel() {
 
     private val _apiKeyInput = MutableStateFlow("")
@@ -60,6 +68,10 @@ class SettingsViewModel @Inject constructor(
     private val _userMessage = MutableStateFlow<String?>(null)
     private val quotaSnapshotsFlow: StateFlow<Map<String, ModelQuotaSnapshot>> =
         quotaTracker?.quotaSnapshots ?: MutableStateFlow(emptyMap())
+    private val playingPreviewVoiceFlow: StateFlow<String?> =
+        voicePreviewPlayer?.playingVoiceId ?: MutableStateFlow(null)
+    private val previewErrorFlow: StateFlow<String?> =
+        voicePreviewPlayer?.previewError ?: MutableStateFlow(null)
 
     private val baseRepoSettings = combine(
         settingsRepository.apiKey,
@@ -74,15 +86,20 @@ class SettingsViewModel @Inject constructor(
             duckLevel = duck,
             cacheLimitBytes = cache,
             echoTargetLanguage = echo,
-            usageStats = FeatureUsageStats()
+            usageStats = FeatureUsageStats(),
+            defaultNarratorVoiceId = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
         )
     }
 
     private val repoSettings = combine(
         baseRepoSettings,
-        settingsRepository.featureUsageStats
-    ) { base, usage ->
-        base.copy(usageStats = usage)
+        settingsRepository.featureUsageStats,
+        settingsRepository.defaultNarratorVoiceId
+    ) { base, usage, narratorVoice ->
+        base.copy(
+            usageStats = usage,
+            defaultNarratorVoiceId = narratorVoice
+        )
     }
 
     private val internalState = combine(
@@ -105,8 +122,10 @@ class SettingsViewModel @Inject constructor(
     val uiState: StateFlow<SettingsUiState> = combine(
         repoSettings,
         internalState,
-        quotaSnapshotsFlow
-    ) { repo, internal, snapshots ->
+        quotaSnapshotsFlow,
+        playingPreviewVoiceFlow,
+        previewErrorFlow
+    ) { repo, internal, snapshots, playingPreviewVoiceId, previewError ->
         val liveTranslateCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_TRANSLATE, repo.usageStats.liveTranslateMinutes * 60.0, repo.usageStats.isFreeTier)
         val ttsCost = CostEstimator.estimateAudioCost(ModelRole.TTS, repo.usageStats.ttsCharactersOrMinutes * 60.0, repo.usageStats.isFreeTier)
         val liveNarrationCost = CostEstimator.estimateAudioCost(ModelRole.LIVE_NARRATION, repo.usageStats.liveNarrationMinutes * 60.0, repo.usageStats.isFreeTier)
@@ -123,6 +142,9 @@ class SettingsViewModel @Inject constructor(
             duckLevel = repo.duckLevel,
             cacheLimitBytes = repo.cacheLimitBytes,
             echoTargetLanguage = repo.echoTargetLanguage,
+            defaultNarratorVoiceId = repo.defaultNarratorVoiceId,
+            playingPreviewVoiceId = playingPreviewVoiceId,
+            previewErrorMessage = previewError,
             featureUsageStats = repo.usageStats,
             estimatedTotalCost = totalCost,
             quotaSnapshots = snapshots,
@@ -140,7 +162,8 @@ class SettingsViewModel @Inject constructor(
         val duckLevel: Float,
         val cacheLimitBytes: Long,
         val echoTargetLanguage: Boolean,
-        val usageStats: FeatureUsageStats
+        val usageStats: FeatureUsageStats,
+        val defaultNarratorVoiceId: String
     )
 
     private data class InternalSettings(
@@ -351,6 +374,29 @@ class SettingsViewModel @Inject constructor(
 
     fun dismissUserMessage() {
         _userMessage.value = null
+    }
+
+    fun selectDefaultNarratorVoice(voiceId: String) {
+        val canonical = GeminiStudioVoices.getVoice(voiceId)?.id ?: voiceId.trim()
+        if (canonical.isEmpty()) return
+        viewModelScope.launch {
+            settingsRepository.setDefaultNarratorVoiceId(canonical)
+        }
+    }
+
+    fun toggleVoicePreview(voiceId: String) {
+        voicePreviewPlayer?.togglePreview(voiceId) {
+            playbackCoordinator?.pauseActivePlayback()
+        }
+    }
+
+    fun stopVoicePreview() {
+        voicePreviewPlayer?.stop()
+    }
+
+    override fun onCleared() {
+        voicePreviewPlayer?.stop()
+        super.onCleared()
     }
 
     /**
