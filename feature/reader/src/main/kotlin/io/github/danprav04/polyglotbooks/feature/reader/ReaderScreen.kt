@@ -103,6 +103,8 @@ fun ReaderScreen(
             if (savedCfi.isNotBlank()) {
                 val jsSavedCfi = JSONObject.quote(savedCfi)
                 webView.evaluateJavascript("window.FoliateBridge?.goToCfi($jsSavedCfi, false);", null)
+            } else if (uiState.currentChapterIndex > 0) {
+                webView.evaluateJavascript("window.FoliateBridge?.loadChapter(${uiState.currentChapterIndex}, false);", null)
             }
         }
     }

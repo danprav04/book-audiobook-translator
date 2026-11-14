@@ -1599,4 +1599,161 @@ class ReaderViewModelTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `paused narration chapter switch and reopen reattach restores new chapter without stale prior chapter highlight`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-reattach-paused").toFile()
+        try {
+            val bookDao = FakeBookDao().apply {
+                insertBook(createTestBook("book-reattach", "Reattach Novel"))
+            }
+            val chapters = listOf(
+                ChapterEntity("c0", "book-reattach", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+                ChapterEntity("c1", "book-reattach", 1, "Ch 2", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 100),
+                ChapterEntity("c2", "book-reattach", 2, "Ch 3", 2000L, 3000L, "epubcfi(/6/6!/4/2/1:0)", 100),
+                ChapterEntity("c3", "book-reattach", 3, "Ch 4", 3000L, 4000L, "epubcfi(/6/8!/4/2/1:0)", 100)
+            )
+            val chapterDao = FakeChapterDao().apply { insertChapters(chapters) }
+            val playbackDao = FakePlaybackStateDao()
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+            }
+            val holdSpeech = CompletableDeferred<Unit>()
+            val extractedBook = EbookContentExtractor.ExtractedBook(
+                format = "EPUB",
+                title = "Reattach Novel",
+                author = "Author",
+                pageCount = 4,
+                chapters = listOf(
+                    EbookContentExtractor.ExtractedChapter(0, "Ch 1", "ch0.xhtml", "", listOf("Ch1 P0")),
+                    EbookContentExtractor.ExtractedChapter(1, "Ch 2", "ch1.xhtml", "", listOf("Ch2 P0")),
+                    EbookContentExtractor.ExtractedChapter(2, "Ch 3", "ch2.xhtml", "", listOf("Ch3 P0", "Ch3 P1")),
+                    EbookContentExtractor.ExtractedChapter(3, "Ch 4", "ch3.xhtml", "", listOf("Ch4 P0", "Ch4 P1"))
+                )
+            )
+            val sharedSession = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                systemTtsFactory = {
+                    object : io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine {
+                        override val id = io.github.danprav04.polyglotbooks.feature.narration.EngineId.SYSTEM_TTS
+                        override val capabilities = io.github.danprav04.polyglotbooks.feature.narration.EngineCapabilities(
+                            supportsMultiVoice = false,
+                            supportsEmotionalStyles = false,
+                            supportsStreaming = false,
+                            outputSampleRate = 24000
+                        )
+                        override suspend fun voices() = emptyList<io.github.danprav04.polyglotbooks.feature.narration.VoiceInfo>()
+                        override fun synthesize(request: io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest) = kotlinx.coroutines.flow.flow {
+                            emit(PcmChunk(ByteArray(1600), 24000, 1))
+                            holdSpeech.await()
+                        }
+                    }
+                }
+            }
+
+            val ch2Paras = sharedSession.buildParagraphsForChapter(extractedBook, 2, "EPUB")
+            sharedSession.updateBookContext(
+                bookId = "book-reattach",
+                bookTitle = "Reattach Novel",
+                extractedBook = extractedBook,
+                chapters = chapters,
+                currentChapterIndex = 2,
+                paragraphs = ch2Paras,
+                activeParagraphIndex = 1,
+                forceWhenDifferentBook = true
+            )
+            sharedSession.startOrResume(
+                bookId = "book-reattach",
+                bookTitle = "Reattach Novel",
+                extractedBook = extractedBook,
+                chapters = chapters,
+                currentChapterIndex = 2,
+                paragraphs = ch2Paras,
+                activeParagraphIndex = 1
+            )
+
+            val vm1 = ReaderViewModel(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-reattach")),
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                injectedSessionManager = sharedSession
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            // 1. Verify active TTS on Chapter 2 (index 2), paragraph 1 -> pause playback
+            assertEquals("epubcfi(/6/6!/4/2/2:0)", vm1.uiState.value.highlightedCfi)
+
+            vm1.pauseNarration()
+            runCurrent()
+            advanceUntilIdle()
+            assertFalse(vm1.uiState.value.isNarrationPlaying)
+            assertTrue(sharedSession.sessionState.value.isActiveSession)
+            assertEquals("epubcfi(/6/6!/4/2/2:0)", vm1.uiState.value.highlightedCfi)
+
+            // Reattaching while still on Chapter 2 preserves the paused Chapter 2 highlight
+            val vmSameChapter = ReaderViewModel(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-reattach")),
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                injectedSessionManager = sharedSession
+            )
+            runCurrent()
+            advanceUntilIdle()
+            assertEquals(2, vmSameChapter.uiState.value.currentChapterIndex)
+            assertEquals("epubcfi(/6/6!/4/2/2:0)", vmSameChapter.uiState.value.currentCfi)
+            assertEquals("epubcfi(/6/6!/4/2/2:0)", vmSameChapter.uiState.value.highlightedCfi)
+
+            // 2. While paused, open TOC and jump to Chapter 3 (index 3)
+            vmSameChapter.selectChapter(chapters[3])
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals(3, vmSameChapter.uiState.value.currentChapterIndex)
+            assertNull("Jumping to Chapter 3 while paused must clear Chapter 2 highlight in UI state", vmSameChapter.uiState.value.highlightedCfi)
+            assertNull("Jumping to Chapter 3 while paused must clear Chapter 2 highlight in session state", sharedSession.sessionState.value.highlightedCfi)
+            assertEquals(3, sharedSession.sessionState.value.currentChapterIndex)
+            assertEquals("epubcfi(/6/8!/4/2/1:0)", vmSameChapter.uiState.value.currentCfi)
+
+            // 3. Navigate Back to Library and reopen Book A while paused session is still active
+            vmSameChapter.flushProgress()
+            val onClearedMethod = androidx.lifecycle.ViewModel::class.java.getDeclaredMethod("onCleared")
+            onClearedMethod.isAccessible = true
+            onClearedMethod.invoke(vmSameChapter)
+            runCurrent()
+            advanceUntilIdle()
+
+            val vmReopened = ReaderViewModel(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-reattach")),
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                injectedSessionManager = sharedSession
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertTrue(vmReopened.uiState.value.isStateRestored)
+            assertEquals(3, vmReopened.uiState.value.currentChapterIndex)
+            assertEquals("epubcfi(/6/8!/4/2/1:0)", vmReopened.uiState.value.currentCfi)
+            assertNull("Reopened book on Chapter 3 must not have stale Chapter 2 highlight", vmReopened.uiState.value.highlightedCfi)
+            assertEquals("Ch4 P0", vmReopened.uiState.value.paragraphs.firstOrNull()?.text)
+
+            holdSpeech.complete(Unit)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

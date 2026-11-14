@@ -1152,4 +1152,107 @@ class ReaderNarrationSessionManagerTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun `paused session chapter change clears stale highlightedCfi and flash tts uses GEMINI_TTS_V2 cache tag`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-cache-v2").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_FLASH_TTS.name)
+            }
+            val keyStore = object : SecureKeyStore {
+                override suspend fun getApiKey(): String = "test-key"
+                override suspend fun saveApiKey(key: String) {}
+                override suspend fun deleteApiKey() {}
+            }
+            val freshPcm = byteArrayOf(9, 8, 7, 6, 5, 4)
+            val poisonedLegacyPcm = byteArrayOf(1, 1, 1, 1)
+            var ttsCallCount = 0
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
+                    ttsCallCount++
+                    return freshPcm
+                }
+
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    ttsCallCount++
+                    emit(PcmChunk(freshPcm, 24000, 1))
+                }
+            }
+
+            // Seed legacy v1 cache keys ("GEMINI_TTS" and "GEMINI_TTS_en") with poisoned audio
+            diskCache.saveAudioSegment(
+                engineTag = "GEMINI_TTS",
+                voiceId = "Charon",
+                style = null,
+                text = "Clean book sentence.",
+                sampleRate = 24000,
+                channels = 1,
+                pcmBytes = poisonedLegacyPcm
+            )
+            diskCache.saveAudioSegment(
+                engineTag = "GEMINI_TTS_en",
+                voiceId = "Charon",
+                style = null,
+                text = "Clean book sentence.",
+                sampleRate = 24000,
+                channels = 1,
+                pcmBytes = poisonedLegacyPcm
+            )
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = keyStore,
+                interactionsTtsClient = ttsClient,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = diskCache
+                playerFactory = { RecordingPcmPlayer() }
+            }
+            runCurrent()
+
+            val chunk = SpeechChunk(
+                text = "Clean book sentence.",
+                leadCfi = "epubcfi(/6/2!/4/2/1:0)",
+                allCfis = listOf("epubcfi(/6/2!/4/2/1:0)"),
+                leadIndex = 0,
+                voiceId = "Charon",
+                style = null,
+                paragraphIndices = listOf(0),
+                paragraphCharWeights = listOf(20),
+                languageCode = "en"
+            )
+            val emitted = mutableListOf<PcmChunk>()
+            manager.synthesizeSpeechChunk(
+                chunk = chunk,
+                engineChoice = NarrationEngine.GEMINI_FLASH_TTS,
+                systemFallback = CapturingSystemEngine(),
+                diskCache = diskCache,
+                maxCacheBytes = TranslationDiskCache.DEFAULT_MAX_AUDIO_BYTES,
+                ttsAlreadyFailed = false,
+                onTtsFailed = {},
+                onStatusUpdate = {},
+                onPcmChunk = { emitted += it }
+            )
+
+            assertEquals("Legacy GEMINI_TTS cache entry must be bypassed", 1, ttsCallCount)
+            assertEquals(1, emitted.size)
+            assertTrue(emitted.single().data.contentEquals(freshPcm))
+
+            val v2Cached = diskCache.loadAudioSegment(
+                engineTag = "${ReaderNarrationSessionManager.GEMINI_TTS_CACHE_TAG_PREFIX}_en",
+                voiceId = "Charon",
+                style = null,
+                text = "Clean book sentence."
+            )
+            assertNotNull("Synthesized audio must be cached under GEMINI_TTS_V2_en", v2Cached)
+            assertTrue(v2Cached!!.pcmBytes.contentEquals(freshPcm))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

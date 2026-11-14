@@ -457,6 +457,7 @@
       currentBookUri = bookUrl || "";
       isBookReady = false;
       hasDirtyPosition = false;
+      activeHighlightCfi = null;
 
       const container = getContainer();
       if (container) {
