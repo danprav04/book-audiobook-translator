@@ -1,59 +1,90 @@
-name: Bug report
-description: Report something that doesn't work as expected.
-labels: [bug]
+name: Bug Report
+description: Create a report to help us improve Polyglot Books
+title: "[Bug]: "
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to report a bug. Fill out the details below so it can be reviewed.
+        Thank you for reporting an issue in Polyglot Books! Please fill out the form below.
   - type: textarea
     id: description
     attributes:
-      label: What happened?
-      description: A clear description of the bug.
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: Tell us what happened...
     validations:
       required: true
   - type: textarea
     id: steps
     attributes:
-      label: Steps to reproduce
+      label: Steps To Reproduce
+      description: Steps to reproduce the behavior.
       placeholder: |
-        1. Open ...
-        2. Tap ...
+        1. Open '...'
+        2. Tap on '...'
         3. See error
     validations:
       required: true
   - type: textarea
     id: expected
     attributes:
-      label: Expected behavior
-    validations:
-      required: true
-  - type: textarea
-    id: actual
-    attributes:
-      label: Actual behavior
-    validations:
-      required: true
-  - type: dropdown
-    id: version
-    attributes:
-      label: App version
-      options:
-        - v0.1.0 (latest release)
-        - Built from source (main)
+      label: Expected Behavior
+      description: What you expected to happen instead.
     validations:
       required: true
   - type: input
-    id: device
+    id: app_version
     attributes:
-      label: Device & Android version
-      placeholder: e.g. Pixel 8, Android 15
+      label: App Version
+      description: Found in Settings -> About.
+      placeholder: e.g. 1.0.0-debug (commit hash)
     validations:
       required: true
+  - type: dropdown
+    id: android_version
+    attributes:
+      label: Android Version
+      options:
+        - Android 15 (API 35)
+        - Android 14 (API 34)
+        - Android 13 (API 33)
+        - Android 12 / 12L (API 31/32)
+        - Android 11 (API 30)
+        - Android 10 (API 29)
+        - Android 9 Pie (API 28)
+        - Android 8 Oreo (API 26/27)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: device_model
+    attributes:
+      label: Device Model
+      placeholder: e.g. Google Pixel 8, Samsung Galaxy S23
+    validations:
+      required: false
+  - type: dropdown
+    id: book_format
+    attributes:
+      label: Book / Audio Format (if applicable)
+      options:
+        - None / Not applicable
+        - EPUB
+        - MOBI / AZW3
+        - PDF
+        - FB2
+        - M4B
+        - MP3
+        - FLAC / OGG / OPUS
+        - TXT / Other
+    validations:
+      required: false
   - type: textarea
     id: logs
     attributes:
-      label: Logs / screenshots
-      description: Optional logcat output or screenshots. Never paste API keys.
+      label: Logcat / Error Logs
+      description: Please paste any relevant log output (DO NOT include your Gemini API key).
       render: shell
+    validations:
+      required: false
