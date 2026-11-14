@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.danprav04.polyglotbooks.core.audio.PcmPlayer
+import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
@@ -26,6 +27,7 @@ import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
 import io.github.danprav04.polyglotbooks.feature.narration.CastingService
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.feature.narration.VoiceCaster
@@ -106,9 +108,13 @@ data class ReaderUiState(
     val followHighlight: Boolean = true,
     val isNarrationSheetExpanded: Boolean = false,
     val jumpToHighlightNonce: Int = 0,
+    val chapterNavigationNonce: Int = 0,
     val isCastEditorOpen: Boolean = false,
     val isBilingualEnabled: Boolean = false,
     val targetLanguage: LanguageCode = LanguageCode.SPANISH,
+    val defaultNarratorVoiceId: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID,
+    val playingPreviewVoiceId: String? = null,
+    val previewErrorMessage: String? = null,
     val bilingualTranslations: Map<String, String> = emptyMap(),
     val isReportDialogOpen: Boolean = false,
     val highlightedCfi: String? = null,
@@ -139,7 +145,9 @@ class ReaderViewModel @Inject constructor(
     private val liveSessionFactory: LiveSessionFactory? = null,
     private val quotaTracker: GeminiQuotaTracker? = null,
     private val modelCatalogService: ModelCatalogService? = null,
-    private val injectedSessionManager: ReaderNarrationSessionManager? = null
+    private val injectedSessionManager: ReaderNarrationSessionManager? = null,
+    private val voicePreviewPlayer: VoicePreviewPlayer? = null,
+    private val playbackCoordinator: PlaybackCoordinator? = null
 ) : ViewModel(), ReaderBridgeListener {
 
     private var bookId: String = savedStateHandle.get<String>("bookId") ?: "sample_book_id"
@@ -149,6 +157,8 @@ class ReaderViewModel @Inject constructor(
     private var sessionObserverJob: Job? = null
     private var castJob: Job? = null
     private val saveMutex = Mutex()
+    private var lastSessionError: String? = null
+    private var lastSessionStatus: String? = null
 
     private val localFallbackSessionManager: ReaderNarrationSessionManager by lazy {
         ReaderNarrationSessionManager(
@@ -163,7 +173,7 @@ class ReaderViewModel @Inject constructor(
             liveSessionFactory = liveSessionFactory,
             quotaTracker = quotaTracker,
             modelCatalogService = modelCatalogService,
-            playbackCoordinator = null,
+            playbackCoordinator = playbackCoordinator,
             applicationScope = viewModelScope
         )
     }
@@ -188,46 +198,68 @@ class ReaderViewModel @Inject constructor(
 
     private fun observeSettings() {
         settingsJob?.cancel()
-        val repo = settingsRepository ?: return
+        val repo = settingsRepository
+        if (repo == null && voicePreviewPlayer == null) return
         settingsJob = viewModelScope.launch {
-            launch {
-                repo.targetLanguage.collect { lang ->
-                    _uiState.update { it.copy(targetLanguage = lang) }
+            repo?.let { r ->
+                launch {
+                    r.targetLanguage.collect { lang ->
+                        _uiState.update { it.copy(targetLanguage = lang) }
+                    }
+                }
+                launch {
+                    r.readerNarrationEngine.collect { engineName ->
+                        val parsed = parseNarrationEngine(engineName)
+                        _uiState.update { it.copy(narrationEngine = parsed) }
+                    }
+                }
+                launch {
+                    r.defaultNarratorVoiceId.collect { voiceId ->
+                        val normalized = GeminiStudioVoices.getVoice(voiceId)?.id
+                            ?: GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+                        _uiState.update { it.copy(defaultNarratorVoiceId = normalized) }
+                    }
+                }
+                launch {
+                    r.readerReadTranslated.collect { readTranslated ->
+                        _uiState.update { it.copy(narrateTranslatedText = readTranslated) }
+                    }
+                }
+                launch {
+                    r.readerNarrationSpeed.collect { speed ->
+                        _uiState.update { it.copy(playbackSpeed = speed.coerceIn(0.5f, 2.5f)) }
+                    }
+                }
+                launch {
+                    r.readerTheme.collect { themeName ->
+                        val parsed = ReaderTheme.values().firstOrNull {
+                            it.name.equals(themeName, ignoreCase = true)
+                        } ?: ReaderTheme.LIGHT
+                        _uiState.update { it.copy(theme = parsed) }
+                    }
+                }
+                launch {
+                    r.readerFontSizeSp.collect { sizeSp ->
+                        _uiState.update { it.copy(fontSizeSp = sizeSp.coerceIn(12, 32)) }
+                    }
+                }
+                launch {
+                    r.readerFontFamily.collect { family ->
+                        if (family.isNotBlank()) {
+                            _uiState.update { it.copy(fontFamily = family) }
+                        }
+                    }
                 }
             }
-            launch {
-                repo.readerNarrationEngine.collect { engineName ->
-                    val parsed = parseNarrationEngine(engineName)
-                    _uiState.update { it.copy(narrationEngine = parsed) }
+            voicePreviewPlayer?.let { preview ->
+                launch {
+                    preview.playingVoiceId.collect { id ->
+                        _uiState.update { it.copy(playingPreviewVoiceId = id) }
+                    }
                 }
-            }
-            launch {
-                repo.readerReadTranslated.collect { readTranslated ->
-                    _uiState.update { it.copy(narrateTranslatedText = readTranslated) }
-                }
-            }
-            launch {
-                repo.readerNarrationSpeed.collect { speed ->
-                    _uiState.update { it.copy(playbackSpeed = speed.coerceIn(0.5f, 2.5f)) }
-                }
-            }
-            launch {
-                repo.readerTheme.collect { themeName ->
-                    val parsed = ReaderTheme.values().firstOrNull {
-                        it.name.equals(themeName, ignoreCase = true)
-                    } ?: ReaderTheme.LIGHT
-                    _uiState.update { it.copy(theme = parsed) }
-                }
-            }
-            launch {
-                repo.readerFontSizeSp.collect { sizeSp ->
-                    _uiState.update { it.copy(fontSizeSp = sizeSp.coerceIn(12, 32)) }
-                }
-            }
-            launch {
-                repo.readerFontFamily.collect { family ->
-                    if (family.isNotBlank()) {
-                        _uiState.update { it.copy(fontFamily = family) }
+                launch {
+                    preview.previewError.collect { err ->
+                        _uiState.update { it.copy(previewErrorMessage = err) }
                     }
                 }
             }
@@ -238,9 +270,17 @@ class ReaderViewModel @Inject constructor(
         sessionObserverJob?.cancel()
         sessionObserverJob = viewModelScope.launch {
             sessionManager.sessionState.collect { session ->
+                val sessionErr = session.errorMessage
+                val sessionStat = session.statusMessage
+                val errChanged = sessionErr != lastSessionError
+                val statChanged = sessionStat != lastSessionStatus
+                lastSessionError = sessionErr
+                lastSessionStatus = sessionStat
+
                 _uiState.update { state ->
                     val base = state.copy(
                         narrationEngine = session.narrationEngine,
+                        defaultNarratorVoiceId = session.defaultNarratorVoiceId,
                         narrateTranslatedText = session.narrateTranslatedText,
                         playbackSpeed = session.playbackSpeed,
                         targetLanguage = session.targetLanguage
@@ -258,7 +298,13 @@ class ReaderViewModel @Inject constructor(
                         } else {
                             base.currentChapterIndex
                         }
-                        val syncedParagraphs = if (session.isActiveSession && session.paragraphs.isNotEmpty()) {
+                        val chapterChangedFromSession = session.isActiveSession &&
+                            updatedChapterIndex != base.currentChapterIndex &&
+                            (!session.isPlaying || base.followHighlight)
+                        val syncedParagraphs = if (
+                            session.isActiveSession ||
+                            (session.currentChapterIndex == updatedChapterIndex && session.extractedBook != null)
+                        ) {
                             session.paragraphs
                         } else {
                             base.paragraphs
@@ -271,11 +317,39 @@ class ReaderViewModel @Inject constructor(
                         } else {
                             base.bilingualTranslations
                         }
+                        val syncedActiveCfi = if (session.isActiveSession && session.isPlaying) {
+                            session.highlightedCfi
+                                ?: syncedParagraphs.getOrNull(session.activeParagraphIndex)?.cfi
+                                ?: base.currentCfi
+                        } else {
+                            base.currentCfi
+                        }
+                        val syncedProgress = if (session.isActiveSession && session.isPlaying) {
+                            val withinChap = if (syncedParagraphs.size <= 1) {
+                                0f
+                            } else {
+                                session.activeParagraphIndex.toFloat() / (syncedParagraphs.size - 1)
+                            }
+                            if (totalChapters <= 1) {
+                                withinChap.coerceIn(0f, 1f)
+                            } else {
+                                ((updatedChapterIndex + withinChap) / totalChapters).coerceIn(0f, 1f)
+                            }
+                        } else {
+                            base.progress
+                        }
                         base.copy(
                             currentChapterIndex = updatedChapterIndex,
+                            chapterNavigationNonce = if (chapterChangedFromSession) {
+                                base.chapterNavigationNonce + 1
+                            } else {
+                                base.chapterNavigationNonce
+                            },
+                            currentCfi = syncedActiveCfi,
+                            progress = syncedProgress,
                             paragraphs = syncedParagraphs,
                             activeParagraphIndex = if (session.isActiveSession) {
-                                session.activeParagraphIndex
+                                session.activeParagraphIndex.coerceIn(0, maxOf(0, syncedParagraphs.lastIndex))
                             } else {
                                 base.activeParagraphIndex
                             },
@@ -292,8 +366,8 @@ class ReaderViewModel @Inject constructor(
                             chapterDurationMs = session.chapterDurationMs,
                             bookPositionMs = session.bookPositionMs,
                             bookDurationMs = session.bookDurationMs,
-                            narrationStatusMessage = session.statusMessage ?: base.narrationStatusMessage,
-                            errorMessage = session.errorMessage ?: base.errorMessage
+                            narrationStatusMessage = if (statChanged) sessionStat else base.narrationStatusMessage,
+                            errorMessage = if (errChanged) sessionErr else base.errorMessage
                         )
                     }
                 }
@@ -309,6 +383,8 @@ class ReaderViewModel @Inject constructor(
         charactersJob?.cancel()
         if (switchingBook) {
             castJob?.cancel()
+            lastSessionError = null
+            lastSessionStatus = null
         }
 
         val existingSession = sessionManager.sessionState.value
@@ -358,6 +434,7 @@ class ReaderViewModel @Inject constructor(
 
         loadJob = viewModelScope.launch {
             try {
+                sessionManager.awaitPendingPersist(targetBookId)
                 val book = bookDao.getBookById(targetBookId)
                 if (book != null) {
                     val savedState = playbackStateDao?.getPlaybackState(targetBookId)
@@ -370,40 +447,9 @@ class ReaderViewModel @Inject constructor(
                         savedState?.lastCfi.orEmpty()
                     }
                     val restoredProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
-                    val existingChapters = _uiState.value.chapters
-                    val restoredChapterIndex = if (isReattaching) {
-                        liveSessionSnapshot.currentChapterIndex
-                    } else {
-                        resolveChapterIndex(
-                            chapters = existingChapters,
-                            cfi = restoredCfi,
-                            progress = restoredProgress,
-                            fallbackIndex = savedState?.chapterIndex ?: 0
-                        )
-                    }
 
-                    _uiState.update {
-                        it.copy(
-                            bookId = targetBookId,
-                            bookTitle = book.title,
-                            bookAuthor = book.author,
-                            bookCoverUri = book.coverUri,
-                            bookFormat = book.format,
-                            bookFilePath = book.filePath,
-                            currentCfi = restoredCfi,
-                            progress = restoredProgress,
-                            currentChapterIndex = restoredChapterIndex,
-                            isStateRestored = true,
-                            errorMessage = null
-                        )
-                    }
-                    withContext(NonCancellable) {
-                        settingsRepository?.setLastOpenedBookId(targetBookId)
-                        bookDao.updateLastReadDate(targetBookId, System.currentTimeMillis())
-                    }
-
-                    if (appContext != null && book.filePath.isNotBlank()) {
-                        val extracted = if (isReattaching && liveSessionSnapshot.extractedBook != null) {
+                    val extracted = if (appContext != null && book.filePath.isNotBlank()) {
+                        if (isReattaching && liveSessionSnapshot.extractedBook != null) {
                             liveSessionSnapshot.extractedBook
                         } else {
                             try {
@@ -415,41 +461,82 @@ class ReaderViewModel @Inject constructor(
                                 null
                             }
                         }
+                    } else {
+                        if (isReattaching) liveSessionSnapshot.extractedBook else null
+                    }
 
-                        if (extracted != null) {
-                            val isPdf = extracted.format.equals("PDF", ignoreCase = true) ||
-                                book.format.equals("PDF", ignoreCase = true)
-                            val dbChapters = chapterDao.getChaptersForBook(targetBookId).firstOrNull().orEmpty()
-                            if (dbChapters.isEmpty() && extracted.chapters.isNotEmpty()) {
-                                val chapterEntities = extracted.chapters.map { ch ->
-                                    ChapterEntity(
-                                        id = "${targetBookId}_chap_${ch.index}",
-                                        bookId = targetBookId,
-                                        index = ch.index,
-                                        title = ch.title.ifBlank {
-                                            if (isPdf) "Page ${ch.index + 1}" else "Chapter ${ch.index + 1}"
-                                        },
-                                        startMs = ch.index * 1000L,
-                                        endMs = (ch.index + 1) * 1000L,
-                                        cfiRange = sessionManager.defaultChapterCfi(ch.index, isPdf),
-                                        textLength = ch.paragraphs.sumOf { it.length }
-                                    )
-                                }
-                                chapterDao.insertChapters(chapterEntities)
-                            }
-                            _uiState.update { state ->
-                                val idx = state.currentChapterIndex.coerceIn(0, maxOf(0, extracted.chapters.lastIndex))
-                                val initialParagraphs = if (state.paragraphs.isEmpty()) {
-                                    sessionManager.buildParagraphsForChapter(extracted, idx, book.format)
-                                } else {
-                                    state.paragraphs
-                                }
-                                state.copy(
-                                    extractedBook = extracted,
-                                    paragraphs = initialParagraphs
-                                )
-                            }
+                    var dbChapters = chapterDao.getChaptersForBook(targetBookId).firstOrNull().orEmpty()
+                    if (dbChapters.isEmpty() && extracted != null && extracted.chapters.isNotEmpty()) {
+                        val isPdf = extracted.format.equals("PDF", ignoreCase = true) ||
+                            book.format.equals("PDF", ignoreCase = true)
+                        val chapterEntities = extracted.chapters.map { ch ->
+                            ChapterEntity(
+                                id = "${targetBookId}_chap_${ch.index}",
+                                bookId = targetBookId,
+                                index = ch.index,
+                                title = ch.title.ifBlank {
+                                    if (isPdf) "Page ${ch.index + 1}" else "Chapter ${ch.index + 1}"
+                                },
+                                startMs = ch.index * 1000L,
+                                endMs = (ch.index + 1) * 1000L,
+                                cfiRange = sessionManager.defaultChapterCfi(ch.index, isPdf),
+                                textLength = ch.paragraphs.sumOf { it.length }
+                            )
                         }
+                        chapterDao.insertChapters(chapterEntities)
+                        dbChapters = chapterEntities
+                    }
+
+                    val restoredChapterIndex = if (isReattaching) {
+                        liveSessionSnapshot.currentChapterIndex
+                    } else {
+                        resolveChapterIndex(
+                            chapters = dbChapters,
+                            cfi = restoredCfi,
+                            progress = restoredProgress,
+                            fallbackIndex = savedState?.chapterIndex ?: 0
+                        )
+                    }
+                    val totalChapters = maxOf(dbChapters.size, extracted?.chapters?.size ?: 0)
+                    val clampedChapterIndex = if (totalChapters > 0) {
+                        restoredChapterIndex.coerceIn(0, totalChapters - 1)
+                    } else {
+                        restoredChapterIndex.coerceAtLeast(0)
+                    }
+
+                    val initialParagraphs = when {
+                        isReattaching && liveSessionSnapshot.paragraphs.isNotEmpty() -> liveSessionSnapshot.paragraphs
+                        extracted != null -> sessionManager.buildParagraphsForChapter(extracted, clampedChapterIndex, book.format)
+                        else -> emptyList()
+                    }
+                    val initialActiveParaIndex = if (isReattaching) {
+                        liveSessionSnapshot.activeParagraphIndex.coerceIn(0, maxOf(0, initialParagraphs.lastIndex))
+                    } else {
+                        deriveParagraphIndexFromCfi(restoredCfi, initialParagraphs)
+                    }
+
+                    _uiState.update {
+                        it.copy(
+                            bookId = targetBookId,
+                            bookTitle = book.title,
+                            bookAuthor = book.author,
+                            bookCoverUri = book.coverUri,
+                            bookFormat = book.format,
+                            bookFilePath = book.filePath,
+                            chapters = dbChapters,
+                            extractedBook = extracted,
+                            paragraphs = initialParagraphs,
+                            activeParagraphIndex = initialActiveParaIndex,
+                            currentCfi = restoredCfi,
+                            progress = restoredProgress,
+                            currentChapterIndex = clampedChapterIndex,
+                            isStateRestored = true,
+                            errorMessage = null
+                        )
+                    }
+                    withContext(NonCancellable) {
+                        settingsRepository?.setLastOpenedBookId(targetBookId)
+                        bookDao.updateLastReadDate(targetBookId, System.currentTimeMillis())
                     }
                     syncContextToSession(forceWhenDifferentBook = false)
                 } else {
@@ -480,10 +567,16 @@ class ReaderViewModel @Inject constructor(
                         } else {
                             state.paragraphs
                         }
+                        val derivedParaIdx = if (state.paragraphs.isEmpty() && refreshedParagraphs.isNotEmpty() && !isReattaching) {
+                            deriveParagraphIndexFromCfi(state.currentCfi, refreshedParagraphs)
+                        } else {
+                            state.activeParagraphIndex.coerceIn(0, maxOf(0, refreshedParagraphs.lastIndex))
+                        }
                         state.copy(
                             chapters = chapters,
                             currentChapterIndex = resolvedChapter,
-                            paragraphs = refreshedParagraphs
+                            paragraphs = refreshedParagraphs,
+                            activeParagraphIndex = derivedParaIdx
                         )
                     }
                     syncContextToSession(forceWhenDifferentBook = false)
@@ -523,6 +616,8 @@ class ReaderViewModel @Inject constructor(
     }
 
     fun clearError() {
+        lastSessionError = sessionManager.sessionState.value.errorMessage
+        lastSessionStatus = sessionManager.sessionState.value.statusMessage
         _uiState.update { it.copy(errorMessage = null, narrationStatusMessage = null) }
         sessionManager.clearNotices()
     }
@@ -596,6 +691,10 @@ class ReaderViewModel @Inject constructor(
 
     fun nextChapter() {
         val state = _uiState.value
+        if (state.isNarrationPlaying && sessionManager.isSessionActiveFor(bookId)) {
+            sessionManager.nextChapter()
+            return
+        }
         val total = maxOf(state.chapters.size, state.extractedBook?.chapters?.size ?: 0)
         if (total <= 0) return
         val next = (state.currentChapterIndex + 1).coerceAtMost(total - 1)
@@ -606,6 +705,10 @@ class ReaderViewModel @Inject constructor(
 
     fun prevChapter() {
         val state = _uiState.value
+        if (state.isNarrationPlaying && sessionManager.isSessionActiveFor(bookId)) {
+            sessionManager.previousChapter()
+            return
+        }
         val total = maxOf(state.chapters.size, state.extractedBook?.chapters?.size ?: 0)
         if (total <= 0) return
         val prev = (state.currentChapterIndex - 1).coerceAtLeast(0)
@@ -635,6 +738,7 @@ class ReaderViewModel @Inject constructor(
         _uiState.update {
             it.copy(
                 currentChapterIndex = clampedIndex,
+                chapterNavigationNonce = it.chapterNavigationNonce + 1,
                 currentCfi = cfi,
                 progress = progress,
                 activeParagraphIndex = 0,
@@ -644,8 +748,8 @@ class ReaderViewModel @Inject constructor(
             )
         }
 
-        if (bookId.isNotBlank()) {
-            persistProgress(bookId, cfi, progress)
+        if (bookId.isNotBlank() && !wasPlaying) {
+            persistProgress(bookId, cfi, progress, chapterIndex = clampedIndex)
         }
         if (wasPlaying) {
             sessionManager.switchChapter(clampedIndex, continuePlaying = true)
@@ -655,6 +759,35 @@ class ReaderViewModel @Inject constructor(
                 sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = true)
             }
         }
+    }
+
+    fun selectDefaultNarratorVoice(voiceId: String) {
+        val normalized = GeminiStudioVoices.getVoice(voiceId)?.id
+            ?: GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+        _uiState.update { it.copy(defaultNarratorVoiceId = normalized) }
+        sessionManager.setDefaultNarratorVoiceId(normalized)
+        viewModelScope.launch(NonCancellable) {
+            try {
+                settingsRepository?.setDefaultNarratorVoiceId(normalized)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun toggleVoicePreview(voiceId: String) {
+        voicePreviewPlayer?.togglePreview(
+            voiceId = voiceId,
+            onBeforeStart = {
+                playbackCoordinator?.pauseActivePlayback()
+                if (playbackCoordinator == null && _uiState.value.isNarrationPlaying) {
+                    sessionManager.pause()
+                }
+            }
+        )
+    }
+
+    fun stopVoicePreview() {
+        voicePreviewPlayer?.stop()
     }
 
     fun toggleNarration() {
@@ -888,7 +1021,10 @@ class ReaderViewModel @Inject constructor(
                     }
                 }
 
-                val caster = VoiceCaster()
+                val narratorVoice = _uiState.value.defaultNarratorVoiceId.ifBlank {
+                    GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+                }
+                val caster = VoiceCaster(defaultNarratorVoiceId = narratorVoice)
                 val usedVoices = mergedDomain.mapNotNull { it.assignedVoiceId }.toMutableSet()
                 val autoAssigned = caster.autoAssignVoices(mergedDomain)
                 val availablePool = GeminiStudioVoices.catalog.map { it.id }.toMutableList()
@@ -899,7 +1035,7 @@ class ReaderViewModel @Inject constructor(
                     val voice = if (existingVoice != null) {
                         existingVoice
                     } else if (ch.name.equals("Narrator", ignoreCase = true)) {
-                        "Charon"
+                        narratorVoice
                     } else {
                         val preferred = autoAssigned[ch.id]
                         if (preferred != null && preferred !in usedVoices) {
@@ -982,53 +1118,103 @@ class ReaderViewModel @Inject constructor(
     }
 
     fun saveProgress(cfi: String, progress: Float) {
-        saveProgressInternal(cfi, progress, chapterTitle = "")
+        saveProgressInternal(cfi, progress)
     }
 
     fun flushProgress() {
         val state = _uiState.value
         if (!state.isStateRestored || state.bookId.isBlank()) return
+        val sessionSnapshot = sessionManager.sessionState.value
+        if (sessionManager.isSessionActiveFor(state.bookId) && sessionSnapshot.isPlaying) {
+            val ttsCfi = sessionSnapshot.highlightedCfi?.takeIf { it.isNotBlank() } ?: return
+            val ttsChapterIndex = sessionSnapshot.currentChapterIndex.coerceAtLeast(0)
+            val totalChapters = maxOf(
+                state.chapters.size,
+                state.extractedBook?.chapters?.size ?: 0,
+                sessionSnapshot.chapters.size
+            )
+            val paraCount = sessionSnapshot.paragraphs.size
+            val withinChap = if (paraCount <= 1) {
+                0f
+            } else {
+                (sessionSnapshot.activeParagraphIndex.toFloat() / (paraCount - 1)).coerceIn(0f, 1f)
+            }
+            val ttsProgress = if (totalChapters <= 1) {
+                withinChap
+            } else {
+                ((ttsChapterIndex + withinChap) / totalChapters).coerceIn(0f, 1f)
+            }
+            persistProgress(
+                targetBookId = state.bookId,
+                cfi = ttsCfi,
+                progress = ttsProgress,
+                chapterIndex = ttsChapterIndex,
+                forceExplicitParams = true
+            )
+            return
+        }
         if (state.currentCfi.isBlank() && state.progress <= 0f) return
-        persistProgress(state.bookId, state.currentCfi, state.progress)
+        persistProgress(state.bookId, state.currentCfi, state.progress, state.currentChapterIndex)
     }
 
     fun resetBookReady() {
         _uiState.update { it.copy(isBookReady = false) }
     }
 
-    private fun saveProgressInternal(cfi: String, progress: Float, chapterTitle: String) {
+    private fun saveProgressInternal(
+        cfi: String,
+        progress: Float,
+        explicitChapterIndex: Int = -1
+    ) {
         val clampedProgress = progress.coerceIn(0f, 1f)
         val targetBookId = bookId
+        var resolvedChapter = 0
         _uiState.update { state ->
             val chapterIndex = resolveChapterIndex(
                 chapters = state.chapters,
                 cfi = cfi,
                 progress = clampedProgress,
-                chapterTitle = chapterTitle,
+                explicitChapterIndex = explicitChapterIndex,
                 fallbackIndex = state.currentChapterIndex
             )
+            resolvedChapter = chapterIndex
+            val updatedPara = if (!state.isNarrationPlaying && state.paragraphs.isNotEmpty()) {
+                deriveParagraphIndexOrNull(cfi, state.paragraphs) ?: state.activeParagraphIndex
+            } else {
+                state.activeParagraphIndex
+            }
             state.copy(
                 currentCfi = cfi,
                 progress = clampedProgress,
-                currentChapterIndex = chapterIndex
+                currentChapterIndex = chapterIndex,
+                activeParagraphIndex = updatedPara
             )
         }
         if (targetBookId.isNotBlank()) {
-            persistProgress(targetBookId, cfi, clampedProgress)
+            persistProgress(targetBookId, cfi, clampedProgress, resolvedChapter)
         }
     }
 
-    private fun persistProgress(targetBookId: String, cfi: String, progress: Float) {
+    private fun persistProgress(
+        targetBookId: String,
+        cfi: String,
+        progress: Float,
+        chapterIndex: Int = _uiState.value.currentChapterIndex,
+        forceExplicitParams: Boolean = false
+    ) {
         viewModelScope.launch(NonCancellable) {
             try {
                 saveMutex.withLock {
                     val latestState = _uiState.value
-                    val cfiToSave = if (latestState.bookId == targetBookId) latestState.currentCfi else cfi
-                    val progressToSave = if (latestState.bookId == targetBookId) latestState.progress else progress
+                    val useLatest = !forceExplicitParams && latestState.bookId == targetBookId
+                    val cfiToSave = if (useLatest) latestState.currentCfi else cfi
+                    val progressToSave = if (useLatest) latestState.progress else progress
+                    val chapterToSave = (if (useLatest) latestState.currentChapterIndex else chapterIndex).coerceAtLeast(0)
                     val now = System.currentTimeMillis()
                     playbackStateDao?.saveReaderProgress(
                         bookId = targetBookId,
                         lastCfi = cfiToSave.ifBlank { null },
+                        chapterIndex = chapterToSave,
                         readingProgress = progressToSave,
                         updatedAt = now
                     )
@@ -1044,10 +1230,13 @@ class ReaderViewModel @Inject constructor(
         chapters: List<ChapterEntity>,
         cfi: String,
         progress: Float,
-        chapterTitle: String = "",
+        explicitChapterIndex: Int = -1,
         fallbackIndex: Int = 0
     ): Int {
-        if (chapters.isEmpty()) return fallbackIndex.coerceAtLeast(0)
+        val total = maxOf(chapters.size, _uiState.value.extractedBook?.chapters?.size ?: 0)
+        if (explicitChapterIndex >= 0 && (total == 0 || explicitChapterIndex < total)) {
+            return explicitChapterIndex
+        }
         if (cfi.isNotBlank()) {
             val exactIndex = chapters.indexOfFirst { !it.cfiRange.isNullOrBlank() && it.cfiRange == cfi }
             if (exactIndex >= 0) return exactIndex
@@ -1062,19 +1251,54 @@ class ReaderViewModel @Inject constructor(
                 }
             }.maxByOrNull { it.second }
             if (prefixMatch != null) return prefixMatch.first
+
+            PDF_PAGE_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { pdfPage ->
+                return if (total > 0) pdfPage.coerceIn(0, total - 1) else pdfPage.coerceAtLeast(0)
+            }
+
+            EPUB_SPINE_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { spineStep ->
+                val byChapterSpine = chapters.indexOfFirst { ch ->
+                    val range = ch.cfiRange ?: return@indexOfFirst false
+                    EPUB_SPINE_CFI_REGEX.find(range)?.groupValues?.getOrNull(1)?.toIntOrNull() == spineStep
+                }
+                if (byChapterSpine >= 0) return byChapterSpine
+                val inferred = (spineStep - 2).coerceAtLeast(0) / 2
+                return if (total > 0) inferred.coerceIn(0, total - 1) else inferred.coerceAtLeast(0)
+            }
         }
-        if (chapterTitle.isNotBlank()) {
-            val titleIndex = chapters.indexOfFirst { it.title.equals(chapterTitle.trim(), ignoreCase = true) }
-            if (titleIndex >= 0) return titleIndex
+        if (fallbackIndex > 0) {
+            return if (total > 0) fallbackIndex.coerceIn(0, total - 1) else fallbackIndex
         }
-        if (progress > 0f) {
+        if (chapters.isNotEmpty() && progress > 0f) {
             return (progress * chapters.size).toInt().coerceIn(0, chapters.size - 1)
         }
-        return fallbackIndex.coerceIn(0, chapters.size - 1)
+        return if (chapters.isNotEmpty()) fallbackIndex.coerceIn(0, chapters.size - 1) else fallbackIndex.coerceAtLeast(0)
     }
+
+    private fun deriveParagraphIndexOrNull(
+        cfi: String,
+        paragraphs: List<ReaderParagraph>
+    ): Int? {
+        if (cfi.isBlank() || paragraphs.isEmpty()) return null
+        val exact = paragraphs.indexOfFirst { it.cfi == cfi }
+        if (exact >= 0) return exact
+        PDF_PARA_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(2)?.toIntOrNull()?.let { pIdx ->
+            return pIdx.coerceIn(0, paragraphs.lastIndex)
+        }
+        EPUB_PARA_CFI_REGEX.find(cfi)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { oneBasedPara ->
+            return (oneBasedPara - 1).coerceIn(0, paragraphs.lastIndex)
+        }
+        return null
+    }
+
+    private fun deriveParagraphIndexFromCfi(
+        cfi: String,
+        paragraphs: List<ReaderParagraph>
+    ): Int = deriveParagraphIndexOrNull(cfi, paragraphs) ?: 0
 
     override fun onCleared() {
         // Do NOT stop background narration on ViewModel teardown; Audio continues cleanly in PlaybackCoordinator.
+        voicePreviewPlayer?.stop()
         flushProgress()
         super.onCleared()
     }
@@ -1082,20 +1306,40 @@ class ReaderViewModel @Inject constructor(
     override fun onParagraphsExtracted(chapterIndex: Int, paragraphsJson: String) {
         val state = _uiState.value
         val resolvedChapter = if (chapterIndex >= 0) chapterIndex else state.currentChapterIndex
+        if (resolvedChapter != state.currentChapterIndex) return
+        val sessionPlaying = sessionManager.sessionState.value.isPlaying &&
+            sessionManager.isSessionActiveFor(state.bookId)
+        if (state.isNarrationPlaying || sessionPlaying) return
+
         val isPdf = state.bookFormat.equals("PDF", ignoreCase = true) ||
             state.extractedBook?.format.equals("PDF", ignoreCase = true)
         val parsed = parseParagraphsJson(paragraphsJson, resolvedChapter, isPdf)
         if (parsed.isNotEmpty()) {
             val changed = parsed != state.paragraphs
+            val derivedPara = deriveParagraphIndexFromCfi(state.currentCfi, parsed)
             _uiState.update {
                 it.copy(
                     paragraphs = parsed,
-                    activeParagraphIndex = if (changed && !it.isNarrationPlaying) 0 else it.activeParagraphIndex
+                    activeParagraphIndex = if (changed) derivedPara else it.activeParagraphIndex.coerceIn(0, parsed.lastIndex)
                 )
             }
             syncContextToSession(forceWhenDifferentBook = false)
             if (_uiState.value.isBilingualEnabled && (changed || state.bilingualTranslations.isEmpty())) {
                 sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = false)
+            }
+        } else {
+            val kotlinParagraphs = state.extractedBook?.let {
+                sessionManager.buildParagraphsForChapter(it, resolvedChapter, state.bookFormat)
+            }.orEmpty()
+            if (kotlinParagraphs.isEmpty() && state.paragraphs.isNotEmpty()) {
+                _uiState.update {
+                    it.copy(
+                        paragraphs = emptyList(),
+                        activeParagraphIndex = 0,
+                        bilingualTranslations = emptyMap()
+                    )
+                }
+                syncContextToSession(forceWhenDifferentBook = false)
             }
         }
     }
@@ -1151,8 +1395,17 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
+    override fun onPageTurned(cfi: String, fraction: Float, chapterIndex: Int, chapterTitle: String) {
+        val state = _uiState.value
+        val activeSession = sessionManager.isSessionActiveFor(state.bookId) &&
+            (state.isNarrationPlaying || sessionManager.sessionState.value.isPlaying)
+        // Guard against WebView smooth-scroll feedback overwrites during active follow-highlight narration.
+        if (activeSession && state.followHighlight) return
+        saveProgressInternal(cfi, fraction, explicitChapterIndex = chapterIndex)
+    }
+
     override fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String) {
-        saveProgressInternal(cfi, fraction, chapterTitle)
+        onPageTurned(cfi, fraction, chapterIndex = -1, chapterTitle = chapterTitle)
     }
 
     override fun onBookReady() {
@@ -1294,6 +1547,10 @@ class ReaderViewModel @Inject constructor(
     }
 
     companion object {
+        private val EPUB_SPINE_CFI_REGEX = Regex("""/6/(\d+)""")
+        private val EPUB_PARA_CFI_REGEX = Regex("""!/4/2/(\d+)(?::\d+)?""")
+        private val PDF_PAGE_CFI_REGEX = Regex("""pdf:page:(\d+)""")
+        private val PDF_PARA_CFI_REGEX = Regex("""pdf:page:(\d+):p:(\d+)""")
         private val COLON_SPEAKER_REGEX = Regex("""^([A-Z][a-zA-Z]{1,24}(?:\s+[A-Z][a-zA-Z]{1,20})?):\s+\S""")
         private val AFTER_QUOTE_SPEAKER_REGEX = Regex(
             """["“”][^"“”]{2,}["””]\s*,?\s*(?:said|asked|replied|whispered|shouted|murmured|exclaimed|answered|cried|added|noted|observed|muttered|called)\s+([A-Z][a-zA-Z]{1,24})\b"""

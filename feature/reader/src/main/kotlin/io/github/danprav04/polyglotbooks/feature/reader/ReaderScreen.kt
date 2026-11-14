@@ -41,6 +41,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
+import io.github.danprav04.polyglotbooks.feature.settings.VoicePickerDialog
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -106,11 +107,16 @@ fun ReaderScreen(
         }
     }
 
-    // Sync explicit chapter/page changes (TOC, Next, Prev) to the WebView.
-    LaunchedEffect(isWebViewPageFinished, uiState.isBookReady, uiState.currentChapterIndex, webViewInstance) {
+    // Sync explicit chapter/page changes (TOC, Next, Prev, narration chapter advance) to the WebView.
+    LaunchedEffect(
+        isWebViewPageFinished,
+        uiState.isBookReady,
+        uiState.chapterNavigationNonce,
+        webViewInstance
+    ) {
         val webView = webViewInstance
         if (webView != null && isWebViewPageFinished && uiState.isBookReady &&
-            lastSyncedChapterIndex != null && uiState.currentChapterIndex != lastSyncedChapterIndex
+            uiState.chapterNavigationNonce > 0 && lastSyncedChapterIndex != null
         ) {
             lastSyncedChapterIndex = uiState.currentChapterIndex
             webView.evaluateJavascript("window.FoliateBridge?.loadChapter(${uiState.currentChapterIndex}, false);", null)
@@ -187,13 +193,21 @@ fun ReaderScreen(
     DisposableEffect(lifecycleOwner, viewModel) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
-                webViewInstance?.evaluateJavascript("window.FoliateBridge?.flushPosition?.();", null)
-                viewModel.flushProgress()
+                val wv = webViewInstance
+                if (wv != null) {
+                    wv.evaluateJavascript("window.FoliateBridge?.flushPosition?.();") {
+                        viewModel.flushProgress()
+                    }
+                } else {
+                    viewModel.flushProgress()
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
+            webViewInstance?.evaluateJavascript("window.FoliateBridge?.flushPosition?.();", null)
+            viewModel.stopVoicePreview()
             viewModel.flushProgress()
         }
     }
@@ -232,7 +246,21 @@ fun ReaderScreen(
                     }
                 },
                 navigationIcon = {
-                    IconButton(onClick = onBackClick) {
+                    IconButton(
+                        onClick = {
+                            viewModel.stopVoicePreview()
+                            val wv = webViewInstance
+                            if (wv != null) {
+                                wv.evaluateJavascript("window.FoliateBridge?.flushPosition?.();") {
+                                    viewModel.flushProgress()
+                                    onBackClick()
+                                }
+                            } else {
+                                viewModel.flushProgress()
+                                onBackClick()
+                            }
+                        }
+                    ) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
@@ -526,13 +554,6 @@ fun ReaderScreen(
                                             )
                                             .clickable {
                                                 viewModel.selectChapter(chapter)
-                                                val chapterCfi = chapter.cfiRange.orEmpty()
-                                                if (chapterCfi.isNotBlank()) {
-                                                    webViewInstance?.evaluateJavascript(
-                                                        "window.FoliateBridge?.goToCfi(${JSONObject.quote(chapterCfi)}, false);",
-                                                        null
-                                                    )
-                                                }
                                                 viewModel.setTocOpen(false)
                                             }
                                     )
@@ -570,6 +591,9 @@ fun ReaderScreen(
                         },
                         onSelectNarrateTranslated = viewModel::setNarrateTranslatedText,
                         onSelectEngine = viewModel::setNarrationEngine,
+                        onSelectDefaultNarratorVoice = viewModel::selectDefaultNarratorVoice,
+                        onToggleVoicePreview = viewModel::toggleVoicePreview,
+                        onStopVoicePreview = viewModel::stopVoicePreview,
                         onSelectSpeed = viewModel::setPlaybackSpeed,
                         onSelectSleepTimer = viewModel::setSleepTimer,
                         onToggleFollowHighlight = viewModel::setFollowHighlight,
@@ -587,11 +611,16 @@ fun ReaderScreen(
                 if (uiState.isCastEditorOpen) {
                     CastEditorDialog(
                         characters = uiState.characters,
+                        defaultNarratorVoiceId = uiState.defaultNarratorVoiceId,
+                        playingPreviewVoiceId = uiState.playingPreviewVoiceId,
+                        previewErrorMessage = uiState.previewErrorMessage,
                         isAnalyzing = uiState.isCastAnalyzing,
                         onAnalyzeCast = { viewModel.analyzeCastForCurrentChapter() },
                         onUpdateVoice = { character, voiceId, style ->
                             viewModel.updateCharacterVoice(character, voiceId, style)
                         },
+                        onTogglePreview = viewModel::toggleVoicePreview,
+                        onStopPreview = viewModel::stopVoicePreview,
                         onDismiss = { viewModel.setCastEditorOpen(false) }
                     )
                 }
@@ -754,13 +783,24 @@ private fun AppearanceAndLanguageDialog(
 @Composable
 private fun CastEditorDialog(
     characters: List<CharacterEntity>,
+    defaultNarratorVoiceId: String,
+    playingPreviewVoiceId: String?,
+    previewErrorMessage: String?,
     isAnalyzing: Boolean,
     onAnalyzeCast: () -> Unit,
     onUpdateVoice: (CharacterEntity, String, String?) -> Unit,
+    onTogglePreview: (String) -> Unit,
+    onStopPreview: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    DisposableEffect(Unit) {
+        onDispose { onStopPreview() }
+    }
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            onStopPreview()
+            onDismiss()
+        },
         title = { Text("Character Cast Editor") },
         text = {
             Column(
@@ -802,7 +842,12 @@ private fun CastEditorDialog(
                         items(characters, key = { it.id }) { character ->
                             CastCharacterRow(
                                 character = character,
-                                onUpdateVoice = onUpdateVoice
+                                defaultNarratorVoiceId = defaultNarratorVoiceId,
+                                playingPreviewVoiceId = playingPreviewVoiceId,
+                                previewErrorMessage = previewErrorMessage,
+                                onUpdateVoice = onUpdateVoice,
+                                onTogglePreview = onTogglePreview,
+                                onStopPreview = onStopPreview
                             )
                         }
                     }
@@ -810,7 +855,12 @@ private fun CastEditorDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(
+                onClick = {
+                    onStopPreview()
+                    onDismiss()
+                }
+            ) {
                 Text("Close")
             }
         }
@@ -820,11 +870,17 @@ private fun CastEditorDialog(
 @Composable
 private fun CastCharacterRow(
     character: CharacterEntity,
-    onUpdateVoice: (CharacterEntity, String, String?) -> Unit
+    defaultNarratorVoiceId: String,
+    playingPreviewVoiceId: String?,
+    previewErrorMessage: String?,
+    onUpdateVoice: (CharacterEntity, String, String?) -> Unit,
+    onTogglePreview: (String) -> Unit,
+    onStopPreview: () -> Unit
 ) {
-    var voiceDropdownExpanded by remember { mutableStateOf(false) }
+    var showVoicePicker by remember { mutableStateOf(false) }
     var styleText by remember(character.id, character.voiceTraits) { mutableStateOf(character.voiceTraits) }
-    val selectedVoice = character.assignedVoiceId ?: "Charon"
+    val selectedVoice = character.assignedVoiceId?.takeIf { it.isNotBlank() } ?: defaultNarratorVoiceId
+    val voiceProfile = remember(selectedVoice) { GeminiStudioVoices.getVoice(selectedVoice) }
 
     Surface(
         tonalElevation = 2.dp,
@@ -845,30 +901,20 @@ private fun CastCharacterRow(
                     style = MaterialTheme.typography.titleSmall,
                     modifier = Modifier.weight(1f)
                 )
-                Box {
-                    OutlinedButton(
-                        onClick = { voiceDropdownExpanded = true },
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                    ) {
-                        Text(selectedVoice, style = MaterialTheme.typography.labelMedium)
-                    }
-                    DropdownMenu(
-                        expanded = voiceDropdownExpanded,
-                        onDismissRequest = { voiceDropdownExpanded = false },
-                        modifier = Modifier.heightIn(max = 260.dp)
-                    ) {
-                        GeminiStudioVoices.catalog.forEach { voice ->
-                            DropdownMenuItem(
-                                text = {
-                                    Text("${voice.name} (${voice.gender}, ${voice.traits.joinToString()})")
-                                },
-                                onClick = {
-                                    voiceDropdownExpanded = false
-                                    onUpdateVoice(character, voice.id, styleText)
-                                }
-                            )
-                        }
-                    }
+                OutlinedButton(
+                    onClick = { showVoicePicker = true },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.RecordVoiceOver,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = voiceProfile?.let { "${it.name} (${it.gender})" } ?: selectedVoice,
+                        style = MaterialTheme.typography.labelMedium
+                    )
                 }
             }
             Row(
@@ -889,6 +935,27 @@ private fun CastCharacterRow(
                 }
             }
         }
+    }
+
+    if (showVoicePicker) {
+        VoicePickerDialog(
+            selectedVoiceId = selectedVoice,
+            playingVoiceId = playingPreviewVoiceId,
+            previewErrorMessage = previewErrorMessage,
+            onSelectVoice = { voiceId ->
+                onStopPreview()
+                showVoicePicker = false
+                onUpdateVoice(character, voiceId, styleText)
+            },
+            onTogglePreview = onTogglePreview,
+            onStopPreview = onStopPreview,
+            onDismiss = {
+                onStopPreview()
+                showVoicePicker = false
+            },
+            title = "Voice for ${character.name}",
+            subtitle = "Choose a Gemini Studio voice and tap play to preview"
+        )
     }
 }
 
@@ -1098,6 +1165,9 @@ private fun ExpandedNarrationSheet(
     onStopNarration: () -> Unit,
     onSelectNarrateTranslated: (Boolean) -> Unit,
     onSelectEngine: (NarrationEngine) -> Unit,
+    onSelectDefaultNarratorVoice: (String) -> Unit,
+    onToggleVoicePreview: (String) -> Unit,
+    onStopVoicePreview: () -> Unit,
     onSelectSpeed: (Float) -> Unit,
     onSelectSleepTimer: (Int) -> Unit,
     onToggleFollowHighlight: (Boolean) -> Unit,
@@ -1108,6 +1178,11 @@ private fun ExpandedNarrationSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var speedMenuExpanded by remember { mutableStateOf(false) }
     var sleepMenuExpanded by remember { mutableStateOf(false) }
+    var showNarratorVoicePicker by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        onDispose { onStopVoicePreview() }
+    }
 
     val coverBitmap = remember(uiState.bookCoverUri, uiState.bookId) {
         val uriFile = uiState.bookCoverUri?.let { File(it) }
@@ -1390,6 +1465,50 @@ private fun ExpandedNarrationSheet(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            // Default Narrator Voice Selector
+            val activeNarratorVoice = remember(uiState.defaultNarratorVoiceId) {
+                GeminiStudioVoices.getVoice(uiState.defaultNarratorVoiceId)
+            }
+            OutlinedCard(
+                onClick = { showNarratorVoicePicker = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.RecordVoiceOver,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Default Narrator Voice",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = activeNarratorVoice?.let {
+                                "${it.name} · ${it.gender} · ${it.traits.joinToString(", ")}"
+                            } ?: uiState.defaultNarratorVoiceId,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Text(
+                        text = "Change",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+
             // Comfort Controls Row: Speed, Sleep Timer, Follow Highlight, Jump to current, Cast Editor
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1479,6 +1598,27 @@ private fun ExpandedNarrationSheet(
                 }
             }
         }
+    }
+
+    if (showNarratorVoicePicker) {
+        VoicePickerDialog(
+            selectedVoiceId = uiState.defaultNarratorVoiceId,
+            playingVoiceId = uiState.playingPreviewVoiceId,
+            previewErrorMessage = uiState.previewErrorMessage,
+            onSelectVoice = { voiceId ->
+                onStopVoicePreview()
+                onSelectDefaultNarratorVoice(voiceId)
+                showNarratorVoicePicker = false
+            },
+            onTogglePreview = onToggleVoicePreview,
+            onStopPreview = onStopVoicePreview,
+            onDismiss = {
+                onStopVoicePreview()
+                showNarratorVoicePicker = false
+            },
+            title = "Default Narrator Voice",
+            subtitle = "Used for narration unless overridden per character"
+        )
     }
 }
 

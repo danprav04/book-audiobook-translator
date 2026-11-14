@@ -7,7 +7,10 @@ import android.webkit.JavascriptInterface
  */
 interface ReaderBridgeListener {
     fun onParagraphsExtracted(chapterIndex: Int, paragraphsJson: String)
-    fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String)
+    fun onPageTurned(cfi: String, fraction: Float, chapterIndex: Int, chapterTitle: String) {
+        onPageTurned(cfi, fraction, chapterTitle)
+    }
+    fun onPageTurned(cfi: String, fraction: Float, chapterTitle: String) {}
     fun onSelectionChanged(cfiRange: String, selectedText: String)
     fun onSearchResults(resultsJson: String)
     fun onBookReady() {}
@@ -32,13 +35,18 @@ class ReaderBridge(
     }
 
     @JavascriptInterface
+    fun onPageTurn(cfi: String, fraction: Float, chapterIndex: Int, chapterTitle: String) {
+        listener?.onPageTurned(cfi, fraction, chapterIndex, chapterTitle)
+    }
+
+    @JavascriptInterface
     fun onPageTurn(cfi: String, fraction: Float, chapterTitle: String) {
-        listener?.onPageTurned(cfi, fraction, chapterTitle)
+        listener?.onPageTurned(cfi, fraction, -1, chapterTitle)
     }
 
     @JavascriptInterface
     fun onPageTurn(cfi: String) {
-        listener?.onPageTurned(cfi, 0f, "")
+        listener?.onPageTurned(cfi, 0f, -1, "")
     }
 
     @JavascriptInterface

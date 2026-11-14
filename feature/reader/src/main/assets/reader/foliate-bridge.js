@@ -51,10 +51,11 @@
     }
   }
 
-  function notifyPageTurn(cfi, fraction, chapterTitle) {
+  function notifyPageTurn(cfi, fraction, chapterIndex, chapterTitle) {
     if (!cfi && !(fraction > 0)) return;
     if (window.AndroidReaderBridge && typeof window.AndroidReaderBridge.onPageTurn === "function") {
-      window.AndroidReaderBridge.onPageTurn(cfi, Number(fraction) || 0, chapterTitle || "");
+      const idx = typeof chapterIndex === "number" && !isNaN(chapterIndex) ? chapterIndex : -1;
+      window.AndroidReaderBridge.onPageTurn(cfi, Number(fraction) || 0, idx, chapterTitle || "");
     }
   }
 
@@ -136,27 +137,49 @@
     return currentFraction;
   }
 
+  function findTopVisibleParagraph(container) {
+    const paragraphs = Array.from(container.querySelectorAll("[data-cfi]"));
+    if (paragraphs.length === 0) return null;
+
+    for (let i = 0; i < paragraphs.length; i++) {
+      const rect = paragraphs[i].getBoundingClientRect();
+      if (rect.bottom > 4) {
+        return paragraphs[i];
+      }
+    }
+    return paragraphs[paragraphs.length - 1];
+  }
+
+  function reportCurrentScrollPosition() {
+    const container = getContainer();
+    if (!container || !isBookReady || isPdfFormat()) return;
+    const topVisible = findTopVisibleParagraph(container);
+    if (!topVisible) return;
+    const cfi = topVisible.getAttribute("data-cfi") || "";
+    if (!cfi) return;
+    currentCfi = cfi;
+    currentFraction = estimateFractionForElement(topVisible);
+    hasDirtyPosition = false;
+    const title = chaptersData?.chapters?.[currentChapterIndex]?.title || "";
+    notifyPageTurn(currentCfi, currentFraction, currentChapterIndex, title);
+  }
+
   function attachScrollTracking() {
     if (window.__polyglotScrollBound) return;
     window.__polyglotScrollBound = true;
 
+    const clearScrollSuppression = function () {
+      suppressScrollUntil = 0;
+    };
+    window.addEventListener("touchstart", clearScrollSuppression, { passive: true });
+    window.addEventListener("pointerdown", clearScrollSuppression, { passive: true });
+    window.addEventListener("wheel", clearScrollSuppression, { passive: true });
+
     window.addEventListener("scroll", function () {
       const container = getContainer();
       if (!container || !isBookReady || isPdfFormat() || Date.now() < suppressScrollUntil) return;
-      const paragraphs = Array.from(container.querySelectorAll("[data-cfi]"));
-      if (paragraphs.length === 0) return;
-
-      let topVisible = null;
-      for (let i = 0; i < paragraphs.length; i++) {
-        const rect = paragraphs[i].getBoundingClientRect();
-        if (rect.bottom > 4) {
-          topVisible = paragraphs[i];
-          break;
-        }
-      }
-      if (!topVisible) {
-        topVisible = paragraphs[paragraphs.length - 1];
-      }
+      const topVisible = findTopVisibleParagraph(container);
+      if (!topVisible) return;
       const cfi = topVisible.getAttribute("data-cfi") || "";
       if (!cfi) return;
       currentCfi = cfi;
@@ -168,7 +191,7 @@
         if (hasDirtyPosition) {
           hasDirtyPosition = false;
           const title = chaptersData?.chapters?.[currentChapterIndex]?.title || "";
-          notifyPageTurn(currentCfi, currentFraction, title);
+          notifyPageTurn(currentCfi, currentFraction, currentChapterIndex, title);
         }
       }, 300);
     }, { passive: true });
@@ -289,18 +312,19 @@
     summary.textContent = "Page Text (" + paragraphs.length + " paragraphs)";
     details.appendChild(summary);
 
+    const basePage = parsePdfPageFromCfi(chapter && chapter.href) ?? clampedPage;
     const extractedPayload = [];
     if (paragraphs.length > 0) {
       paragraphs.forEach(function (text, pIdx) {
         const p = document.createElement("p");
-        const cfi = "pdf:page:" + clampedPage + ":p:" + pIdx;
+        const cfi = "pdf:page:" + basePage + ":p:" + pIdx;
         p.setAttribute("data-cfi", cfi);
         p.setAttribute("data-paragraph-index", String(pIdx));
-        p.setAttribute("data-id", "pdf_" + clampedPage + "_" + pIdx);
+        p.setAttribute("data-id", "pdf_" + basePage + "_" + pIdx);
         p.textContent = text;
         details.appendChild(p);
         extractedPayload.push({
-          id: "pdf_" + clampedPage + "_" + pIdx,
+          id: "pdf_" + basePage + "_" + pIdx,
           text: text,
           cfiRange: cfi
         });
@@ -314,7 +338,7 @@
     viewer.appendChild(details);
     container.appendChild(viewer);
 
-    suppressScrollUntil = Date.now() + 250;
+    suppressScrollUntil = Date.now() + 500;
     window.scrollTo(0, 0);
     document.documentElement.scrollTop = 0;
     void container.offsetHeight;
@@ -328,7 +352,7 @@
     notifyParagraphs(currentChapterIndex, extractedPayload);
 
     if (notifyAndroid !== false) {
-      notifyPageTurn(currentCfi, currentFraction, "Page " + (clampedPage + 1));
+      notifyPageTurn(currentCfi, currentFraction, currentChapterIndex, "Page " + (clampedPage + 1));
     }
   }
 
@@ -354,7 +378,11 @@
     const bodyWrapper = document.createElement("div");
     bodyWrapper.className = "chapter-content";
     if (chapter.html && chapter.html.trim().length > 0) {
-      bodyWrapper.innerHTML = chapter.html;
+      // Expand self-closing non-void block tags so HTML5 DOM matches XHTML leaf extraction.
+      bodyWrapper.innerHTML = String(chapter.html).replace(
+        /<(p|h[1-6]|li|blockquote|div)\b([^>]*?)\/\s*>/gi,
+        "<$1$2></$1>"
+      );
     } else if (Array.isArray(chapter.paragraphs)) {
       bodyWrapper.innerHTML = chapter.paragraphs.map(function (t) {
         return "<p>" + escapeHtml(t) + "</p>";
@@ -393,7 +421,7 @@
       });
     });
 
-    suppressScrollUntil = Date.now() + 250;
+    suppressScrollUntil = Date.now() + 500;
     window.scrollTo(0, 0);
     document.documentElement.scrollTop = 0;
     void container.offsetHeight;
@@ -412,7 +440,7 @@
     notifyParagraphs(clampedIndex, extractedPayload);
 
     if (notifyAndroid !== false) {
-      notifyPageTurn(currentCfi, currentFraction, chapter.title || "");
+      notifyPageTurn(currentCfi, currentFraction, clampedIndex, chapter.title || "");
     }
   }
 
@@ -457,6 +485,9 @@
           const initialPage = parsePdfPageFromCfi(resolvedInitialCfi) ?? 0;
           isBookReady = true;
           renderPdfPage(initialPage, false);
+          if (resolvedInitialCfi && String(resolvedInitialCfi).trim().length > 0) {
+            this.goToCfi(resolvedInitialCfi, false);
+          }
         } else {
           const chapters = Array.isArray(chaptersData.chapters) ? chaptersData.chapters : [];
           if (chapters.length === 0) {
@@ -508,7 +539,7 @@
         currentCfi = cfi;
         const el = findElementByCfi(cfi);
         if (el) {
-          suppressScrollUntil = Date.now() + 250;
+          suppressScrollUntil = Date.now() + 500;
           el.scrollIntoView({ behavior: notifyAndroid === false ? "auto" : "smooth", block: "center" });
         }
         if (notifyAndroid === false) {
@@ -517,7 +548,7 @@
         }
         currentFraction = totalPdfPages <= 1 ? 0.0 : currentPdfPage / (totalPdfPages - 1);
         hasDirtyPosition = false;
-        notifyPageTurn(cfi, currentFraction, "Page " + (currentPdfPage + 1));
+        notifyPageTurn(cfi, currentFraction, currentChapterIndex, "Page " + (currentPdfPage + 1));
         return;
       }
 
@@ -535,7 +566,7 @@
       currentCfi = cfi;
       const el = findElementByCfi(cfi);
       if (el) {
-        suppressScrollUntil = Date.now() + 250;
+        suppressScrollUntil = Date.now() + 500;
         el.scrollIntoView({ behavior: notifyAndroid === false ? "auto" : "smooth", block: "center" });
       }
       if (notifyAndroid === false) {
@@ -546,7 +577,7 @@
       currentFraction = fraction;
       hasDirtyPosition = false;
       const title = chaptersData?.chapters?.[currentChapterIndex]?.title || "";
-      notifyPageTurn(cfi, fraction, title);
+      notifyPageTurn(cfi, fraction, currentChapterIndex, title);
     },
 
     flushPosition: function () {
@@ -559,7 +590,7 @@
         const title = isPdfFormat()
           ? "Page " + (currentPdfPage + 1)
           : (chaptersData?.chapters?.[currentChapterIndex]?.title || "");
-        notifyPageTurn(currentCfi, currentFraction, title);
+        notifyPageTurn(currentCfi, currentFraction, currentChapterIndex, title);
       }
     },
 
@@ -576,7 +607,10 @@
       const atBottom = scrollTop + viewportHeight >= docHeight - 12;
       if (!atBottom && docHeight > viewportHeight) {
         const step = Math.max(120, Math.floor(viewportHeight * 0.85));
+        suppressScrollUntil = Date.now() + 350;
         window.scrollBy({ top: step, behavior: "smooth" });
+        if (scrollReportTimer) clearTimeout(scrollReportTimer);
+        scrollReportTimer = setTimeout(reportCurrentScrollPosition, 420);
         return;
       }
       const chapters = chaptersData?.chapters || [];
@@ -597,7 +631,10 @@
       const atTop = scrollTop <= 12;
       if (!atTop) {
         const step = Math.max(120, Math.floor(viewportHeight * 0.85));
+        suppressScrollUntil = Date.now() + 350;
         window.scrollBy({ top: -step, behavior: "smooth" });
+        if (scrollReportTimer) clearTimeout(scrollReportTimer);
+        scrollReportTimer = setTimeout(reportCurrentScrollPosition, 420);
         return;
       }
       if (currentChapterIndex > 0) {
@@ -613,7 +650,15 @@
       }
       if (isPdfFormat()) {
         const targetPage = parsePdfPageFromCfi(cfiRange);
-        if (targetPage !== null && targetPage !== currentPdfPage) {
+        const targetChapter = targetPage !== null ? chapterIndexForPdfPage(targetPage) : null;
+        if (targetPage !== null && targetChapter !== null && targetChapter !== currentChapterIndex) {
+          renderPdfPage(targetPage, false);
+        } else if (
+          targetPage !== null &&
+          chaptersData?.chapters &&
+          chaptersData.chapters.length >= totalPdfPages &&
+          targetPage !== currentPdfPage
+        ) {
           renderPdfPage(targetPage, false);
         }
       } else {
@@ -637,7 +682,7 @@
           const comfortBottom = vh * 0.72;
           const outOfComfortZone = rect.top < comfortTop || rect.bottom > comfortBottom;
           if (outOfComfortZone) {
-            suppressScrollUntil = Date.now() + 350;
+            suppressScrollUntil = Date.now() + 900;
             el.scrollIntoView({ behavior: "smooth", block: "center" });
           }
         }
@@ -646,7 +691,14 @@
 
     jumpToHighlight: function () {
       if (!activeHighlightCfi) return;
-      if (!isPdfFormat()) {
+      if (isPdfFormat()) {
+        const targetPage = parsePdfPageFromCfi(activeHighlightCfi);
+        const targetChapter = targetPage !== null ? chapterIndexForPdfPage(targetPage) : null;
+        if (targetPage !== null && targetChapter !== null && targetChapter !== currentChapterIndex) {
+          renderPdfPage(targetPage, false);
+          applyHighlightToDom();
+        }
+      } else {
         const targetChapter = parseChapterIndexFromCfi(activeHighlightCfi);
         if (
           targetChapter !== null &&
@@ -660,7 +712,7 @@
       }
       const el = findElementByCfi(activeHighlightCfi);
       if (el) {
-        suppressScrollUntil = Date.now() + 350;
+        suppressScrollUntil = Date.now() + 900;
         el.scrollIntoView({ behavior: "smooth", block: "center" });
       }
     },

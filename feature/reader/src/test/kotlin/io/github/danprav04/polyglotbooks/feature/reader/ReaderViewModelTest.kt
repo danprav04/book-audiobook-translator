@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.reader
 
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelStore
+import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
 import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
@@ -15,8 +16,13 @@ import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.playback.ActivePlaybackSource
+import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import io.github.danprav04.polyglotbooks.core.gemini.Blob
 import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
@@ -46,18 +52,20 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 
 class FakeBookDao : BookDao {
-    var book = BookEntity(
+    private val defaultBook = BookEntity(
         id = "test_book",
         title = "Test Book",
         author = "Author",
@@ -68,15 +76,37 @@ class FakeBookDao : BookDao {
         lastReadDate = System.currentTimeMillis(),
         isAudiobook = false
     )
+    private val books = linkedMapOf(defaultBook.id to defaultBook)
 
-    override fun getAllBooks(): Flow<List<BookEntity>> = flowOf(listOf(book))
-    override suspend fun getBookById(id: String): BookEntity? = if (id == book.id) book else null
+    var book: BookEntity = defaultBook
+        set(value) {
+            field = value
+            books[value.id] = value
+        }
+
+    override fun getAllBooks(): Flow<List<BookEntity>> = flowOf(books.values.toList())
+    override suspend fun getBookById(id: String): BookEntity? =
+        books[id] ?: if (id == book.id) book else null
     override fun getBooksByType(isAudiobook: Boolean): Flow<List<BookEntity>> = flowOf(emptyList())
-    override suspend fun insertBook(book: BookEntity) { this.book = book }
-    override suspend fun insertBooks(books: List<BookEntity>) {}
-    override suspend fun updateBook(book: BookEntity) { this.book = book }
-    override suspend fun deleteBook(book: BookEntity) {}
-    override suspend fun deleteBookById(id: String) {}
+    override suspend fun insertBook(book: BookEntity) {
+        books[book.id] = book
+        this.book = book
+    }
+    override suspend fun insertBooks(books: List<BookEntity>) {
+        books.forEach { this.books[it.id] = it }
+    }
+    override suspend fun updateBook(book: BookEntity) {
+        books[book.id] = book
+        if (this.book.id == book.id || books.size <= 1) {
+            this.book = book
+        }
+    }
+    override suspend fun deleteBook(book: BookEntity) {
+        books.remove(book.id)
+    }
+    override suspend fun deleteBookById(id: String) {
+        books.remove(id)
+    }
     override suspend fun insertChapters(chapters: List<ChapterEntity>) {}
 }
 
@@ -86,16 +116,33 @@ class FakeChapterDao(
         ChapterEntity(id = "ch_2", bookId = "test_book", index = 1, title = "Chapter 2", startMs = 1000, endMs = 2000, cfiRange = "cfi_2", textLength = 100)
     )
 ) : ChapterDao {
-    val chapters = initialChapters
+    private val chaptersFlow = MutableStateFlow(initialChapters)
+    val chapters: List<ChapterEntity>
+        get() = chaptersFlow.value
 
-    override fun getChaptersForBook(bookId: String): Flow<List<ChapterEntity>> = flowOf(chapters)
-    override suspend fun getChapterById(id: String): ChapterEntity? = chapters.find { it.id == id }
-    override suspend fun getChapterByIndex(bookId: String, index: Int): ChapterEntity? = chapters.find { it.index == index }
-    override suspend fun insertChapter(chapter: ChapterEntity) {}
-    override suspend fun insertChapters(chapters: List<ChapterEntity>) {}
-    override suspend fun updateChapter(chapter: ChapterEntity) {}
-    override suspend fun deleteChapter(chapter: ChapterEntity) {}
-    override suspend fun deleteChaptersByBookId(bookId: String) {}
+    override fun getChaptersForBook(bookId: String): Flow<List<ChapterEntity>> =
+        chaptersFlow.map { list -> list.filter { it.bookId == bookId } }
+    override suspend fun getChapterById(id: String): ChapterEntity? =
+        chaptersFlow.value.find { it.id == id }
+    override suspend fun getChapterByIndex(bookId: String, index: Int): ChapterEntity? =
+        chaptersFlow.value.find { it.bookId == bookId && it.index == index }
+    override suspend fun insertChapter(chapter: ChapterEntity) {
+        chaptersFlow.value = chaptersFlow.value.filterNot { it.id == chapter.id } + chapter
+    }
+    override suspend fun insertChapters(chapters: List<ChapterEntity>) {
+        val incomingIds = chapters.map { it.id }.toSet()
+        chaptersFlow.value = (chaptersFlow.value.filterNot { it.id in incomingIds } + chapters)
+            .sortedWith(compareBy({ it.bookId }, { it.index }))
+    }
+    override suspend fun updateChapter(chapter: ChapterEntity) {
+        chaptersFlow.value = chaptersFlow.value.map { if (it.id == chapter.id) chapter else it }
+    }
+    override suspend fun deleteChapter(chapter: ChapterEntity) {
+        chaptersFlow.value = chaptersFlow.value.filterNot { it.id == chapter.id }
+    }
+    override suspend fun deleteChaptersByBookId(bookId: String) {
+        chaptersFlow.value = chaptersFlow.value.filterNot { it.bookId == bookId }
+    }
 }
 
 class FakePlaybackStateDao : PlaybackStateDao {
@@ -175,6 +222,7 @@ class FakeSettingsRepository : SettingsRepository {
     private val _lastOpenedBookId = MutableStateFlow<String?>(null)
     private val _targetLanguage = MutableStateFlow(LanguageCode.ENGLISH)
     private val _readerNarrationEngine = MutableStateFlow("GEMINI_FLASH_TTS")
+    private val _defaultNarratorVoiceId = MutableStateFlow(GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID)
     private val _readerReadTranslated = MutableStateFlow(false)
     private val _readerNarrationSpeed = MutableStateFlow(1.0f)
     private val _readerTheme = MutableStateFlow("LIGHT")
@@ -190,6 +238,7 @@ class FakeSettingsRepository : SettingsRepository {
     override val featureUsageStats: Flow<FeatureUsageStats> = flowOf(FeatureUsageStats())
     override val lastOpenedBookId: Flow<String?> = _lastOpenedBookId
     override val readerNarrationEngine: Flow<String> = _readerNarrationEngine
+    override val defaultNarratorVoiceId: Flow<String> = _defaultNarratorVoiceId
     override val readerReadTranslated: Flow<Boolean> = _readerReadTranslated
     override val readerNarrationSpeed: Flow<Float> = _readerNarrationSpeed
     override val readerTheme: Flow<String> = _readerTheme
@@ -215,6 +264,9 @@ class FakeSettingsRepository : SettingsRepository {
     }
     override suspend fun setReaderNarrationEngine(engineName: String) {
         _readerNarrationEngine.value = engineName
+    }
+    override suspend fun setDefaultNarratorVoiceId(voiceId: String) {
+        _defaultNarratorVoiceId.value = voiceId
     }
     override suspend fun setReaderReadTranslated(readTranslated: Boolean) {
         _readerReadTranslated.value = readTranslated
@@ -663,21 +715,57 @@ class ReaderViewModelTest {
     fun testToggleNarrationAndBridgeErrorCallback() = runTest {
         val bookDao = FakeBookDao()
         val chapterDao = FakeChapterDao()
+        val settingsRepo = FakeSettingsRepository().apply {
+            setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+        }
+        val gate = CompletableDeferred<Unit>()
         val viewModel = ReaderViewModel(
             bookDao = bookDao,
             chapterDao = chapterDao,
-            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book"))
-        )
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book")),
+            settingsRepository = settingsRepo
+        ).apply {
+            sessionManager.ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+            sessionManager.systemTtsFactory = {
+                object : io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine {
+                    override val id = io.github.danprav04.polyglotbooks.feature.narration.EngineId.SYSTEM_TTS
+                    override val capabilities = io.github.danprav04.polyglotbooks.feature.narration.EngineCapabilities(
+                        supportsMultiVoice = false,
+                        supportsEmotionalStyles = false,
+                        supportsStreaming = false,
+                        outputSampleRate = 24000
+                    )
+                    override suspend fun voices() = emptyList<io.github.danprav04.polyglotbooks.feature.narration.VoiceInfo>()
+                    override fun synthesize(request: io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest) = kotlinx.coroutines.flow.flow {
+                        emit(io.github.danprav04.polyglotbooks.core.model.PcmChunk(ByteArray(800), 24000, 1))
+                        gate.await()
+                    }
+                }
+            }
+        }
         val bridge = ReaderBridge(viewModel)
+        runCurrent()
+        viewModel.onParagraphsExtracted(
+            0,
+            """[{"index":0,"text":"Playable test paragraph.","cfi":"epubcfi(/6/2!/4/2/1:0)"}]"""
+        )
 
         assertFalse(viewModel.uiState.value.isNarrationPlaying)
         viewModel.toggleNarration()
+        runCurrent()
         assertTrue(viewModel.uiState.value.isNarrationPlaying)
         viewModel.toggleNarration()
+        runCurrent()
         assertFalse(viewModel.uiState.value.isNarrationPlaying)
+        gate.complete(Unit)
+        viewModel.stopNarration()
+        runCurrent()
 
         bridge.onReaderError("Failed to render chapter")
         assertEquals("Failed to render chapter", viewModel.uiState.value.errorMessage)
+        val clearStore = ViewModelStore()
+        clearStore.put("reader", viewModel)
+        clearStore.clear()
     }
 
     @Test
@@ -1029,7 +1117,26 @@ class ReaderViewModelTest {
             chapterDao = chapterDao,
             settingsRepository = settingsRepo,
             applicationScope = backgroundScope
-        )
+        ).apply {
+            ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+            systemTtsFactory = {
+                object : io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine {
+                    override val id = io.github.danprav04.polyglotbooks.feature.narration.EngineId.SYSTEM_TTS
+                    override val capabilities = io.github.danprav04.polyglotbooks.feature.narration.EngineCapabilities(
+                        supportsMultiVoice = false,
+                        supportsEmotionalStyles = false,
+                        supportsStreaming = false,
+                        outputSampleRate = 24000
+                    )
+                    override suspend fun voices() = emptyList<io.github.danprav04.polyglotbooks.feature.narration.VoiceInfo>()
+                    override fun synthesize(request: io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest) =
+                        kotlinx.coroutines.flow.flow {
+                            emit(PcmChunk(ByteArray(1600), 24000, 1))
+                            CompletableDeferred<Unit>().await()
+                        }
+                }
+            }
+        }
         sharedSession.updateBookContext(
             bookId = "book-bg",
             bookTitle = "Background Book",
@@ -1072,5 +1179,424 @@ class ReaderViewModelTest {
 
         assertTrue(sharedSession.sessionState.value.isActiveSession)
         assertTrue(sharedSession.sessionState.value.isPlaying)
+    }
+
+    private class FakeVoicePreviewPlayer : VoicePreviewPlayer {
+        private val _playing = MutableStateFlow<String?>(null)
+        private val _error = MutableStateFlow<String?>(null)
+        override val playingVoiceId: StateFlow<String?> = _playing.asStateFlow()
+        override val previewError: StateFlow<String?> = _error.asStateFlow()
+        var stopCount = 0
+
+        override fun togglePreview(voiceId: String, onBeforeStart: (() -> Unit)?) {
+            if (_playing.value == voiceId) {
+                stop()
+            } else {
+                onBeforeStart?.invoke()
+                _error.value = null
+                _playing.value = voiceId
+            }
+        }
+
+        override fun stop() {
+            stopCount++
+            _playing.value = null
+        }
+    }
+
+    private fun createTestBook(id: String, title: String) = BookEntity(
+        id = id,
+        title = title,
+        author = "Author",
+        format = "EPUB",
+        filePath = "",
+        coverUri = null,
+        addedDate = 0L,
+        lastReadDate = 0L,
+        isAudiobook = false
+    )
+
+    @Test
+    fun `default narrator voice updates settings and replaces Charon in cast analysis`() = runTest {
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook("book-cast", "Cast Novel"))
+        }
+        val chapterDao = FakeChapterDao().apply {
+            insertChapters(
+                listOf(ChapterEntity("c0", "book-cast", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 50))
+            )
+        }
+        val characterDao = FakeCharacterDao()
+        val settingsRepo = FakeSettingsRepository()
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-cast")),
+            settingsRepository = settingsRepo,
+            characterDao = characterDao,
+            textModelClient = FakeTextModelClient { """{"characters":[{"name":"Narrator"},{"name":"Alice","gender":"FEMALE"}]}""" }
+        )
+        advanceUntilIdle()
+
+        viewModel.selectDefaultNarratorVoice("kore")
+        advanceUntilIdle()
+        assertEquals("Kore", viewModel.uiState.value.defaultNarratorVoiceId)
+        assertEquals("Kore", settingsRepo.defaultNarratorVoiceId.first())
+
+        viewModel.onParagraphsExtracted(
+            0,
+            """[{"index":0,"text":"\"Hello,\" Alice whispered softly."}]"""
+        )
+        viewModel.analyzeCastForCurrentChapter()
+        advanceUntilIdle()
+
+        val savedChars = characterDao.getCharactersForBook("book-cast").first()
+        val narrator = savedChars.firstOrNull { it.name.equals("Narrator", ignoreCase = true) }
+        assertNotNull(narrator)
+        assertEquals("Kore", narrator?.assignedVoiceId)
+        assertTrue(savedChars.none { it.assignedVoiceId == "Charon" && it.name.equals("Narrator", ignoreCase = true) })
+    }
+
+    @Test
+    fun `toggleVoicePreview pauses active PlaybackCoordinator and onCleared stops preview`() = runTest {
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook("book-prev", "Preview Book"))
+        }
+        val chapterDao = FakeChapterDao()
+        val coordinator = PlaybackCoordinator()
+        val previewPlayer = FakeVoicePreviewPlayer()
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-prev")),
+            voicePreviewPlayer = previewPlayer,
+            playbackCoordinator = coordinator
+        )
+        advanceUntilIdle()
+
+        var delegatePaused = false
+        coordinator.registerExternalDelegate(
+            object : io.github.danprav04.polyglotbooks.core.playback.ExternalNarrationDelegate {
+                private val _ext = MutableStateFlow(
+                    io.github.danprav04.polyglotbooks.core.playback.ExternalNarrationState(
+                        bookId = "other",
+                        bookTitle = "Other",
+                        isActiveSession = true,
+                        isPlaying = true
+                    )
+                )
+                override val externalState = _ext.asStateFlow()
+                override fun play() {}
+                override fun pause() {
+                    delegatePaused = true
+                    _ext.value = _ext.value.copy(isPlaying = false)
+                }
+                override fun stop() {}
+                override fun seekToChapterPositionMs(positionMs: Long) {}
+                override fun seekByDeltaMs(deltaMs: Long) {}
+                override fun nextParagraph() {}
+                override fun previousParagraph() {}
+                override fun nextChapter() {}
+                override fun previousChapter() {}
+                override fun setPlaybackSpeed(speed: Float) {}
+                override fun onAudioBecomingNoisy() {}
+            }
+        )
+        coordinator.updateExternalState(
+            io.github.danprav04.polyglotbooks.core.playback.ExternalNarrationState(
+                bookId = "other",
+                bookTitle = "Other",
+                isActiveSession = true,
+                isPlaying = true
+            )
+        )
+
+        viewModel.toggleVoicePreview("Aoede")
+        advanceUntilIdle()
+        assertTrue("Active PlaybackCoordinator must be paused before preview starts", delegatePaused)
+        assertEquals("Aoede", viewModel.uiState.value.playingPreviewVoiceId)
+
+        val onClearedMethod = androidx.lifecycle.ViewModel::class.java.getDeclaredMethod("onCleared")
+        onClearedMethod.isAccessible = true
+        onClearedMethod.invoke(viewModel)
+        assertTrue(previewPlayer.stopCount >= 1)
+        assertNull(previewPlayer.playingVoiceId.value)
+    }
+
+    @Test
+    fun `duplicate chapter titles resolve exact EPUB spine chapter on page turn and cold reopen even with stale chapterIndex`() = runTest {
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook("book-dup", "Anthology"))
+        }
+        val duplicateChapters = listOf(
+            ChapterEntity("c0", "book-dup", 0, "Story", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+            ChapterEntity("c1", "book-dup", 1, "Story", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 100),
+            ChapterEntity("c2", "book-dup", 2, "Story", 2000L, 3000L, "epubcfi(/6/6!/4/2/1:0)", 100)
+        )
+        val chapterDao = FakeChapterDao().apply { insertChapters(duplicateChapters) }
+        val playbackDao = FakePlaybackStateDao().apply {
+            // Simulate stale saved chapterIndex = 0 alongside newer chapter-2 paragraph-3 CFI
+            upsertPlaybackState(
+                PlaybackStateEntity(
+                    bookId = "book-dup",
+                    lastCfi = "epubcfi(/6/6!/4/2/3:0)",
+                    chapterIndex = 0,
+                    readingProgress = 0.72f
+                )
+            )
+        }
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-dup")),
+            playbackStateDao = playbackDao
+        )
+        advanceUntilIdle()
+
+        assertTrue(viewModel.uiState.value.isStateRestored)
+        assertEquals(2, viewModel.uiState.value.currentChapterIndex)
+        assertEquals("epubcfi(/6/6!/4/2/3:0)", viewModel.uiState.value.currentCfi)
+
+        // Paragraph extraction inside chapter 2 must derive paragraph index 2 (from /4/2/3:0), not reset to 0
+        viewModel.onParagraphsExtracted(
+            2,
+            """[{"index":0,"text":"P0","cfi":"epubcfi(/6/6!/4/2/1:0)"},{"index":1,"text":"P1","cfi":"epubcfi(/6/6!/4/2/2:0)"},{"index":2,"text":"P2","cfi":"epubcfi(/6/6!/4/2/3:0)"}]"""
+        )
+        assertEquals(2, viewModel.uiState.value.activeParagraphIndex)
+
+        // Page turn with explicit chapterIndex=1 and duplicate title "Story" resolves to chapter 1 (not 0),
+        // and does NOT increment chapterNavigationNonce (so WebView isn't re-loaded in a feedback loop)
+        val bridge = ReaderBridge(viewModel)
+        val nonceBeforeScroll = viewModel.uiState.value.chapterNavigationNonce
+        bridge.onPageTurn("epubcfi(/6/4!/4/2/2:0)", 0.45f, 1, "Story")
+        advanceUntilIdle()
+        assertEquals(1, viewModel.uiState.value.currentChapterIndex)
+        assertEquals(nonceBeforeScroll, viewModel.uiState.value.chapterNavigationNonce)
+
+        // Legacy 3-arg ReaderBridge page turn without explicit chapterIndex still resolves chapter 2 via /6/6 spine parse
+        bridge.onPageTurn("epubcfi(/6/6!/4/2/2:0)", 0.7f, "Story")
+        advanceUntilIdle()
+        assertEquals(2, viewModel.uiState.value.currentChapterIndex)
+
+        // Explicit chapter jump increments chapterNavigationNonce and updates saved chapterIndex
+        viewModel.prevChapter()
+        advanceUntilIdle()
+        assertEquals(1, viewModel.uiState.value.currentChapterIndex)
+        assertTrue(viewModel.uiState.value.chapterNavigationNonce > nonceBeforeScroll)
+        assertEquals(1, playbackDao.getPlaybackState("book-dup")?.chapterIndex)
+    }
+
+    @Test
+    fun `multi-book cold reopen awaits chapters and restores independent chapterIndex and paragraph per book`() = runTest {
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook("mb-1", "Book Alpha"))
+            insertBook(createTestBook("mb-2", "Book Beta"))
+        }
+        val chapterDao = FakeChapterDao().apply {
+            insertChapters(
+                listOf(
+                    ChapterEntity("m1_0", "mb-1", 0, "Alpha 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 50),
+                    ChapterEntity("m1_1", "mb-1", 1, "Alpha 2", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 50),
+                    ChapterEntity("m2_0", "mb-2", 0, "Beta 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 50),
+                    ChapterEntity("m2_1", "mb-2", 1, "Beta 2", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 50),
+                    ChapterEntity("m2_2", "mb-2", 2, "Beta 3", 2000L, 3000L, "epubcfi(/6/6!/4/2/1:0)", 50)
+                )
+            )
+        }
+        val playbackDao = FakePlaybackStateDao()
+
+        val vmBook1 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "mb-1")),
+            playbackStateDao = playbackDao
+        )
+        advanceUntilIdle()
+        vmBook1.onPageTurned("epubcfi(/6/4!/4/2/2:0)", 0.65f, 1, "Alpha 2")
+        vmBook1.flushProgress()
+        advanceUntilIdle()
+
+        val vmBook2 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "mb-2")),
+            playbackStateDao = playbackDao
+        )
+        advanceUntilIdle()
+        vmBook2.onPageTurned("epubcfi(/6/6!/4/2/3:0)", 0.9f, 2, "Beta 3")
+        vmBook2.flushProgress()
+        advanceUntilIdle()
+
+        // Cold reopen Book 1 -> must restore chapter 1, CFI epubcfi(/6/4!/4/2/2:0), and paragraph index 1
+        val reopenedBook1 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "mb-1")),
+            playbackStateDao = playbackDao
+        )
+        advanceUntilIdle()
+        assertEquals(1, reopenedBook1.uiState.value.currentChapterIndex)
+        assertEquals("epubcfi(/6/4!/4/2/2:0)", reopenedBook1.uiState.value.currentCfi)
+        reopenedBook1.onParagraphsExtracted(
+            1,
+            """[{"index":0,"text":"P0","cfi":"epubcfi(/6/4!/4/2/1:0)"},{"index":1,"text":"P1","cfi":"epubcfi(/6/4!/4/2/2:0)"}]"""
+        )
+        assertEquals(1, reopenedBook1.uiState.value.activeParagraphIndex)
+    }
+
+    @Test
+    fun `onPageTurned ignored during active follow-highlight narration and flushProgress uses active TTS position`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-vm-guard").toFile()
+        try {
+            val bookDao = FakeBookDao().apply {
+                insertBook(createTestBook("book-guard", "Sync Guard"))
+            }
+            val chapters = listOf(
+                ChapterEntity("c0", "book-guard", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+                ChapterEntity("c1", "book-guard", 1, "Ch 2", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 100)
+            )
+            val chapterDao = FakeChapterDao().apply { insertChapters(chapters) }
+            val playbackDao = FakePlaybackStateDao()
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+            }
+            val holdSpeech = CompletableDeferred<Unit>()
+            val sharedSession = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = kotlinx.coroutines.test.UnconfinedTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                systemTtsFactory = {
+                    object : io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine {
+                        override val id = io.github.danprav04.polyglotbooks.feature.narration.EngineId.SYSTEM_TTS
+                        override val capabilities = io.github.danprav04.polyglotbooks.feature.narration.EngineCapabilities(
+                            supportsMultiVoice = false,
+                            supportsEmotionalStyles = false,
+                            supportsStreaming = false,
+                            outputSampleRate = 24000
+                        )
+                        override suspend fun voices() = emptyList<io.github.danprav04.polyglotbooks.feature.narration.VoiceInfo>()
+                        override fun synthesize(request: io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest) = kotlinx.coroutines.flow.flow {
+                            emit(io.github.danprav04.polyglotbooks.core.model.PcmChunk(ByteArray(1600), 24000, 1))
+                            holdSpeech.await()
+                        }
+                    }
+                }
+            }
+            val ch1Paras = listOf(
+                ReaderParagraph(0, "p0", "Active line zero.", "epubcfi(/6/4!/4/2/1:0)"),
+                ReaderParagraph(1, "p1", "Active line one.", "epubcfi(/6/4!/4/2/2:0)")
+            )
+            sharedSession.updateBookContext(
+                bookId = "book-guard",
+                bookTitle = "Sync Guard",
+                chapters = chapters,
+                currentChapterIndex = 1,
+                paragraphs = ch1Paras,
+                activeParagraphIndex = 1,
+                forceWhenDifferentBook = true
+            )
+            sharedSession.startOrResume(
+                bookId = "book-guard",
+                bookTitle = "Sync Guard",
+                chapters = chapters,
+                currentChapterIndex = 1,
+                paragraphs = ch1Paras,
+                activeParagraphIndex = 1
+            )
+
+            val viewModel = ReaderViewModel(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-guard")),
+                playbackStateDao = playbackDao,
+                settingsRepository = settingsRepo,
+                injectedSessionManager = sharedSession
+            )
+            runCurrent()
+            advanceUntilIdle()
+            assertTrue(viewModel.uiState.value.isStateRestored)
+
+            // Stale WebView scroll from chapter 0 smooth scroll must NOT clobber active TTS chapter 1 / para 1
+            viewModel.onPageTurned("epubcfi(/6/2!/4/2/1:0)", 0.05f, 0, "Ch 1")
+            // Stale DOM extraction from chapter 0 must also be ignored
+            viewModel.onParagraphsExtracted(0, """[{"index":0,"text":"Wrong chapter","cfi":"epubcfi(/6/2!/4/2/1:0)"}]""")
+            // Active-playback DOM extraction for same chapter must also be ignored
+            viewModel.onParagraphsExtracted(1, """[{"index":0,"text":"Truncated","cfi":"epubcfi(/6/4!/4/2/1:0)"}]""")
+
+            assertEquals(1, viewModel.uiState.value.currentChapterIndex)
+            assertEquals(2, viewModel.uiState.value.paragraphs.size)
+            assertEquals("epubcfi(/6/4!/4/2/2:0)", viewModel.uiState.value.currentCfi)
+
+            // flushProgress during active playback must preserve active TTS CFI and chapterIndex
+            viewModel.flushProgress()
+            runCurrent()
+            advanceUntilIdle()
+            assertEquals("epubcfi(/6/4!/4/2/2:0)", playbackDao.getPlaybackState("book-guard")?.lastCfi)
+            assertEquals(1, playbackDao.getPlaybackState("book-guard")?.chapterIndex)
+
+            holdSpeech.complete(Unit)
+            sharedSession.pause()
+            runCurrent()
+            advanceUntilIdle()
+
+            // When paused, empty DOM extraction for current chapter clears stale paragraphs
+            viewModel.onParagraphsExtracted(1, "[]")
+            assertTrue(viewModel.uiState.value.paragraphs.isEmpty())
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `clearError clears session errorMessage and statusMessage without re-emitting stale message`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-clear-err").toFile()
+        try {
+            val bookDao = FakeBookDao().apply {
+                insertBook(createTestBook("book-err", "Empty Book"))
+            }
+            val chapterDao = FakeChapterDao().apply {
+                insertChapters(listOf(ChapterEntity("c0", "book-err", 0, "Cover", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 0)))
+            }
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+            }
+            val session = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                settingsRepository = settingsRepo,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+            }
+            val viewModel = ReaderViewModel(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                savedStateHandle = SavedStateHandle(mapOf("bookId" to "book-err")),
+                settingsRepository = settingsRepo,
+                injectedSessionManager = session
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            viewModel.startNarration()
+            runCurrent()
+            advanceUntilIdle()
+            assertNotNull(viewModel.uiState.value.errorMessage)
+
+            viewModel.clearError()
+            runCurrent()
+            advanceUntilIdle()
+            assertNull(viewModel.uiState.value.errorMessage)
+            assertNull(session.sessionState.value.errorMessage)
+        } finally {
+            tempDir.deleteRecursively()
+        }
     }
 }

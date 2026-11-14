@@ -60,6 +60,7 @@ dependencies {
     implementation(project(":core:audio"))
     implementation(project(":core:playback"))
     implementation(project(":feature:narration"))
+    implementation(project(":feature:settings"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

@@ -1565,21 +1565,31 @@ object EbookContentExtractor {
             .replace(Regex("""<script\b[^>]*/\s*>""", RegexOption.IGNORE_CASE), "")
     }
 
-    private fun extractTitleFromHtml(rawHtml: String): String? {
-        val titleMatch = Regex("""<title\b[^>]*>([\s\S]*?)</title>""", RegexOption.IGNORE_CASE).find(rawHtml)
-        val titleText = titleMatch?.groupValues?.get(1)?.let { stripTagsAndDecode(it) }
-        if (!titleText.isNullOrBlank()) return titleText
-
+    internal fun extractTitleFromHtml(rawHtml: String): String? {
         val headingMatch = Regex("""<h[1-3]\b[^>]*>([\s\S]*?)</h[1-3]>""", RegexOption.IGNORE_CASE).find(rawHtml)
         val headingText = headingMatch?.groupValues?.get(1)?.let { stripTagsAndDecode(it) }
-        return headingText?.takeIf { it.isNotBlank() }
+        if (!headingText.isNullOrBlank()) return headingText
+
+        val titleMatch = Regex("""<title\b[^>]*>([\s\S]*?)</title>""", RegexOption.IGNORE_CASE).find(rawHtml)
+        val titleText = titleMatch?.groupValues?.get(1)?.let { stripTagsAndDecode(it) }
+        return titleText?.takeIf { it.isNotBlank() }
     }
 
-    private fun extractParagraphsFromHtml(html: String): List<String> {
+    private fun sanitizeHtmlForParagraphExtraction(html: String): String {
+        return html
+            .replace(Regex("""<!--[\s\S]*?-->"""), "")
+            .replace(Regex("""<(script|style|noscript|template)\b[^>]*>[\s\S]*?</\1>""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""<(script|style|noscript|template)\b[^>]*/\s*>""", RegexOption.IGNORE_CASE), "")
+            // Match HTML5 DOM behavior where self-closing block spacers don't enclose subsequent paragraphs.
+            .replace(Regex("""<(p|h[1-6]|li|blockquote|div)\b[^>]*/\s*>""", RegexOption.IGNORE_CASE), "")
+    }
+
+    internal fun extractParagraphsFromHtml(html: String): List<String> {
+        val sanitized = sanitizeHtmlForParagraphExtraction(html)
         val result = mutableListOf<String>()
-        collectParagraphBlocks(html, result)
+        collectParagraphBlocks(sanitized, result)
         if (result.isEmpty()) {
-            val plain = decodeHtmlEntities(html.replace(Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
+            val plain = decodeHtmlEntities(sanitized.replace(Regex("""<br\s*/?>""", RegexOption.IGNORE_CASE), "\n")
                 .replace(Regex("""</(?:div|p|section|article|tr)\s*>""", RegexOption.IGNORE_CASE), "\n\n")
                 .replace(Regex("""<[^>]+>"""), " "))
             result.addAll(splitTextIntoParagraphs(plain))
@@ -1587,21 +1597,78 @@ object EbookContentExtractor {
         return result
     }
 
-    private val BLOCK_TAG_REGEX = Regex(
-        """<(p|h[1-6]|li|blockquote)\b[^>]*>([\s\S]*?)</\1>""",
+    private val BLOCK_TAG_TOKEN_REGEX = Regex(
+        """<(/?)(p|h[1-6]|li|blockquote)\b([^>]*)>""",
         RegexOption.IGNORE_CASE
     )
     private val NESTED_BLOCK_CHECK = Regex("""<(?:p|h[1-6]|li|blockquote)\b""", RegexOption.IGNORE_CASE)
 
     private fun collectParagraphBlocks(fragment: String, out: MutableList<String>) {
-        for (match in BLOCK_TAG_REGEX.findAll(fragment)) {
-            val inner = match.groupValues[2]
-            if (NESTED_BLOCK_CHECK.containsMatchIn(inner)) {
+        val tokens = BLOCK_TAG_TOKEN_REGEX.findAll(fragment).toList()
+        var idx = 0
+        while (idx < tokens.size) {
+            val openToken = tokens[idx]
+            val isClosing = openToken.groupValues[1] == "/"
+            val attrs = openToken.groupValues[3]
+            if (isClosing || attrs.trimEnd().endsWith("/")) {
+                idx++
+                continue
+            }
+            val openTag = openToken.groupValues[2].lowercase(Locale.ROOT)
+            val contentStart = openToken.range.last + 1
+            val stack = ArrayDeque<String>()
+            stack.addLast(openTag)
+            var hasNested = false
+            var endIdx = idx
+            var contentEnd = fragment.length
+
+            var j = idx + 1
+            while (j < tokens.size) {
+                val t = tokens[j]
+                val tClose = t.groupValues[1] == "/"
+                val tTag = t.groupValues[2].lowercase(Locale.ROOT)
+                val tAttrs = t.groupValues[3]
+                if (!tClose) {
+                    if (!tAttrs.trimEnd().endsWith("/")) {
+                        // In HTML5, an unclosed <p> implicitly closes at a sibling <p>.
+                        if (tTag == "p" && stack.size == 1 && stack.last() == "p") {
+                            contentEnd = t.range.first
+                            endIdx = j - 1
+                            stack.removeLast()
+                            break
+                        }
+                        hasNested = true
+                        stack.addLast(tTag)
+                    }
+                } else {
+                    val matchPos = stack.lastIndexOf(tTag)
+                    if (matchPos >= 0) {
+                        while (stack.size > matchPos) {
+                            stack.removeLast()
+                        }
+                        if (stack.isEmpty()) {
+                            contentEnd = t.range.first
+                            endIdx = j
+                            break
+                        }
+                    }
+                }
+                j++
+            }
+
+            if (stack.isNotEmpty()) {
+                // Unclosed outer tag: handle up to end of fragment cleanly.
+                endIdx = tokens.size - 1
+            }
+
+            val inner = if (contentStart <= contentEnd) fragment.substring(contentStart, contentEnd) else ""
+            if (hasNested && NESTED_BLOCK_CHECK.containsMatchIn(inner)) {
                 collectParagraphBlocks(inner, out)
             } else {
                 val text = stripTagsAndDecode(inner)
                 if (text.isNotBlank()) out.add(text)
             }
+            idx = endIdx + 1
         }
     }
 
