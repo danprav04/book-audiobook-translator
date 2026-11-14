@@ -96,7 +96,8 @@ class AudiobookSessionManager @Inject constructor(
     private val settingsRepository: SettingsRepository?,
     private val liveTranslationBackend: LiveTranslationBackend,
     @ApplicationScope private val applicationScope: CoroutineScope,
-    @ApplicationContext private val context: Context?
+    @ApplicationContext private val context: Context?,
+    private val playbackCoordinator: PlaybackCoordinator? = null
 ) {
     constructor(
         bookDao: BookDao? = null,
@@ -112,7 +113,8 @@ class AudiobookSessionManager @Inject constructor(
         settingsRepository = settingsRepository,
         liveTranslationBackend = liveTranslationBackend,
         applicationScope = applicationScope,
-        context = null
+        context = null,
+        playbackCoordinator = null
     )
     private val _state = MutableStateFlow(AudiobookServiceState())
     val state: StateFlow<AudiobookServiceState> = _state.asStateFlow()
@@ -398,6 +400,16 @@ class AudiobookSessionManager @Inject constructor(
     }
 
     init {
+        playbackCoordinator?.onPauseAudiobook = {
+            val isExoPlaying = try {
+                exoPlayer?.isPlaying == true
+            } catch (_: Throwable) {
+                false
+            }
+            if (_state.value.isPlaying || isExoPlaying) {
+                pause()
+            }
+        }
         observeBackendState()
         observeSleepTimer()
         observeSettings()
@@ -924,6 +936,7 @@ class AudiobookSessionManager @Inject constructor(
     }
 
     fun play() {
+        playbackCoordinator?.activateAudiobook()
         cancelPendingSeekRestart()
         val s = _state.value
         if (s.isLiveTranslationActive && settingsRepository != null && currentApiKey.isNullOrBlank()) {

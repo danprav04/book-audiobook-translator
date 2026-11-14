@@ -20,12 +20,25 @@ class PlaybackNotificationManager(private val context: Context) {
         const val CHANNEL_ID = "polyglot_playback_channel"
         const val NOTIFICATION_ID = 1001
         const val MAIN_ACTIVITY_CLASS_NAME = "io.github.danprav04.polyglotbooks.MainActivity"
+        const val EXTRA_NAV_BOOK_ID = "extra_nav_book_id"
+        const val EXTRA_NAV_IS_AUDIOBOOK = "extra_nav_is_audiobook"
 
-        fun createSessionActivityPendingIntent(context: Context): PendingIntent? {
+        fun createSessionActivityPendingIntent(
+            context: Context,
+            bookId: String? = null,
+            isAudiobook: Boolean = true
+        ): PendingIntent? {
             return try {
                 val launchIntent = context.packageManager?.getLaunchIntentForPackage(context.packageName)
                     ?: Intent().setClassName(context, MAIN_ACTIVITY_CLASS_NAME)
                 launchIntent.flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                if (!bookId.isNullOrBlank()) {
+                    launchIntent.putExtra(EXTRA_NAV_BOOK_ID, bookId)
+                    launchIntent.putExtra(EXTRA_NAV_IS_AUDIOBOOK, isAudiobook)
+                } else {
+                    launchIntent.removeExtra(EXTRA_NAV_BOOK_ID)
+                    launchIntent.removeExtra(EXTRA_NAV_IS_AUDIOBOOK)
+                }
                 val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 PendingIntent.getActivity(context, 0, launchIntent, flags)
             } catch (_: Throwable) {
@@ -74,9 +87,15 @@ class PlaybackNotificationManager(private val context: Context) {
         title: String,
         author: String,
         isPlaying: Boolean,
-        subtitleText: String? = null
+        subtitleText: String? = null,
+        bookId: String? = null,
+        isAudiobook: Boolean = true
     ): android.app.Notification {
-        val contentIntent = createSessionActivityPendingIntent(context)
+        val contentIntent = createSessionActivityPendingIntent(
+            context = context,
+            bookId = bookId,
+            isAudiobook = isAudiobook
+        )
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(if (subtitleText.isNullOrBlank()) author else "$author • $subtitleText")

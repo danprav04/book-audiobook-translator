@@ -4,9 +4,12 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.media.AudioManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -23,7 +26,11 @@ import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
@@ -57,7 +64,11 @@ class PolyglotPlaybackService : MediaSessionService() {
     @ApplicationScope
     lateinit var applicationScope: CoroutineScope
 
+    @Inject
+    lateinit var playbackCoordinator: PlaybackCoordinator
+
     private var fallbackSessionManager: AudiobookSessionManager? = null
+    private var fallbackPlaybackCoordinator: PlaybackCoordinator? = null
 
     private val activeSessionManager: AudiobookSessionManager
         get() = if (::sessionManager.isInitialized) {
@@ -66,14 +77,29 @@ class PolyglotPlaybackService : MediaSessionService() {
             fallbackSessionManager ?: AudiobookSessionManager().also { fallbackSessionManager = it }
         }
 
+    internal val activePlaybackCoordinator: PlaybackCoordinator
+        get() = if (::playbackCoordinator.isInitialized) {
+            playbackCoordinator
+        } else {
+            fallbackPlaybackCoordinator ?: PlaybackCoordinator().also { fallbackPlaybackCoordinator = it }
+        }
+
     var mediaSession: MediaSession? = null
         internal set
 
     var exoPlayer: ExoPlayer? = null
         internal set
 
+    var externalNarrationPlayer: ExternalNarrationPlayer? = null
+        internal set
+
     var notificationManager: PlaybackNotificationManager? = null
         internal set
+
+    private var sessionForwardingPlayer: SessionForwardingPlayer? = null
+    private var mainHandler: Handler? = null
+    private var lastSessionActivityKey: String? = null
+    private var audiobookObserverJob: Job? = null
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
@@ -102,6 +128,12 @@ class PolyglotPlaybackService : MediaSessionService() {
     override fun onCreate() {
         super.onCreate()
 
+        mainHandler = try {
+            Looper.getMainLooper()?.let { Handler(it) }
+        } catch (_: Throwable) {
+            null
+        }
+
         initStreamingLocks()
         registerBecomingNoisyReceiver()
 
@@ -124,14 +156,34 @@ class PolyglotPlaybackService : MediaSessionService() {
             .build()
         exoPlayer = newPlayer
 
-        val sessionPlayer = SessionForwardingPlayer(newPlayer)
-        val sessionBuilder = MediaSession.Builder(this, sessionPlayer)
+        val forwardingPlayer = SessionForwardingPlayer(newPlayer)
+        sessionForwardingPlayer = forwardingPlayer
+
+        val coordinator = activePlaybackCoordinator
+        val extPlayer = try {
+            Looper.getMainLooper()?.let { ExternalNarrationPlayer(it, coordinator) }
+        } catch (_: Throwable) {
+            null
+        }
+        externalNarrationPlayer = extPlayer
+
+        val initialPlayer: Player =
+            if (coordinator.activeSource.value == ActivePlaybackSource.EBOOK_NARRATION && extPlayer != null) {
+                extPlayer
+            } else {
+                forwardingPlayer
+            }
+
+        val sessionBuilder = MediaSession.Builder(this, initialPlayer)
         PlaybackNotificationManager.createSessionActivityPendingIntent(this)?.let { pendingIntent ->
             sessionBuilder.setSessionActivity(pendingIntent)
         }
         mediaSession = sessionBuilder.build()
 
+        coordinator.onServiceCommand = { action -> handleCoordinatorCommand(action) }
         activeSessionManager.attachService(this)
+        observeAudiobookSessionUpdates()
+        updateSessionActivity()
     }
 
     private inner class SessionForwardingPlayer(
@@ -207,6 +259,15 @@ class PolyglotPlaybackService : MediaSessionService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_START_EXTERNAL_NARRATION) {
+            ensureForegroundForExternalNarration()
+            postToMainThread {
+                switchToExternalNarrationPlayer()
+                externalNarrationPlayer?.notifyStateChanged()
+                updateSessionActivity()
+                updateStreamingLocks()
+            }
+        }
         intent?.getStringExtra(EXTRA_BOOK_ID)?.takeIf { it.isNotBlank() }?.let { bookId ->
             activeSessionManager.loadBook(bookId)
         }
@@ -221,12 +282,15 @@ class PolyglotPlaybackService : MediaSessionService() {
         try {
             activeSessionManager.onTaskRemoved()
         } finally {
-            val isCurrentlyPlaying = try {
+            val isAudiobookPlaying = try {
                 exoPlayer?.isPlaying == true || activeSessionManager.state.value.isPlaying
             } catch (_: Throwable) {
                 false
             }
-            if (!isCurrentlyPlaying) {
+            val isExternalPlaying =
+                activePlaybackCoordinator.activeSource.value == ActivePlaybackSource.EBOOK_NARRATION &&
+                    activePlaybackCoordinator.externalState.value.isPlaying
+            if (!isAudiobookPlaying && !isExternalPlaying) {
                 stopSelf()
             }
         }
@@ -234,6 +298,9 @@ class PolyglotPlaybackService : MediaSessionService() {
     }
 
     override fun onDestroy() {
+        audiobookObserverJob?.cancel()
+        audiobookObserverJob = null
+        activePlaybackCoordinator.onServiceCommand = null
         try {
             activeSessionManager.flushProgressNow()
             if (::liveTranslationBackend.isInitialized) {
@@ -250,15 +317,21 @@ class PolyglotPlaybackService : MediaSessionService() {
                 activeSessionManager.detachService(this)
                 mediaSession?.run {
                     try {
-                        player.release()
-                    } catch (_: Throwable) {
-                    }
-                    try {
                         release()
                     } catch (_: Throwable) {
                     }
                     mediaSession = null
                 }
+                try {
+                    externalNarrationPlayer?.release()
+                } catch (_: Throwable) {
+                }
+                externalNarrationPlayer = null
+                try {
+                    exoPlayer?.release()
+                } catch (_: Throwable) {
+                }
+                sessionForwardingPlayer = null
                 exoPlayer = null
                 super.onDestroy()
             }
@@ -276,13 +349,19 @@ class PolyglotPlaybackService : MediaSessionService() {
             } catch (_: Throwable) {
             }
         }
-        activeSessionManager.onAudioBecomingNoisy()
+        val activeSource = activePlaybackCoordinator.activeSource.value
+        if (activeSource == ActivePlaybackSource.EBOOK_NARRATION) {
+            activePlaybackCoordinator.getExternalDelegate()?.onAudioBecomingNoisy()
+        }
+        if (activeSource != ActivePlaybackSource.EBOOK_NARRATION || activeSessionManager.state.value.isPlaying) {
+            activeSessionManager.onAudioBecomingNoisy()
+        }
         releaseStreamingLocks()
     }
 
     /**
      * Synchronizes partial CPU [PowerManager.WakeLock] and high-perf [WifiManager.WifiLock]
-     * with active playback + live AI translation.
+     * with active audiobook live AI translation or active background ebook narration.
      */
     fun updateStreamingLocks() {
         val currentState = activeSessionManager.state.value
@@ -291,11 +370,166 @@ class PolyglotPlaybackService : MediaSessionService() {
         } else {
             false
         }
-        val shouldHoldLocks = currentState.isPlaying && (currentState.isLiveTranslationActive || backendRunning)
-        if (shouldHoldLocks) {
+        val audiobookNeedsLocks = currentState.isPlaying && (currentState.isLiveTranslationActive || backendRunning)
+        val extState = activePlaybackCoordinator.externalState.value
+        val externalNeedsLocks =
+            activePlaybackCoordinator.activeSource.value == ActivePlaybackSource.EBOOK_NARRATION &&
+                extState.isActiveSession &&
+                extState.isPlaying
+        if (audiobookNeedsLocks || externalNeedsLocks) {
             acquireStreamingLocks()
         } else {
             releaseStreamingLocks()
+        }
+    }
+
+    private fun observeAudiobookSessionUpdates() {
+        if (!::applicationScope.isInitialized) return
+        audiobookObserverJob?.cancel()
+        audiobookObserverJob = applicationScope.launch {
+            activeSessionManager.state
+                .map { it.bookId }
+                .distinctUntilChanged()
+                .collect {
+                    postToMainThread {
+                        updateSessionActivity()
+                    }
+                }
+        }
+    }
+
+    private fun handleCoordinatorCommand(action: String) {
+        postToMainThread {
+            when (action) {
+                PlaybackCoordinator.ACTION_ACTIVATE_AUDIOBOOK -> {
+                    switchToAudiobookPlayer()
+                    updateSessionActivity()
+                    updateStreamingLocks()
+                }
+                ACTION_START_EXTERNAL_NARRATION -> {
+                    switchToExternalNarrationPlayer()
+                    externalNarrationPlayer?.notifyStateChanged()
+                    updateSessionActivity()
+                    updateStreamingLocks()
+                }
+                PlaybackCoordinator.ACTION_EXTERNAL_STATE_UPDATED -> {
+                    if (activePlaybackCoordinator.activeSource.value == ActivePlaybackSource.EBOOK_NARRATION) {
+                        switchToExternalNarrationPlayer()
+                        externalNarrationPlayer?.notifyStateChanged()
+                        updateSessionActivity()
+                        updateStreamingLocks()
+                    }
+                }
+                PlaybackCoordinator.ACTION_RELEASE_EXTERNAL_NARRATION -> {
+                    externalNarrationPlayer?.notifyStateChanged()
+                    if (activePlaybackCoordinator.activeSource.value != ActivePlaybackSource.EBOOK_NARRATION) {
+                        switchToAudiobookPlayer()
+                    }
+                    updateSessionActivity()
+                    updateStreamingLocks()
+                }
+            }
+        }
+    }
+
+    private fun switchToExternalNarrationPlayer() {
+        val session = mediaSession ?: return
+        val extPlayer = externalNarrationPlayer ?: return
+        if (session.player !== extPlayer) {
+            try {
+                session.setPlayer(extPlayer)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun switchToAudiobookPlayer() {
+        val session = mediaSession ?: return
+        val abPlayer = sessionForwardingPlayer ?: return
+        if (session.player !== abPlayer) {
+            try {
+                session.setPlayer(abPlayer)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun updateSessionActivity() {
+        val session = mediaSession ?: return
+        val extState = activePlaybackCoordinator.externalState.value
+        val isExternal = activePlaybackCoordinator.activeSource.value == ActivePlaybackSource.EBOOK_NARRATION &&
+            extState.bookId.isNotBlank()
+        val bookId: String?
+        val isAudiobook: Boolean
+        if (isExternal) {
+            bookId = extState.bookId
+            isAudiobook = false
+        } else {
+            val abBookId = activeSessionManager.state.value.bookId
+            bookId = abBookId.takeIf { it.isNotBlank() }
+            isAudiobook = true
+        }
+        val key = "$isAudiobook:${bookId.orEmpty()}"
+        if (key == lastSessionActivityKey) return
+        lastSessionActivityKey = key
+        PlaybackNotificationManager.createSessionActivityPendingIntent(
+            context = this,
+            bookId = bookId,
+            isAudiobook = isAudiobook
+        )?.let { pendingIntent ->
+            try {
+                session.setSessionActivity(pendingIntent)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun ensureForegroundForExternalNarration() {
+        val notifMgr = notificationManager ?: return
+        val ext = activePlaybackCoordinator.externalState.value
+        val title = ext.bookTitle.ifBlank { "Ebook Narration" }
+        val subtitle = ext.chapterTitle.takeIf { it.isNotBlank() }
+        try {
+            val notification = notifMgr.buildNotification(
+                title = title,
+                author = ext.author.ifBlank { "Polyglot Books" },
+                isPlaying = ext.isPlaying || ext.isBuffering,
+                subtitleText = subtitle,
+                bookId = ext.bookId.takeIf { it.isNotBlank() },
+                isAudiobook = false
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    PlaybackNotificationManager.NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                )
+            } else {
+                startForeground(PlaybackNotificationManager.NOTIFICATION_ID, notification)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun postToMainThread(block: () -> Unit) {
+        val handler = mainHandler
+        val currentLooper = try {
+            Looper.myLooper()
+        } catch (_: Throwable) {
+            null
+        }
+        if (handler == null || currentLooper === handler.looper) {
+            try {
+                block()
+            } catch (_: Throwable) {
+            }
+        } else {
+            handler.post {
+                try {
+                    block()
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
@@ -411,6 +645,10 @@ class PolyglotPlaybackService : MediaSessionService() {
 
     companion object {
         const val EXTRA_BOOK_ID = "extra_book_id"
+        const val EXTRA_NAV_BOOK_ID = PlaybackNotificationManager.EXTRA_NAV_BOOK_ID
+        const val EXTRA_NAV_IS_AUDIOBOOK = PlaybackNotificationManager.EXTRA_NAV_IS_AUDIOBOOK
+        const val ACTION_START_EXTERNAL_NARRATION =
+            "io.github.danprav04.polyglotbooks.action.START_EXTERNAL_NARRATION"
         const val WAKE_LOCK_TAG = "PolyglotBooks:LiveTranslateWakeLock"
         const val WIFI_LOCK_TAG = "PolyglotBooks:LiveTranslateWifiLock"
         private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60L * 1000L // 4 hours max safety timeout
