@@ -11,6 +11,8 @@ interface ReaderBridgeListener {
     fun onSelectionChanged(cfiRange: String, selectedText: String)
     fun onSearchResults(resultsJson: String)
     fun onBookReady() {}
+    fun onChaptersExtracted(chaptersJson: String) {}
+    fun onReaderError(message: String) {}
 }
 
 /**
@@ -25,8 +27,18 @@ class ReaderBridge(
     }
 
     @JavascriptInterface
+    fun postParagraphs(paragraphsJson: String) {
+        listener?.onParagraphsExtracted(-1, paragraphsJson)
+    }
+
+    @JavascriptInterface
     fun onPageTurn(cfi: String, fraction: Float, chapterTitle: String) {
         listener?.onPageTurned(cfi, fraction, chapterTitle)
+    }
+
+    @JavascriptInterface
+    fun onPageTurn(cfi: String) {
+        listener?.onPageTurned(cfi, 0f, "")
     }
 
     @JavascriptInterface
@@ -42,5 +54,15 @@ class ReaderBridge(
     @JavascriptInterface
     fun onBookReady() {
         listener?.onBookReady()
+    }
+
+    @JavascriptInterface
+    fun onChaptersExtracted(chaptersJson: String) {
+        listener?.onChaptersExtracted(chaptersJson)
+    }
+
+    @JavascriptInterface
+    fun onReaderError(message: String) {
+        listener?.onReaderError(message)
     }
 }

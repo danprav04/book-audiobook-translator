@@ -6,10 +6,14 @@ import io.github.danprav04.polyglotbooks.core.data.db.BookDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
+import io.github.danprav04.polyglotbooks.core.data.db.CharacterDao
+import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateEntity
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
+import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
+import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
@@ -183,6 +187,60 @@ class FakeSettingsRepository : SettingsRepository {
     ) {}
 
     override suspend fun resetUsageStats() {}
+}
+
+class FakeCharacterDao : CharacterDao {
+    private val characters = MutableStateFlow<List<CharacterEntity>>(emptyList())
+
+    override fun getCharactersForBook(bookId: String): Flow<List<CharacterEntity>> =
+        characters.map { list -> list.filter { it.bookId == bookId } }
+
+    override suspend fun getCharacterById(id: String): CharacterEntity? =
+        characters.value.firstOrNull { it.id == id }
+
+    override suspend fun insertCharacter(character: CharacterEntity) {
+        characters.value = characters.value.filterNot { it.id == character.id } + character
+    }
+
+    override suspend fun insertCharacters(characters: List<CharacterEntity>) {
+        val incomingIds = characters.map { it.id }.toSet()
+        this.characters.value = this.characters.value.filterNot { it.id in incomingIds } + characters
+    }
+
+    override suspend fun updateCharacter(character: CharacterEntity) {
+        characters.value = characters.value.map { if (it.id == character.id) character else it }
+    }
+
+    override suspend fun deleteCharacter(character: CharacterEntity) {
+        characters.value = characters.value.filterNot { it.id == character.id }
+    }
+
+    override suspend fun deleteCharactersByBookId(bookId: String) {
+        characters.value = characters.value.filterNot { it.bookId == bookId }
+    }
+}
+
+class FakeSecureKeyStore(private var storedKey: String? = "test-api-key") : SecureKeyStore {
+    override suspend fun getApiKey(): String? = storedKey
+    override suspend fun saveApiKey(key: String) { storedKey = key }
+    override suspend fun deleteApiKey() { storedKey = null }
+}
+
+class FakeTextModelClient(private val responder: (String) -> String) : TextModelClient {
+    var lastPrompt: String? = null
+    var lastModel: String? = null
+
+    override suspend fun generateContent(
+        apiKey: String,
+        prompt: String,
+        systemInstruction: String?,
+        responseJsonSchema: String?,
+        model: String
+    ): String {
+        lastPrompt = prompt
+        lastModel = model
+        return responder(prompt)
+    }
 }
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -409,5 +467,162 @@ class ReaderViewModelTest {
 
         viewModel.resetBookReady()
         assertFalse(viewModel.uiState.value.isBookReady)
+    }
+
+    @Test
+    fun testChapterNavigationSelectNextAndPrevUpdatesStateAndPersists() = runTest {
+        val bookDao = FakeBookDao()
+        val ch1 = ChapterEntity("ch_1", "test_book", 0, "Chapter 1", 0, 1000, "cfi_1", 100)
+        val ch2 = ChapterEntity("ch_2", "test_book", 1, "Chapter 2", 1000, 2000, "cfi_2", 100)
+        val ch3 = ChapterEntity("ch_3", "test_book", 2, "Chapter 3", 2000, 3000, "cfi_3", 100)
+        val chapterDao = FakeChapterDao(listOf(ch1, ch2, ch3))
+        val playbackStateDao = FakePlaybackStateDao()
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book")),
+            playbackStateDao = playbackStateDao
+        )
+
+        assertEquals(0, viewModel.uiState.value.currentChapterIndex)
+
+        viewModel.nextChapter()
+        assertEquals(1, viewModel.uiState.value.currentChapterIndex)
+        assertEquals("cfi_2", viewModel.uiState.value.currentCfi)
+        assertEquals(0.5f, viewModel.uiState.value.progress, 0.001f)
+        assertEquals("cfi_2", playbackStateDao.getPlaybackState("test_book")?.lastCfi)
+
+        viewModel.selectChapter(ch3)
+        assertEquals(2, viewModel.uiState.value.currentChapterIndex)
+        assertEquals("cfi_3", viewModel.uiState.value.currentCfi)
+        assertEquals(1.0f, viewModel.uiState.value.progress, 0.001f)
+
+        // Clamped at upper bound
+        viewModel.nextChapter()
+        assertEquals(2, viewModel.uiState.value.currentChapterIndex)
+
+        viewModel.prevChapter()
+        assertEquals(1, viewModel.uiState.value.currentChapterIndex)
+        assertEquals("cfi_2", viewModel.uiState.value.currentCfi)
+
+        viewModel.prevChapter()
+        assertEquals(0, viewModel.uiState.value.currentChapterIndex)
+        // Clamped at lower bound
+        viewModel.prevChapter()
+        assertEquals(0, viewModel.uiState.value.currentChapterIndex)
+    }
+
+    @Test
+    fun testHeuristicCastAnalysisAndVoiceEditingPersistViaCharacterDao() = runTest {
+        val bookDao = FakeBookDao()
+        val chapterDao = FakeChapterDao()
+        val characterDao = FakeCharacterDao()
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book")),
+            characterDao = characterDao
+        )
+
+        val paragraphsJson = """
+            [
+              {"id":"p0","text":"\"Hello there,\" said Alice cheerfully.","cfiRange":"epubcfi(/6/2!/4/2/1:0)"},
+              {"id":"p1","text":"Bob: \"Good morning, Alice!\"","cfiRange":"epubcfi(/6/2!/4/2/2:0)"}
+            ]
+        """.trimIndent()
+        viewModel.onParagraphsExtracted(0, paragraphsJson)
+
+        viewModel.analyzeCastForCurrentChapter()
+
+        val cast = viewModel.uiState.value.characters
+        assertFalse(viewModel.uiState.value.isCastAnalyzing)
+        assertTrue(cast.any { it.name == "Narrator" })
+        assertTrue(cast.any { it.name == "Alice" })
+        assertTrue(cast.any { it.name == "Bob" })
+
+        val assignedVoices = cast.mapNotNull { it.assignedVoiceId }
+        assertEquals(cast.size, assignedVoices.size)
+        assertEquals(assignedVoices.size, assignedVoices.distinct().size)
+
+        val alice = cast.first { it.name == "Alice" }
+        viewModel.updateCharacterVoice(alice, "Zephyr", "warm, gentle")
+
+        val updatedAlice = viewModel.uiState.value.characters.first { it.id == alice.id }
+        assertEquals("Zephyr", updatedAlice.assignedVoiceId)
+        assertEquals("warm, gentle", updatedAlice.voiceTraits)
+        assertEquals("Zephyr", characterDao.getCharacterById(alice.id)?.assignedVoiceId)
+    }
+
+    @Test
+    fun testBilingualTranslationUsesTextModelClientAndReTranslatesOnLanguageChange() = runTest {
+        val bookDao = FakeBookDao()
+        val chapterDao = FakeChapterDao()
+        val characterDao = FakeCharacterDao()
+        val keyStore = FakeSecureKeyStore("fake-gemini-key")
+        val textClient = FakeTextModelClient { prompt ->
+            if (prompt.contains("French")) {
+                """["Bonjour le monde", "Bon matin"]"""
+            } else {
+                """["Hola mundo", "Buenos días"]"""
+            }
+        }
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book")),
+            characterDao = characterDao,
+            secureKeyStore = keyStore,
+            textModelClient = textClient
+        )
+
+        viewModel.onParagraphsExtracted(
+            0,
+            """
+            [
+              {"id":"p0","text":"Hello world","cfiRange":"epubcfi(/6/2!/4/2/1:0)"},
+              {"id":"p1","text":"Good morning","cfiRange":"epubcfi(/6/2!/4/2/2:0)"}
+            ]
+            """.trimIndent()
+        )
+
+        viewModel.setTargetLanguage(LanguageCode.SPANISH)
+        viewModel.toggleBilingualMode()
+
+        assertTrue(viewModel.uiState.value.isBilingualEnabled)
+        assertEquals("Hola mundo", viewModel.uiState.value.bilingualTranslations["epubcfi(/6/2!/4/2/1:0)"])
+        assertEquals("Buenos días", viewModel.uiState.value.bilingualTranslations["epubcfi(/6/2!/4/2/2:0)"])
+
+        viewModel.setTargetLanguage(LanguageCode.FRENCH)
+        assertEquals(LanguageCode.FRENCH, viewModel.uiState.value.targetLanguage)
+        assertEquals("Bonjour le monde", viewModel.uiState.value.bilingualTranslations["epubcfi(/6/2!/4/2/1:0)"])
+        assertEquals("Bon matin", viewModel.uiState.value.bilingualTranslations["epubcfi(/6/2!/4/2/2:0)"])
+
+        viewModel.toggleBilingualMode()
+        assertFalse(viewModel.uiState.value.isBilingualEnabled)
+        assertTrue(viewModel.uiState.value.bilingualTranslations.isEmpty())
+    }
+
+    @Test
+    fun testToggleNarrationAndBridgeErrorCallback() = runTest {
+        val bookDao = FakeBookDao()
+        val chapterDao = FakeChapterDao()
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "test_book"))
+        )
+        val bridge = ReaderBridge(viewModel)
+
+        assertFalse(viewModel.uiState.value.isNarrationPlaying)
+        viewModel.toggleNarration()
+        assertTrue(viewModel.uiState.value.isNarrationPlaying)
+        viewModel.toggleNarration()
+        assertFalse(viewModel.uiState.value.isNarrationPlaying)
+
+        bridge.onReaderError("Failed to render chapter")
+        assertEquals("Failed to render chapter", viewModel.uiState.value.errorMessage)
     }
 }
