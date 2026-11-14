@@ -728,7 +728,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         chapterIdx: Int,
         targetLangCode: String,
         paragraphMap: Map<String, String>,
-        updateErrorOnFailure: Boolean
+        updateErrorOnFailure: Boolean,
+        requireRealTranslation: Boolean = false
     ): Map<String, String>? {
         val diskCache = resolveDiskCache()
         val cached = diskCache?.loadTranslations(
@@ -754,7 +755,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
 
         val apiKey = resolveApiKey()
-        if (textModelClient == null || apiKey.isNullOrBlank()) {
+        val allowMockFallback = !requireRealTranslation && (appContext == null || textModelClient == null)
+        if ((textModelClient == null || apiKey.isNullOrBlank()) && !allowMockFallback) {
             if (updateErrorOnFailure) {
                 _sessionState.update {
                     it.copy(
@@ -828,6 +830,7 @@ class ReaderNarrationSessionManager @Inject constructor(
 
         if (appContext == null && activeParagraphs.isEmpty()) {
             // Pure unit-test compatibility when appContext & paragraphs are absent.
+            playbackCoordinator?.activateExternalNarration(appContext)
             _sessionState.update { it.copy(isActiveSession = true, isPlaying = true) }
             pushExternalState()
             return
@@ -843,6 +846,25 @@ class ReaderNarrationSessionManager @Inject constructor(
             }
             pushExternalState()
             return
+        }
+
+        if (state.narrateTranslatedText) {
+            val startIdx = state.activeParagraphIndex.coerceIn(0, activeParagraphs.lastIndex)
+            val hasMissingTranslations = activeParagraphs.drop(startIdx)
+                .filter { it.text.isNotBlank() }
+                .any { state.bilingualTranslations[it.cfi].isNullOrBlank() }
+            if (hasMissingTranslations && textModelClient == null && resolveDiskCache() == null) {
+                _sessionState.update {
+                    it.copy(
+                        isPlaying = false,
+                        isBuffering = false,
+                        isTranslating = false,
+                        errorMessage = "Add a Gemini API key in Settings to translate chapters."
+                    )
+                }
+                pushExternalState()
+                return
+            }
         }
 
         cancelPlaybackJobsOnly()
@@ -896,7 +918,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                                 chapterIdx = chapterIdx,
                                 targetLangCode = targetLang.code,
                                 paragraphMap = chapterParas.filter { it.text.isNotBlank() }.associate { it.cfi to it.text },
-                                updateErrorOnFailure = true
+                                updateErrorOnFailure = true,
+                                requireRealTranslation = true
                             )
                             if (ensured == null || neededMap.keys.all { ensured[it].isNullOrBlank() }) {
                                 _sessionState.update {

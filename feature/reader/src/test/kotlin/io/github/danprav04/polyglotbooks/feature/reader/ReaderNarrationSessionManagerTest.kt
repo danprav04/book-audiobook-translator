@@ -16,29 +16,22 @@ import io.github.danprav04.polyglotbooks.feature.narration.EngineCapabilities
 import io.github.danprav04.polyglotbooks.feature.narration.EngineId
 import io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest
 import io.github.danprav04.polyglotbooks.feature.narration.VoiceInfo
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.StandardTestDispatcher
-import kotlinx.coroutines.test.UnconfinedTestDispatcher
-import kotlinx.coroutines.test.advanceUntilIdle
-import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
-import kotlinx.coroutines.test.setMain
-import org.junit.After
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Before
 import org.junit.Test
 import java.nio.file.Files
 import io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine as FeatureNarrationEngine
@@ -46,18 +39,8 @@ import io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine as Fe
 @OptIn(ExperimentalCoroutinesApi::class)
 class ReaderNarrationSessionManagerTest {
 
-    @Before
-    fun setUp() {
-        Dispatchers.setMain(UnconfinedTestDispatcher())
-    }
-
-    @After
-    fun tearDown() {
-        Dispatchers.resetMain()
-    }
-
     private class RecordingPcmPlayer(
-        private val writeGate: CompletableDeferred<Unit>? = null
+        private val onWrite: ((Int) -> Unit)? = null
     ) : PcmPlayer {
         private val _currentPositionMs = MutableStateFlow(0L)
         override val currentPositionMs: StateFlow<Long> = _currentPositionMs.asStateFlow()
@@ -71,13 +54,9 @@ class ReaderNarrationSessionManagerTest {
         }
 
         override fun write(chunk: PcmChunk): Int {
-            writeGate?.let { gate ->
-                while (!gate.isCompleted) {
-                    Thread.sleep(5)
-                }
-            }
             writtenChunks.add(chunk)
             _currentPositionMs.value += 100L
+            onWrite?.invoke(writtenChunks.size)
             return chunk.data.size
         }
 
@@ -158,7 +137,7 @@ class ReaderNarrationSessionManagerTest {
                 playerFactory = { fakePlayer }
                 systemTtsFactory = { capturingEngine }
             }
-            advanceUntilIdle()
+            runCurrent()
 
             val paragraphs = listOf(
                 ReaderParagraph(0, "p0", "Hello world.", "epubcfi(/6/2!/4/2/1:0)"),
@@ -170,7 +149,7 @@ class ReaderNarrationSessionManagerTest {
                 paragraphs = paragraphs,
                 chapters = listOf(ChapterEntity("c0", "book-1", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 25))
             )
-            advanceUntilIdle()
+            runCurrent()
 
             assertEquals(1, translateCalls)
             assertEquals(2, capturingEngine.requests.size)
@@ -183,7 +162,7 @@ class ReaderNarrationSessionManagerTest {
 
             // Changing speed mid-session persists and updates settings without re-translating
             manager.setPlaybackSpeed(1.75f)
-            advanceUntilIdle()
+            runCurrent()
             assertEquals(1.75f, settingsRepo.readerNarrationSpeed.first())
             assertEquals(1.75f, manager.sessionState.value.playbackSpeed)
         } finally {
@@ -213,14 +192,14 @@ class ReaderNarrationSessionManagerTest {
             playerFactory = { fakePlayer }
             systemTtsFactory = { capturingEngine }
         }
-        advanceUntilIdle()
+        runCurrent()
 
         manager.startOrResume(
             bookId = "book-fail",
             bookTitle = "Untranslated Book",
             paragraphs = listOf(ReaderParagraph(0, "p0", "Original English text.", "epubcfi(/6/2!/4/2/1:0)"))
         )
-        advanceUntilIdle()
+        runCurrent()
 
         assertFalse(manager.sessionState.value.isPlaying)
         assertNotNull(manager.sessionState.value.errorMessage)
@@ -261,7 +240,7 @@ class ReaderNarrationSessionManagerTest {
             playerFactory = { RecordingPcmPlayer() }
             systemTtsFactory = { capturingEngine }
         }
-        advanceUntilIdle()
+        runCurrent()
 
         val ch0Paras = manager.buildParagraphsForChapter(extracted, 0, "EPUB")
         manager.updateBookContext(
@@ -295,7 +274,7 @@ class ReaderNarrationSessionManagerTest {
             currentChapterIndex = 0,
             paragraphs = ch0Paras
         )
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(0, manager.sessionState.value.currentChapterIndex)
         assertFalse(manager.sessionState.value.isPlaying)
@@ -304,6 +283,7 @@ class ReaderNarrationSessionManagerTest {
 
         // With sleep timer off, playback auto-advances from Ch 1 through Ch 2 and persists progress!
         capturingEngine.requests.clear()
+        manager.stop()
         manager.startOrResume(
             bookId = "book-multi",
             bookTitle = "Multi Chapter",
@@ -312,7 +292,7 @@ class ReaderNarrationSessionManagerTest {
             currentChapterIndex = 0,
             paragraphs = ch0Paras
         )
-        advanceUntilIdle()
+        runCurrent()
 
         assertEquals(1, manager.sessionState.value.currentChapterIndex)
         assertEquals(3, capturingEngine.requests.size)
@@ -324,18 +304,20 @@ class ReaderNarrationSessionManagerTest {
     fun `prefetch runs for System TTS but is skipped for Gemini Flash TTS to save quota`() = runTest {
         val tempDir = Files.createTempDirectory("session-prefetch-test").toFile()
         try {
-            val settingsRepo = FakeSettingsRepository().apply {
+            val flashSettings = FakeSettingsRepository().apply {
                 setReaderNarrationEngine(NarrationEngine.GEMINI_FLASH_TTS.name)
             }
             var ttsCallCount = 0
-            val gate = CompletableDeferred<Unit>()
             val countingTts = object : InteractionsTtsClient {
                 override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
                     ttsCallCount++
                     return ByteArray(1600)
                 }
 
-                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = emptyFlow()
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    ttsCallCount++
+                    emit(PcmChunk(ByteArray(1600), 24000, 1))
+                }
             }
             val keyStore = object : SecureKeyStore {
                 override suspend fun getApiKey(): String = "api-key-tts"
@@ -343,10 +325,11 @@ class ReaderNarrationSessionManagerTest {
                 override suspend fun deleteApiKey() {}
             }
 
-            val manager = ReaderNarrationSessionManager(
+            lateinit var flashManager: ReaderNarrationSessionManager
+            flashManager = ReaderNarrationSessionManager(
                 bookDao = FakeBookDao(),
                 chapterDao = FakeChapterDao(),
-                settingsRepository = settingsRepo,
+                settingsRepository = flashSettings,
                 secureKeyStore = keyStore,
                 interactionsTtsClient = countingTts,
                 quotaTracker = GeminiQuotaTracker(),
@@ -354,27 +337,81 @@ class ReaderNarrationSessionManagerTest {
             ).apply {
                 testDiskCache = TranslationDiskCache(tempDir)
                 ioDispatcher = StandardTestDispatcher(testScheduler)
-                playerFactory = { RecordingPcmPlayer(gate) }
+                playerFactory = {
+                    RecordingPcmPlayer { writtenCount ->
+                        if (writtenCount == 1) {
+                            flashManager.pause()
+                        }
+                    }
+                }
             }
-            advanceUntilIdle()
+            runCurrent()
 
-            // Two chunks (each > 1000 chars or separated by speaker), pause/stop during chunk 0
+            // Two chunks (each > 1000 chars combined), pause during chunk 0 write
             val p0 = ReaderParagraph(0, "p0", "First block. " + "A".repeat(700), "epubcfi(/6/2!/4/2/1:0)")
             val p1 = ReaderParagraph(1, "p1", "Second block. " + "B".repeat(700), "epubcfi(/6/2!/4/2/2:0)")
 
-            manager.startOrResume(
+            flashManager.startOrResume(
                 bookId = "book-quota",
                 bookTitle = "Quota Safe",
                 paragraphs = listOf(p0, p1)
             )
-            // Let chunk 0 synthesize and reach player.write(), then pause BEFORE chunk 1
-            testScheduler.runCurrent()
-            gate.complete(Unit)
-            manager.pause()
-            advanceUntilIdle()
+            runCurrent()
 
             // Chunk 1 must NOT have been prefetched under GEMINI_FLASH_TTS
             assertEquals(1, ttsCallCount)
+            assertFalse(flashManager.sessionState.value.isPlaying)
+
+            // Under SYSTEM_TTS, chunk 1 IS prefetched while chunk 0 synthesizes before pausing
+            val sysSettings = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+            }
+            var systemCallCount = 0
+            val countingSystemEngine = object : FeatureNarrationEngine {
+                override val id: EngineId = EngineId.SYSTEM_TTS
+                override val capabilities = EngineCapabilities(
+                    supportsMultiVoice = false,
+                    supportsEmotionalStyles = false,
+                    supportsStreaming = false,
+                    outputSampleRate = 24000
+                )
+
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    systemCallCount++
+                    yield()
+                    emit(PcmChunk(ByteArray(1600), 24000, 1))
+                }
+            }
+            lateinit var sysManager: ReaderNarrationSessionManager
+            sysManager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = sysSettings,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                systemTtsFactory = { countingSystemEngine }
+                playerFactory = {
+                    RecordingPcmPlayer { writtenCount ->
+                        if (writtenCount == 1) {
+                            sysManager.pause()
+                        }
+                    }
+                }
+            }
+            runCurrent()
+
+            sysManager.startOrResume(
+                bookId = "book-sys-prefetch",
+                bookTitle = "System Prefetch",
+                paragraphs = listOf(p0, p1)
+            )
+            runCurrent()
+
+            assertEquals(2, systemCallCount)
+            assertFalse(sysManager.sessionState.value.isPlaying)
         } finally {
             tempDir.deleteRecursively()
         }
@@ -395,7 +432,7 @@ class ReaderNarrationSessionManagerTest {
         ).apply {
             ioDispatcher = StandardTestDispatcher(testScheduler)
         }
-        advanceUntilIdle()
+        runCurrent()
 
         manager.startOrResume(
             bookId = "book-coord",
