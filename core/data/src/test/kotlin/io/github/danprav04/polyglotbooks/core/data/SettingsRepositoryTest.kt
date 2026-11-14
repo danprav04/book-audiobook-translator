@@ -243,4 +243,18 @@ class SettingsRepositoryTest {
         repository.setReaderFontSizeSp(6)
         assertEquals(12, repository.readerFontSizeSp.first())
     }
+
+    @Test
+    fun testDefaultNarratorVoiceIdDefaultsCanonicalizesAndPersists() = runTest {
+        assertEquals("Charon", repository.defaultNarratorVoiceId.first())
+
+        repository.setDefaultNarratorVoiceId("Kore")
+        assertEquals("Kore", repository.defaultNarratorVoiceId.first())
+
+        repository.setDefaultNarratorVoiceId("aoede")
+        assertEquals("Aoede", repository.defaultNarratorVoiceId.first())
+
+        repository.setDefaultNarratorVoiceId("   ")
+        assertEquals("Aoede", repository.defaultNarratorVoiceId.first())
+    }
 }

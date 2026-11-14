@@ -136,11 +136,20 @@ class AudioPipelineComponentsTest {
         player.release()
         assertTrue(released)
 
-        // Also verify pure-JVM fallback when adapterFactory returns null
-        val fallbackPlayer = AudioTrackPcmPlayer { _, _ -> null }
+        // Also verify pure-JVM fallback when adapterFactory returns null (wall-clock paced)
+        var nowNs = 0L
+        val fallbackPlayer = AudioTrackPcmPlayer(
+            adapterFactory = { _, _ -> null },
+            nanoTimeProvider = { nowNs },
+            drainSleepMs = { ms -> nowNs += ms * 1_000_000L }
+        )
         fallbackPlayer.init(24000, 1)
         assertFalse(fallbackPlayer.isAudioOutputAvailable)
+        fallbackPlayer.play()
         fallbackPlayer.write(PcmChunk(ByteArray(4800), sampleRate = 24000, channels = 1))
+        assertEquals(0L, fallbackPlayer.currentPositionMs.value)
+        nowNs += 100_000_000L
+        assertEquals(2400L, fallbackPlayer.playbackHeadPositionFrames())
         assertEquals(100L, fallbackPlayer.currentPositionMs.value)
     }
 
