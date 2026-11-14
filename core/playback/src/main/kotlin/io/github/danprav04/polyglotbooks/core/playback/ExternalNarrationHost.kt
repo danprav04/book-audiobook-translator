@@ -2,7 +2,9 @@ package io.github.danprav04.polyglotbooks.core.playback
 
 import android.content.Context
 import android.content.Intent
+import androidx.annotation.OptIn
 import androidx.core.content.ContextCompat
+import androidx.media3.common.util.UnstableApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -73,6 +75,7 @@ enum class ActivePlaybackSource {
  * local audiobook playback ([AudiobookSessionManager]) and external ebook narration ([ExternalNarrationDelegate]).
  */
 @Singleton
+@OptIn(UnstableApi::class)
 class PlaybackCoordinator @Inject constructor() {
 
     private val _activeSource = MutableStateFlow(ActivePlaybackSource.NONE)
