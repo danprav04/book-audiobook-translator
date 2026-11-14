@@ -28,6 +28,8 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
@@ -304,6 +306,7 @@ class TranslationPipelineTest {
         val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
         val stopGate = CompletableDeferred<Unit>()
         val firstStopDone = CompletableDeferred<Unit>()
+        val secondStartDone = CountDownLatch(1)
         val events = java.util.Collections.synchronizedList(mutableListOf<String>())
         val fakeClient = object : LiveTranslateClient {
             @Volatile
@@ -318,6 +321,9 @@ class TranslationPipelineTest {
             ) {
                 events.add("start:$targetLanguageCode")
                 active = true
+                if (targetLanguageCode == LanguageCode.GERMAN.code) {
+                    secondStartDone.countDown()
+                }
             }
 
             override suspend fun sendAudio(chunk: PcmChunk) {}
@@ -362,11 +368,18 @@ class TranslationPipelineTest {
             apiKey = "valid-key"
         )
 
-        // Unblock async stop cleanup on Dispatchers.IO and wait for it to release clientMutex
+        // Unblock async stop cleanup on Dispatchers.IO and wait for it to release clientMutex.
+        // firstStopDone completes while the mutex is still held (it is the last statement inside
+        // the fake stop()), so we must also wait for the follow-up start("de") that is serialized
+        // behind the mutex release before draining the test scheduler.
         stopGate.complete(Unit)
         withContext(Dispatchers.Default) {
             firstStopDone.await()
         }
+        assertTrue(
+            "New session client start() must run after the old stop() cleanup releases clientMutex",
+            secondStartDone.await(10, TimeUnit.SECONDS)
+        )
         advanceUntilIdle()
 
         // New session must not be stopped by older stop() cleanup
