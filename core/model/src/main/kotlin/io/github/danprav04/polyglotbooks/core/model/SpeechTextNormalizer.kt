@@ -49,7 +49,8 @@ object SpeechTextNormalizer {
 
     private enum class CandidateKind {
         OPENER,
-        CLOSER
+        CLOSER,
+        MIDWORD_POSSESSIVE_S
     }
 
     private data class QuoteCandidate(
@@ -59,6 +60,10 @@ object SpeechTextNormalizer {
 
     /**
      * Returns [text] normalized for speech synthesis.
+     *
+     * Paired single quotes become curly double quotes (`“...”`, with nested quotes as `‘...’`),
+     * and all genuine apostrophes/lookalikes normalize to the typographic apostrophe (`’`, U+2019)
+     * so raw ASCII `'` (U+0027) never triggers mid-word breaks in speech models.
      */
     fun normalizeForSpeech(text: String): String {
         if (text.isEmpty()) return text
@@ -67,14 +72,20 @@ object SpeechTextNormalizer {
         if (!containsSingleQuoteChar(normalized)) return normalized
 
         val candidates = collectCandidates(normalized)
-        if (candidates.size < 2) return normalized
+        val replacements = if (candidates.isNotEmpty()) {
+            pairCandidates(normalized, candidates)
+        } else {
+            emptyMap()
+        }
 
-        val replacements = pairCandidates(normalized, candidates)
-        if (replacements.isEmpty()) return normalized
-
-        val sb = StringBuilder(normalized.length)
+        val sb = StringBuilder(normalized.length + 4)
         for (i in normalized.indices) {
-            sb.append(replacements[i] ?: normalized[i])
+            val replacement = replacements[i]
+            when {
+                replacement != null -> sb.append(replacement)
+                normalized[i] == '\'' -> sb.append('\u2019')
+                else -> sb.append(normalized[i])
+            }
         }
         return sb.toString()
     }
@@ -114,8 +125,15 @@ object SpeechTextNormalizer {
             val prev = if (i > 0) text[i - 1] else null
             val next = if (i + 1 < text.length) text[i + 1] else null
 
-            // Mid-word apostrophes (`wasn't`, `Kim Namwoon's`, `I'll`) are never quote delimiters.
-            if (isWordChar(prev) && isWordChar(next)) continue
+            // Mid-word apostrophes (`wasn't`, `Kim Namwoon's`, `I'll`) are contractions or possessives.
+            // Track trailing `'s` in case it closes a single-quoted title (`'Ways of Survival's`).
+            if (isWordChar(prev) && isWordChar(next)) {
+                val afterNext = if (i + 2 < text.length) text[i + 2] else null
+                if ((next == 's' || next == 'S') && !isWordChar(afterNext) && ch != '\u2018') {
+                    candidates.add(QuoteCandidate(i, CandidateKind.MIDWORD_POSSESSIVE_S))
+                }
+                continue
+            }
 
             // Skip closing quote of `'n'` contraction (`rock 'n' roll`).
             if (isShortNElisionCloser(text, i)) continue
@@ -156,6 +174,9 @@ object SpeechTextNormalizer {
         val word = extractLeadingWord(text, index + 1)
         if (word.isNotEmpty()) {
             val lower = word.lowercase()
+            if ((prev == ']' || prev == ')') && lower == "s") {
+                return false
+            }
             if (lower in LEADING_ELISIONS || DECADE_REGEX.matches(lower)) {
                 return false
             }
@@ -176,34 +197,87 @@ object SpeechTextNormalizer {
     private fun pairCandidates(
         text: String,
         candidates: List<QuoteCandidate>
-    ): Map<Int, Char> {
-        val replacements = HashMap<Int, Char>(candidates.size)
-        var openOpenerIndex = -1
+    ): Map<Int, String> {
+        val replacements = HashMap<Int, String>(candidates.size)
+        val openerStack = ArrayDeque<Int>()
 
         for (pos in candidates.indices) {
             val candidate = candidates[pos]
             when (candidate.kind) {
                 CandidateKind.OPENER -> {
-                    if (openOpenerIndex == -1) {
-                        openOpenerIndex = candidate.index
-                    }
+                    openerStack.addLast(candidate.index)
                 }
                 CandidateKind.CLOSER -> {
-                    if (openOpenerIndex == -1) {
+                    if (openerStack.isEmpty()) {
                         // Unmatched plural possessive (`boys'`) or dialect elision (`doin'`).
                         continue
                     }
-                    if (isPluralPossessiveInsideOuterQuote(text, candidates, pos)) {
+                    if (openerStack.size == 1 && isPluralPossessiveInsideOuterQuote(text, candidates, pos)) {
                         continue
                     }
-                    replacements[openOpenerIndex] = '\u201C'
-                    replacements[candidate.index] = '\u201D'
-                    openOpenerIndex = -1
+                    val openIdx = openerStack.removeLast()
+                    if (openerStack.isEmpty()) {
+                        replacements[openIdx] = "\u201C"
+                        replacements[candidate.index] = "\u201D"
+                    } else {
+                        replacements[openIdx] = "\u2018"
+                        replacements[candidate.index] = "\u2019"
+                    }
+                }
+                CandidateKind.MIDWORD_POSSESSIVE_S -> {
+                    if (openerStack.isEmpty()) {
+                        continue
+                    }
+                    if (hasMatchingCloserAheadOnLine(text, candidates, pos)) {
+                        continue
+                    }
+                    val openIdx = openerStack.removeLast()
+                    if (openerStack.isEmpty()) {
+                        replacements[openIdx] = "\u201C"
+                        replacements[candidate.index] = "\u201D\u2019"
+                    } else {
+                        replacements[openIdx] = "\u2018"
+                        replacements[candidate.index] = "\u2019"
+                    }
                 }
             }
         }
 
+        // Convert any unclosed opener so no raw ASCII `'` remains in normalized output.
+        for (i in openerStack.indices) {
+            replacements[openerStack[i]] = if (i == 0) "\u201C" else "\u2018"
+        }
+
         return replacements
+    }
+
+    private fun hasMatchingCloserAheadOnLine(
+        text: String,
+        candidates: List<QuoteCandidate>,
+        fromPos: Int
+    ): Boolean {
+        val startIdx = candidates[fromPos].index
+        var depth = 0
+        for (lookahead in (fromPos + 1) until candidates.size) {
+            val upcoming = candidates[lookahead]
+            for (k in startIdx until upcoming.index) {
+                if (text[k] == '\n') return false
+            }
+            when (upcoming.kind) {
+                CandidateKind.OPENER -> depth++
+                CandidateKind.CLOSER -> {
+                    if (depth == 0) {
+                        if (isPluralPossessiveInsideOuterQuote(text, candidates, lookahead)) {
+                            continue
+                        }
+                        return true
+                    }
+                    depth--
+                }
+                CandidateKind.MIDWORD_POSSESSIVE_S -> Unit
+            }
+        }
+        return false
     }
 
     /**
@@ -241,6 +315,11 @@ object SpeechTextNormalizer {
                         continue
                     }
                     return true
+                }
+                CandidateKind.MIDWORD_POSSESSIVE_S -> {
+                    if (!hasMatchingCloserAheadOnLine(text, candidates, lookahead)) {
+                        return true
+                    }
                 }
             }
         }
