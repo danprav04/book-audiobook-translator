@@ -119,9 +119,9 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
         val channelMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
         val minBuffer = AudioTrack.getMinBufferSize(sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
         require(minBuffer > 0) { "Unsupported AudioTrack format: rate=$sampleRate channels=$channels" }
-        // ~500 ms hardware buffer keeps writes smooth without adding much latency.
+        // ~2s hardware buffer prevents AudioTrack underruns across Live turn bursts without delaying writes.
         val bytesPerSecond = sampleRate * (if (channels >= 2) 2 else 1) * 2
-        val bufferSize = maxOf(minBuffer * 2, bytesPerSecond / 2)
+        val bufferSize = maxOf(minBuffer * 2, bytesPerSecond * 2)
 
         track = AudioTrack.Builder()
             .setAudioAttributes(
