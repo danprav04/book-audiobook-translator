@@ -223,4 +223,22 @@ class InteractionsTtsClientTest {
         out.write(pcm)
         return out.toByteArray()
     }
+
+    @Test
+    fun `buildPromptText includes personality and storyContext only when provided`() {
+        val client = OkHttpInteractionsTtsClient()
+        val prompt = client.buildPromptText(
+            TtsRequest(
+                text = "Everything changed at 7:00 PM.",
+                speaker = "Kim Dokja",
+                style = "quiet, wary disbelief",
+                personality = "guarded, analytical reader",
+                storyContext = "Subway stops mid-tunnel as scenarios begin."
+            )
+        )
+        assertTrue(prompt.contains("Kim Dokja (guarded, analytical reader)"))
+        assertTrue(prompt.contains("quiet, wary disbelief tone"))
+        assertTrue(prompt.contains("given the scene (Subway stops mid-tunnel as scenarios begin.)"))
+        assertTrue(prompt.endsWith(": Everything changed at 7:00 PM."))
+    }
 }

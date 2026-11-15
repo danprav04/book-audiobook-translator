@@ -41,7 +41,9 @@ data class TtsRequest(
     val speaker: String? = null,
     val style: String? = null,
     val model: String = DefaultModels.get(ModelRole.TTS),
-    val languageCode: String? = null
+    val languageCode: String? = null,
+    val personality: String? = null,
+    val storyContext: String? = null
 )
 
 /**
@@ -248,19 +250,29 @@ class OkHttpInteractionsTtsClient(
             return request.text
         }
         val speaker = sanitizeDirectiveValue(request.speaker)
+        val personality = sanitizeDirectiveValue(request.personality)?.take(140)
         val style = sanitizeStyle(resolved.styleCue)
-        if (speaker == null && style == null) {
+        val storyContext = sanitizeDirectiveValue(request.storyContext)?.take(240)
+        if (speaker == null && style == null && personality == null && storyContext == null) {
             return resolved.spokenText
         }
         return buildString {
             append("Say")
-            if (speaker != null) append(" as $speaker")
+            if (speaker != null) {
+                append(" as $speaker")
+                if (personality != null) append(" ($personality)")
+            } else if (personality != null) {
+                append(" with character demeanor ($personality)")
+            }
             if (style != null) {
                 if (style.endsWith("tone", ignoreCase = true)) {
                     append(" in a $style")
                 } else {
                     append(" in a $style tone")
                 }
+            }
+            if (storyContext != null) {
+                append(" given the scene ($storyContext)")
             }
             append(": ")
             append(resolved.spokenText)
