@@ -159,8 +159,8 @@ data class RealtimeInputData(
  */
 @Serializable
 data class Blob(
-    val mimeType: String,
-    val data: String
+    val mimeType: String = "",
+    val data: String = ""
 )
 
 /**
@@ -295,8 +295,9 @@ data class ModelTurn(
  */
 @Serializable
 data class TranscriptionData(
-    val text: String,
-    val languageCode: String? = null
+    val text: String = "",
+    val languageCode: String? = null,
+    val finished: Boolean? = null
 )
 
 /**
@@ -304,7 +305,7 @@ data class TranscriptionData(
  */
 @Serializable
 data class GoAwayData(
-    val timeLeft: String
+    val timeLeft: String? = null
 )
 
 /**

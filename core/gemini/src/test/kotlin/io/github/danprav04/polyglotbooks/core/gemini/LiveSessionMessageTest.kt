@@ -278,4 +278,46 @@ class LiveSessionMessageTest {
         val newlineEmptyMsg = json.decodeFromString<LiveServerMessage>("{\n}")
         assertTrue(newlineEmptyMsg is LiveServerMessage.IgnoredMessage)
     }
+
+    @Test
+    fun testTranscriptionWithoutTextDoesNotDropBundledAudio() {
+        val raw = """
+            {
+              "serverContent": {
+                "modelTurn": {
+                  "parts": [
+                    { "inlineData": { "mimeType": "audio/pcm;rate=24000", "data": "AQIDBA==" } }
+                  ]
+                },
+                "outputTranscription": { "finished": true }
+              }
+            }
+        """.trimIndent()
+        val decoded = json.decodeFromString<LiveServerMessage>(raw) as LiveServerMessage.ServerContentMessage
+        assertEquals("AQIDBA==", decoded.serverContent.modelTurn?.parts?.single()?.inlineData?.data)
+        assertEquals("", decoded.serverContent.outputTranscription?.text)
+        assertEquals(true, decoded.serverContent.outputTranscription?.finished)
+
+        val rawNullText = """
+            {
+              "serverContent": {
+                "modelTurn": {
+                  "parts": [
+                    { "inlineData": { "mimeType": "audio/pcm;rate=24000", "data": "BQYHCA==" } }
+                  ]
+                },
+                "outputTranscription": { "text": null }
+              }
+            }
+        """.trimIndent()
+        val lenientJson = Json {
+            ignoreUnknownKeys = true
+            coerceInputValues = true
+            encodeDefaults = true
+            explicitNulls = false
+        }
+        val decodedNull = lenientJson.decodeFromString<LiveServerMessage>(rawNullText) as LiveServerMessage.ServerContentMessage
+        assertEquals("BQYHCA==", decodedNull.serverContent.modelTurn?.parts?.single()?.inlineData?.data)
+        assertEquals("", decodedNull.serverContent.outputTranscription?.text)
+    }
 }

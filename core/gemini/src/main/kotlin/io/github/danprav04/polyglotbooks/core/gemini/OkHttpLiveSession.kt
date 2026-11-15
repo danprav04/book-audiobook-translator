@@ -32,6 +32,7 @@ class OkHttpLiveSession(
     private val okHttpClient: OkHttpClient = defaultOkHttpClient(),
     private val json: Json = Json {
         ignoreUnknownKeys = true
+        coerceInputValues = true
         encodeDefaults = true
         explicitNulls = false
     },
