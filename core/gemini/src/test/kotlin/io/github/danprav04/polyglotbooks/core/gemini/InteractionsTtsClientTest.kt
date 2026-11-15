@@ -295,4 +295,23 @@ class InteractionsTtsClientTest {
         assertNull(retryPart["speechMetadata"])
         assertEquals("Hold on!", retryPart["text"]!!.jsonPrimitive.content)
     }
+
+    @Test
+    fun `buildPromptText and buildRequestJson normalize paired single quotes while keeping apostrophes`() {
+        val client = OkHttpInteractionsTtsClient(
+            okHttpClient = OkHttpClient(),
+            baseUrl = "https://mock.local"
+        )
+        val input = "[The constellation 'Demon-like Judge of Fire' wasn't pleased with Kim Namwoon's choice.]"
+        val expected = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn't pleased with Kim Namwoon's choice.]"
+        val request = TtsRequest(text = input, voiceName = "Charon")
+
+        assertEquals(expected, client.buildPromptText(request))
+
+        val payload = json.parseToJsonElement(client.buildRequestJson(request)).jsonObject
+        val text = payload["contents"]!!.jsonArray[0]
+            .jsonObject["parts"]!!.jsonArray[0]
+            .jsonObject["text"]!!.jsonPrimitive.content
+        assertEquals(expected, text)
+    }
 }

@@ -5,6 +5,7 @@ import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
+import io.github.danprav04.polyglotbooks.core.model.SpeechTextNormalizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -310,7 +311,7 @@ class OkHttpInteractionsTtsClient(
         ) {
             return request.text
         }
-        return resolved.spokenText
+        return SpeechTextNormalizer.normalizeForSpeech(resolved.spokenText)
     }
 
     /**
@@ -364,7 +365,12 @@ class OkHttpInteractionsTtsClient(
                 personality = request.personality,
                 storyContext = request.storyContext
             )
-            return listOf(ResolvedTtsPart(text = resolved.spokenText, styleCue = cue))
+            return listOf(
+                ResolvedTtsPart(
+                    text = SpeechTextNormalizer.normalizeForSpeech(resolved.spokenText),
+                    styleCue = cue
+                )
+            )
         }
 
         // First merge adjacent segments sharing the same base acting cue (before attaching
@@ -377,6 +383,7 @@ class OkHttpInteractionsTtsClient(
             ) {
                 continue
             }
+            val spokenSegment = SpeechTextNormalizer.normalizeForSpeech(resolved.spokenText)
             val baseCue = buildMetadataStyleCue(
                 speaker = segment.speaker ?: request.speaker,
                 style = resolved.styleCue ?: segment.style ?: request.style,
@@ -385,9 +392,9 @@ class OkHttpInteractionsTtsClient(
             )
             val previous = grouped.lastOrNull()
             if (previous != null && previous.second == baseCue) {
-                grouped[grouped.lastIndex] = "${previous.first}\n\n${resolved.spokenText}" to baseCue
+                grouped[grouped.lastIndex] = "${previous.first}\n\n$spokenSegment" to baseCue
             } else {
-                grouped.add(resolved.spokenText to baseCue)
+                grouped.add(spokenSegment to baseCue)
             }
         }
         if (grouped.isEmpty()) {
