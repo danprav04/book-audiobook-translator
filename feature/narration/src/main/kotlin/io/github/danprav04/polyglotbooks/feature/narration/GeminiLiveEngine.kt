@@ -22,6 +22,9 @@ import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
+import io.github.danprav04.polyglotbooks.core.model.SpeechTextNormalizer
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -105,11 +108,12 @@ class GeminiLiveEngine(
             }
             else -> Unit
         }
-        val effectiveRequest = if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE) {
-            request.copy(text = resolved.spokenText, style = resolved.styleCue)
-        } else {
-            request
-        }
+        val effectiveRequest = buildEffectiveSpeechRequest(
+            request = request,
+            isExpressivePunctuation = resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE,
+            spokenText = resolved.spokenText,
+            styleCue = resolved.styleCue
+        )
 
         if (liveSessionFactory == null) {
             try {
@@ -204,14 +208,12 @@ class GeminiLiveEngine(
                 else -> Unit
             }
             val isExpressivePunctuation = resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE
-            val effectiveRequest = if (isExpressivePunctuation) {
-                request.copy(
-                    text = resolved.spokenText,
-                    style = resolved.styleCue
-                )
-            } else {
-                request
-            }
+            val effectiveRequest = buildEffectiveSpeechRequest(
+                request = request,
+                isExpressivePunctuation = isExpressivePunctuation,
+                spokenText = resolved.spokenText,
+                styleCue = resolved.styleCue
+            )
 
             val factory = liveSessionFactory
             val apiKey = try {
@@ -714,7 +716,12 @@ class GeminiLiveEngine(
 
             val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk
             if (bufferedChunks != null && turnVerifiedComplete) {
-                for (chunk in bufferedChunks) {
+                val chunksToEmit = if (isExpressivePunctuation) {
+                    bufferedChunks
+                } else {
+                    trimExcessiveEdgeSilence(bufferedChunks)
+                }
+                for (chunk in chunksToEmit) {
                     emitChunk(chunk)
                 }
                 emittedAnyAudio = true
@@ -865,6 +872,199 @@ class GeminiLiveEngine(
         private const val SIMILARITY_THRESHOLD = 0.75
         private const val POST_GENERATION_IDLE_TIMEOUT_MS = 1_500L
         private const val POST_AUDIO_IDLE_TIMEOUT_MS = 1_500L
+        private const val MIN_TRIM_DURATION_MS = 300L
+        private const val LEAD_SILENCE_THRESHOLD_MS = 180L
+        private const val LEAD_KEEP_MS = 40L
+        private const val TAIL_SILENCE_THRESHOLD_MS = 200L
+        private const val TAIL_KEEP_MS = 80L
+        private const val EDGE_FADE_IN_MS = 4L
+        private const val EDGE_FADE_OUT_MS = 8L
+        private const val SILENCE_AMPLITUDE_THRESHOLD = 300
+
+        private fun buildEffectiveSpeechRequest(
+            request: SynthesisRequest,
+            isExpressivePunctuation: Boolean,
+            spokenText: String,
+            styleCue: String?
+        ): SynthesisRequest {
+            val rawText = if (isExpressivePunctuation) spokenText else request.text
+            val normalizedText = SpeechTextNormalizer.normalizeForSpeech(rawText)
+            return if (isExpressivePunctuation) {
+                request.copy(text = normalizedText, style = styleCue)
+            } else if (normalizedText != request.text) {
+                request.copy(text = normalizedText)
+            } else {
+                request
+            }
+        }
+
+        /**
+         * Trims excessive dead-air padding generated at the edges of verified Live turns (>= 300 ms)
+         * so paragraph highlights and timers advance into speech promptly without clipping breathing
+         * room or introducing clicks.
+         */
+        internal fun trimExcessiveEdgeSilence(chunks: List<PcmChunk>): List<PcmChunk> {
+            if (chunks.isEmpty()) return chunks
+            val sampleRate = chunks.first().sampleRate
+            val channels = chunks.first().channels
+            if (sampleRate <= 0 || channels <= 0) return chunks
+            val bytesPerFrame = channels * 2
+            if (chunks.any {
+                    it.sampleRate != sampleRate ||
+                        it.channels != channels ||
+                        it.data.size % bytesPerFrame != 0
+                }
+            ) {
+                return chunks
+            }
+
+            val totalFrames = chunks.sumOf { it.data.size.toLong() / bytesPerFrame }
+            val minTotalFrames = (sampleRate.toLong() * MIN_TRIM_DURATION_MS) / 1000L
+            if (totalFrames < minTotalFrames) return chunks
+
+            val firstActiveFrame = findFirstActiveFrame(chunks, channels, bytesPerFrame)
+            if (firstActiveFrame < 0L) return chunks
+            val lastActiveFrame = findLastActiveFrame(chunks, totalFrames, firstActiveFrame, channels, bytesPerFrame)
+
+            val leadSilenceFrames = firstActiveFrame
+            val leadThresholdFrames = (sampleRate.toLong() * LEAD_SILENCE_THRESHOLD_MS) / 1000L
+            val leadKeepFrames = (sampleRate.toLong() * LEAD_KEEP_MS) / 1000L
+
+            val tailSilenceFrames = (totalFrames - 1L) - lastActiveFrame
+            val tailThresholdFrames = (sampleRate.toLong() * TAIL_SILENCE_THRESHOLD_MS) / 1000L
+            val tailKeepFrames = (sampleRate.toLong() * TAIL_KEEP_MS) / 1000L
+
+            val trimStartFrame = if (leadSilenceFrames > leadThresholdFrames) {
+                (firstActiveFrame - leadKeepFrames).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+            val trimEndExclusiveFrame = if (tailSilenceFrames > tailThresholdFrames) {
+                (lastActiveFrame + 1L + tailKeepFrames).coerceAtMost(totalFrames)
+            } else {
+                totalFrames
+            }
+            if (trimStartFrame == 0L && trimEndExclusiveFrame == totalFrames) return chunks
+
+            val outBytes = sliceFrameRange(chunks, bytesPerFrame, trimStartFrame, trimEndExclusiveFrame)
+            val outFrames = outBytes.size / bytesPerFrame
+            if (trimStartFrame > 0L) {
+                val fadeInFrames = ((sampleRate.toLong() * EDGE_FADE_IN_MS) / 1000L).toInt().coerceIn(0, outFrames)
+                applyLinearFade(outBytes, startFrame = 0, frameCount = fadeInFrames, channels = channels, fadeIn = true)
+            }
+            if (trimEndExclusiveFrame < totalFrames) {
+                val fadeOutFrames = ((sampleRate.toLong() * EDGE_FADE_OUT_MS) / 1000L).toInt().coerceIn(0, outFrames)
+                applyLinearFade(
+                    outBytes,
+                    startFrame = outFrames - fadeOutFrames,
+                    frameCount = fadeOutFrames,
+                    channels = channels,
+                    fadeIn = false
+                )
+            }
+            return listOf(PcmChunk(data = outBytes, sampleRate = sampleRate, channels = channels))
+        }
+
+        private fun isFrameActive(data: ByteArray, byteOffset: Int, channels: Int): Boolean {
+            for (ch in 0 until channels) {
+                val idx = byteOffset + ch * 2
+                val sample = (data[idx + 1].toInt() shl 8) or (data[idx].toInt() and 0xFF)
+                if (abs(sample) > SILENCE_AMPLITUDE_THRESHOLD) return true
+            }
+            return false
+        }
+
+        private fun findFirstActiveFrame(chunks: List<PcmChunk>, channels: Int, bytesPerFrame: Int): Long {
+            var globalFrame = 0L
+            for (chunk in chunks) {
+                val d = chunk.data
+                var off = 0
+                while (off + bytesPerFrame <= d.size) {
+                    if (isFrameActive(d, off, channels)) return globalFrame
+                    off += bytesPerFrame
+                    globalFrame++
+                }
+            }
+            return -1L
+        }
+
+        private fun findLastActiveFrame(
+            chunks: List<PcmChunk>,
+            totalFrames: Long,
+            firstActiveFrame: Long,
+            channels: Int,
+            bytesPerFrame: Int
+        ): Long {
+            var chunkEndFrame = totalFrames
+            for (ci in chunks.lastIndex downTo 0) {
+                val d = chunks[ci].data
+                val chunkFrames = d.size.toLong() / bytesPerFrame
+                val chunkStartFrame = chunkEndFrame - chunkFrames
+                if (chunkEndFrame - 1L <= firstActiveFrame) break
+
+                var frameInChunk = (d.size / bytesPerFrame) - 1
+                while (frameInChunk >= 0) {
+                    val candidateGlobal = chunkStartFrame + frameInChunk
+                    if (candidateGlobal <= firstActiveFrame) return firstActiveFrame
+                    if (isFrameActive(d, frameInChunk * bytesPerFrame, channels)) return candidateGlobal
+                    frameInChunk--
+                }
+                chunkEndFrame = chunkStartFrame
+            }
+            return firstActiveFrame
+        }
+
+        private fun sliceFrameRange(
+            chunks: List<PcmChunk>,
+            bytesPerFrame: Int,
+            startFrame: Long,
+            endExclusiveFrame: Long
+        ): ByteArray {
+            val outBytes = ByteArray(((endExclusiveFrame - startFrame) * bytesPerFrame).toInt())
+            var cursorFrame = 0L
+            var outOffset = 0
+            for (chunk in chunks) {
+                val d = chunk.data
+                val chunkFrames = d.size.toLong() / bytesPerFrame
+                val chunkEnd = cursorFrame + chunkFrames
+                val copyStart = maxOf(cursorFrame, startFrame)
+                val copyEnd = minOf(chunkEnd, endExclusiveFrame)
+                if (copyEnd > copyStart) {
+                    val srcOffset = ((copyStart - cursorFrame) * bytesPerFrame).toInt()
+                    val length = ((copyEnd - copyStart) * bytesPerFrame).toInt()
+                    System.arraycopy(d, srcOffset, outBytes, outOffset, length)
+                    outOffset += length
+                }
+                cursorFrame = chunkEnd
+            }
+            return outBytes
+        }
+
+        private fun applyLinearFade(
+            pcm: ByteArray,
+            startFrame: Int,
+            frameCount: Int,
+            channels: Int,
+            fadeIn: Boolean
+        ) {
+            if (frameCount <= 0) return
+            val bytesPerFrame = channels * 2
+            for (i in 0 until frameCount) {
+                val gain = if (fadeIn) {
+                    i.toFloat() / frameCount.toFloat()
+                } else {
+                    (frameCount - 1 - i).toFloat() / frameCount.toFloat()
+                }
+                val frameByteOffset = (startFrame + i) * bytesPerFrame
+                for (ch in 0 until channels) {
+                    val idx = frameByteOffset + ch * 2
+                    val sample = (pcm[idx + 1].toInt() shl 8) or (pcm[idx].toInt() and 0xFF)
+                    val scaled = (sample * gain).roundToInt().coerceIn(-32768, 32767)
+                    pcm[idx] = (scaled and 0xFF).toByte()
+                    pcm[idx + 1] = ((scaled ushr 8) and 0xFF).toByte()
+                }
+            }
+        }
 
         /**
          * Joins streaming BPE outputTranscription fragments without inserting artificial spaces
@@ -901,7 +1101,7 @@ class GeminiLiveEngine(
             append("Read the user's text aloud strictly verbatim, word for word, without adding, omitting, ")
             append("paraphrasing, replying conversationally, or repeating these instructions. ")
             append("Read each phrase once and only once—never repeat, echo, or restart a sentence. ")
-            append("Stop cleanly at trailing dashes (—), hyphens (-), or ellipses (...) and never complete or guess unfinished words. ")
+            append("Stop cleanly if a line ends mid-thought with a trailing dash (—) or ellipsis (...) without guessing unfinished words, while pronouncing hyphenated compounds smoothly. ")
             append("Never speak stage directions, speaker labels, or delivery metadata aloud. ")
             append("Perform with natural human warmth, expressive cadence, emotional presence, vivid intonation, ")
             append("and authentic pauses at punctuation (dashes, ellipses, questions, and exclamations) rather than a flat monotone. ")

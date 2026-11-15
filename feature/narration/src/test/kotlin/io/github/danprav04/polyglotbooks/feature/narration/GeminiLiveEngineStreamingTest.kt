@@ -686,4 +686,107 @@ class GeminiLiveEngineStreamingTest {
             live.close()
         }
     }
+
+    @Test
+    fun `streaming Live session normalizes paired single quotes before sending turn`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            fallbackEngine = object : NarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = EngineCapabilities(false, false, false, 24000)
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flowOf()
+            },
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            val line1 = "[The constellation 'Demon-like Judge of Fire' wasn't pleased.]"
+            val expected1 = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn't pleased.]"
+            val j1 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = line1, voiceId = "Charon")).toList()
+            }
+            runCurrent()
+            createdSessions.last().emitServerMessage(audioServerMessage(byteArrayOf(1, 2), transcript = line1, turnComplete = true))
+            j1.join()
+
+            val line2 = "He muttered, 'Wait 'til I'm home.'"
+            val expected2 = "He muttered, \u201CWait 'til I'm home.\u201D"
+            val j2 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = line2, voiceId = "Charon")).toList()
+            }
+            runCurrent()
+            createdSessions.last().emitServerMessage(audioServerMessage(byteArrayOf(3, 4), transcript = line2, turnComplete = true))
+            j2.join()
+
+            val sentTexts = createdSessions.single().sentMessages
+                .filterIsInstance<LiveClientMessage.ClientContentMessage>()
+                .mapNotNull { it.clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text }
+            assertEquals(listOf(expected1, expected2), sentTexts)
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `trimExcessiveEdgeSilence trims oversized silence while preserving speech and leaving short turns untouched`() {
+        fun encodeSamples(samples: ShortArray): ByteArray {
+            val out = ByteArray(samples.size * 2)
+            for (i in samples.indices) {
+                val s = samples[i].toInt()
+                out[i * 2] = (s and 0xFF).toByte()
+                out[i * 2 + 1] = ((s ushr 8) and 0xFF).toByte()
+            }
+            return out
+        }
+
+        fun decodeSample(bytes: ByteArray, frameIndex: Int): Short {
+            val idx = frameIndex * 2
+            return ((bytes[idx + 1].toInt() shl 8) or (bytes[idx].toInt() and 0xFF)).toShort()
+        }
+
+        // Tiny synthetic unit-test chunk (< 300 ms) must remain untouched.
+        val tiny = listOf(PcmChunk(byteArrayOf(1, 2, 3, 4), sampleRate = 24000, channels = 1))
+        assertEquals(tiny, GeminiLiveEngine.trimExcessiveEdgeSilence(tiny))
+
+        // 400 ms codec floor (9600 frames @ +-50) + 200 ms speech (4800 frames @ 5000) + 350 ms silence (8400 frames @ 0)
+        val totalFrames = 9600 + 4800 + 8400
+        val samples = ShortArray(totalFrames) { i ->
+            when {
+                i < 9600 -> if (i % 2 == 0) 50 else -50
+                i < 9600 + 4800 -> 5000
+                else -> 0
+            }
+        }
+        val fullBytes = encodeSamples(samples)
+        val splitByte = 12000 * 2
+        val chunks = listOf(
+            PcmChunk(fullBytes.copyOfRange(0, splitByte), sampleRate = 24000, channels = 1),
+            PcmChunk(fullBytes.copyOfRange(splitByte, fullBytes.size), sampleRate = 24000, channels = 1)
+        )
+
+        val trimmed = GeminiLiveEngine.trimExcessiveEdgeSilence(chunks)
+        assertEquals(1, trimmed.size)
+        // Kept: 40 ms lead (960) + 200 ms speech (4800) + 80 ms tail (1920) = 7680 frames
+        val trimmedBytes = trimmed.single().data
+        assertEquals(7680 * 2, trimmedBytes.size)
+        assertEquals(0.toShort(), decodeSample(trimmedBytes, 0))
+        assertEquals(5000.toShort(), decodeSample(trimmedBytes, 960))
+        assertEquals(0.toShort(), decodeSample(trimmedBytes, 7679))
+
+        // Modest edge silence (100 ms lead, 120 ms tail, total 420 ms) stays untouched.
+        val modestSamples = ShortArray(2400 + 4800 + 2880) { i ->
+            if (i in 2400 until 7200) 5000 else 0
+        }
+        val modestChunks = listOf(PcmChunk(encodeSamples(modestSamples), sampleRate = 24000, channels = 1))
+        assertEquals(modestChunks, GeminiLiveEngine.trimExcessiveEdgeSilence(modestChunks))
+    }
 }
