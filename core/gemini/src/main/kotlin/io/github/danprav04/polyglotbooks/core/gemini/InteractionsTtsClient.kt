@@ -35,6 +35,17 @@ import java.util.Base64
 /**
  * Request payload for text-to-speech synthesis via the Interactions API.
  */
+/**
+ * One segment within a batched [TtsRequest] sharing the same narrator voice while
+ * applying segment-specific acting cues (`speechMetadata.style`).
+ */
+data class TtsSegment(
+    val text: String,
+    val style: String? = null,
+    val speaker: String? = null,
+    val personality: String? = null
+)
+
 data class TtsRequest(
     val text: String,
     val voiceName: String? = null,
@@ -43,7 +54,8 @@ data class TtsRequest(
     val model: String = DefaultModels.get(ModelRole.TTS),
     val languageCode: String? = null,
     val personality: String? = null,
-    val storyContext: String? = null
+    val storyContext: String? = null,
+    val segments: List<TtsSegment> = emptyList()
 )
 
 /**
@@ -95,8 +107,9 @@ class OkHttpInteractionsTtsClient(
                 .ifEmpty { DefaultModels.get(ModelRole.TTS) }
 
             val candidates = quotaTracker.ttsCandidatePool(primaryModel)
-            val estimatedTokens = (request.text.length / 4).coerceAtLeast(50)
-            val payload = buildRequestJson(request)
+            val resolvedParts = resolveParts(request)
+            val totalChars = resolvedParts.sumOf { it.text.length }.coerceAtLeast(request.text.length)
+            val estimatedTokens = (totalChars / 4).coerceAtLeast(50)
             val cleanBase = baseUrl.trimEnd('/')
             val mediaType = "application/json; charset=utf-8".toMediaType()
 
@@ -104,6 +117,7 @@ class OkHttpInteractionsTtsClient(
             val triedThisPass = mutableSetOf<String>()
             var didCooldownWait = false
             var lastErrorBody = ""
+            var stripMetadataForCurrentModel = false
 
             while (true) {
                 val remainingCandidates = candidates.filterNot { it in triedThisPass }
@@ -136,8 +150,14 @@ class OkHttpInteractionsTtsClient(
                     )
                 }
 
-                triedThisPass.add(modelId)
-                attemptedModels.add(modelId)
+                val useSpeechMetadata = supportsSpeechMetadata(modelId) &&
+                    !stripMetadataForCurrentModel &&
+                    resolvedParts.any { !it.styleCue.isNullOrBlank() }
+                val payload = buildRequestJson(
+                    request = request,
+                    modelId = modelId,
+                    includeSpeechMetadata = useSpeechMetadata
+                )
 
                 val url = "$cleanBase/v1beta/models/$modelId:generateContent"
                 val httpRequest = Request.Builder()
@@ -150,10 +170,27 @@ class OkHttpInteractionsTtsClient(
                 okHttpClient.newCall(httpRequest).execute().use { response ->
                     val responseBody = response.body?.string().orEmpty()
                     if (response.isSuccessful) {
+                        stripMetadataForCurrentModel = false
                         val (audioBytes, totalTokens) = extractAudioBytesAndTokens(responseBody)
                         quotaTracker.recordSuccess(modelId, totalTokens)
                         return@withContext audioBytes
                     }
+
+                    // If an older/gateway endpoint rejects speechMetadata with HTTP 400, retry the
+                    // same model once with pure verbatim text parts before consuming fallback quota.
+                    if (response.code == 400 && useSpeechMetadata) {
+                        stripMetadataForCurrentModel = true
+                        DiagnosticLogBuffer.record(
+                            "InteractionsTtsClient",
+                            "TTS HTTP 400 with speechMetadata on $modelId; retrying plain verbatim text",
+                            level = "WARN"
+                        )
+                        return@use
+                    }
+
+                    stripMetadataForCurrentModel = false
+                    triedThisPass.add(modelId)
+                    attemptedModels.add(modelId)
 
                     if (response.code == 401 || response.code == 403) {
                         DiagnosticLogBuffer.record(
@@ -212,8 +249,20 @@ class OkHttpInteractionsTtsClient(
         }
     }
 
-    internal fun buildRequestJson(request: TtsRequest): String {
-        val promptText = buildPromptText(request)
+    private data class ResolvedTtsPart(
+        val text: String,
+        val styleCue: String?
+    )
+
+    internal fun supportsSpeechMetadata(modelId: String): Boolean =
+        !modelId.contains("2.5", ignoreCase = true)
+
+    internal fun buildRequestJson(
+        request: TtsRequest,
+        modelId: String = request.model,
+        includeSpeechMetadata: Boolean = supportsSpeechMetadata(modelId)
+    ): String {
+        val parts = resolveParts(request)
         val voiceName = request.voiceName?.trim()?.takeIf { it.isNotEmpty() } ?: "Puck"
 
         return buildJsonObject {
@@ -221,8 +270,16 @@ class OkHttpInteractionsTtsClient(
                 addJsonObject {
                     put("role", "user")
                     putJsonArray("parts") {
-                        addJsonObject {
-                            put("text", promptText)
+                        for (part in parts) {
+                            addJsonObject {
+                                put("text", part.text)
+                                val cue = part.styleCue
+                                if (includeSpeechMetadata && !cue.isNullOrBlank()) {
+                                    putJsonObject("speechMetadata") {
+                                        put("style", cue)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -242,6 +299,10 @@ class OkHttpInteractionsTtsClient(
         }.toString()
     }
 
+    /**
+     * Returns strictly verbatim book text for TTS input parts so Gemini TTS never speaks
+     * inline directives (such as `"Say as narrator..."`) aloud.
+     */
     internal fun buildPromptText(request: TtsRequest): String {
         val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
         if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EMPTY ||
@@ -249,33 +310,97 @@ class OkHttpInteractionsTtsClient(
         ) {
             return request.text
         }
-        val speaker = sanitizeDirectiveValue(request.speaker)
-        val personality = sanitizeDirectiveValue(request.personality)?.take(140)
-        val style = sanitizeStyle(resolved.styleCue)
-        val storyContext = sanitizeDirectiveValue(request.storyContext)?.take(240)
-        if (speaker == null && style == null && personality == null && storyContext == null) {
-            return resolved.spokenText
+        return resolved.spokenText
+    }
+
+    /**
+     * Builds the non-spoken `speechMetadata.style` directing cue for a single expressive narrator
+     * performing character-aware intonations without switching voices.
+     */
+    internal fun buildMetadataStyleCue(
+        speaker: String?,
+        style: String?,
+        personality: String?,
+        storyContext: String?
+    ): String? {
+        val cleanSpeaker = sanitizeDirectiveValue(speaker)
+        val cleanPersonality = sanitizeDirectiveValue(personality)?.take(100)
+        val cleanStyle = sanitizeStyle(style)?.take(80)
+        val cleanStory = sanitizeDirectiveValue(storyContext)?.take(120)
+
+        val parts = mutableListOf<String>()
+        if (cleanStyle != null) {
+            parts.add(cleanStyle)
         }
-        return buildString {
-            append("Say")
-            if (speaker != null) {
-                append(" as $speaker")
-                if (personality != null) append(" ($personality)")
-            } else if (personality != null) {
-                append(" with character demeanor ($personality)")
-            }
-            if (style != null) {
-                if (style.endsWith("tone", ignoreCase = true)) {
-                    append(" in a $style")
+        when {
+            cleanSpeaker != null && !cleanSpeaker.equals("Narrator", ignoreCase = true) -> {
+                val portrayal = if (cleanPersonality != null) {
+                    "portraying $cleanSpeaker ($cleanPersonality)"
                 } else {
-                    append(" in a $style tone")
+                    "portraying $cleanSpeaker"
                 }
+                parts.add(portrayal)
             }
-            if (storyContext != null) {
-                append(" given the scene ($storyContext)")
+            cleanPersonality != null -> parts.add("narrator demeanor ($cleanPersonality)")
+        }
+        if (cleanStory != null) {
+            parts.add("scene ($cleanStory)")
+        }
+        if (parts.isEmpty()) return null
+        return parts.joinToString(", ").take(260)
+    }
+
+    private fun resolveParts(request: TtsRequest): List<ResolvedTtsPart> {
+        if (request.segments.isEmpty()) {
+            val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+            if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EMPTY ||
+                resolved.kind == PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER
+            ) {
+                return listOf(ResolvedTtsPart(text = request.text, styleCue = null))
             }
-            append(": ")
-            append(resolved.spokenText)
+            val cue = buildMetadataStyleCue(
+                speaker = request.speaker,
+                style = resolved.styleCue ?: request.style,
+                personality = request.personality,
+                storyContext = request.storyContext
+            )
+            return listOf(ResolvedTtsPart(text = resolved.spokenText, styleCue = cue))
+        }
+
+        // First merge adjacent segments sharing the same base acting cue (before attaching
+        // scene context to the leading part) so contiguous prose paragraphs stay one smooth part.
+        val grouped = mutableListOf<Pair<String, String?>>()
+        for (segment in request.segments) {
+            val resolved = PunctuationDialogueHelper.resolve(segment.text, segment.style)
+            if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EMPTY ||
+                resolved.kind == PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER
+            ) {
+                continue
+            }
+            val baseCue = buildMetadataStyleCue(
+                speaker = segment.speaker ?: request.speaker,
+                style = resolved.styleCue ?: segment.style ?: request.style,
+                personality = segment.personality ?: request.personality,
+                storyContext = null
+            )
+            val previous = grouped.lastOrNull()
+            if (previous != null && previous.second == baseCue) {
+                grouped[grouped.lastIndex] = "${previous.first}\n\n${resolved.spokenText}" to baseCue
+            } else {
+                grouped.add(resolved.spokenText to baseCue)
+            }
+        }
+        if (grouped.isEmpty()) {
+            return listOf(ResolvedTtsPart(text = request.text, styleCue = null))
+        }
+        val cleanStory = sanitizeDirectiveValue(request.storyContext)?.take(120)
+        return grouped.mapIndexed { index, (text, baseCue) ->
+            val cueWithScene = if (index == 0 && cleanStory != null) {
+                if (baseCue.isNullOrBlank()) "scene ($cleanStory)" else "$baseCue, scene ($cleanStory)".take(260)
+            } else {
+                baseCue
+            }
+            ResolvedTtsPart(text = text, styleCue = cueWithScene)
         }
     }
 

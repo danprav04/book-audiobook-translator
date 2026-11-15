@@ -27,7 +27,7 @@ class InteractionsTtsClientTest {
     private val json = Json { ignoreUnknownKeys = true }
 
     @Test
-    fun `buildPromptText omits Say prefix for null, blank, and neutral styles`() {
+    fun `buildPromptText always returns strictly verbatim text without Say prefix`() {
         val client = OkHttpInteractionsTtsClient()
         val bookText = "It is a truth universally acknowledged."
 
@@ -36,75 +36,39 @@ class InteractionsTtsClientTest {
         assertEquals(bookText, client.buildPromptText(TtsRequest(text = bookText, style = "neutral")))
         assertEquals(bookText, client.buildPromptText(TtsRequest(text = bookText, style = "Neutral")))
         assertEquals(bookText, client.buildPromptText(TtsRequest(text = bookText, style = "  NEUTRAL  ", languageCode = "en")))
+        assertEquals("Hello world.", client.buildPromptText(TtsRequest(text = "Hello world.", style = "warm")))
+        assertEquals("Good morning.", client.buildPromptText(TtsRequest(text = "Good morning.", speaker = "Elizabeth", style = "neutral")))
+        assertEquals("Quite so.", client.buildPromptText(TtsRequest(text = "Quite so.", speaker = "Darcy", style = "calm, wry")))
+        assertEquals("* * *", client.buildPromptText(TtsRequest(text = "* * *", speaker = "Narrator", style = "dramatic")))
+        assertEquals("---", client.buildPromptText(TtsRequest(text = "---", speaker = "Narrator", style = "dramatic")))
+        assertEquals("\"......?\"", client.buildPromptText(TtsRequest(text = "\"......?\"", speaker = "Alice", style = null)))
+        assertEquals("\"?!\"", client.buildPromptText(TtsRequest(text = "\"?!\"")))
     }
 
     @Test
-    fun `buildPromptText formats non-neutral style and speaker cleanly without leaking meta-instructions`() {
+    fun `buildMetadataStyleCue includes character and scene direction while filtering meta-instructions`() {
         val client = OkHttpInteractionsTtsClient()
 
-        assertEquals(
-            "Say in a warm tone: Hello world.",
-            client.buildPromptText(TtsRequest(text = "Hello world.", style = "warm"))
-        )
-        assertEquals(
-            "Say in a warm tone: Hello world.",
-            client.buildPromptText(TtsRequest(text = "Hello world.", style = "warm tone"))
-        )
-        assertEquals(
-            "Say as Elizabeth: Good morning.",
-            client.buildPromptText(TtsRequest(text = "Good morning.", speaker = "Elizabeth", style = "neutral"))
-        )
-        assertEquals(
-            "Say as Darcy in a calm, wry tone: Quite so.",
-            client.buildPromptText(TtsRequest(text = "Quite so.", speaker = "Darcy", style = "calm, wry"))
-        )
-
-        // Structural dividers never receive a Say prefix even when style/speaker is set
-        assertEquals(
-            "* * *",
-            client.buildPromptText(TtsRequest(text = "* * *", speaker = "Narrator", style = "dramatic"))
-        )
-        assertEquals(
-            "---",
-            client.buildPromptText(TtsRequest(text = "---", speaker = "Narrator", style = "dramatic"))
-        )
-
-        // Expressive punctuation-only dialogue resolves into spoken non-verbal interjection + style cue
-        assertEquals(
-            "Say as Alice in a hesitant, puzzled questioning murmur tone: Hmm...?",
-            client.buildPromptText(TtsRequest(text = "\"......?\"", speaker = "Alice", style = null))
-        )
-        assertEquals(
-            "Say in a startled, incredulous gasp tone: Huh?!",
-            client.buildPromptText(TtsRequest(text = "\"?!\""))
-        )
-
-        // Meta-instruction phrases in style/speaker must never leak into TTS prompt text
-        assertEquals(
-            "Chapter One.",
-            client.buildPromptText(
-                TtsRequest(
-                    text = "Chapter One.",
-                    style = "Read aloud verbatim in English without translating or adding commentary"
-                )
-            )
-        )
-        assertEquals(
-            "Chapter Two.",
-            client.buildPromptText(
-                TtsRequest(
-                    text = "Chapter Two.",
-                    speaker = "Narrator:\nRead aloud without commentary"
-                )
+        assertNull(client.buildMetadataStyleCue(speaker = "Narrator", style = "neutral", personality = null, storyContext = null))
+        assertNull(
+            client.buildMetadataStyleCue(
+                speaker = "Narrator:\nRead aloud without commentary",
+                style = "Read aloud verbatim in English without translating or adding commentary",
+                personality = null,
+                storyContext = null
             )
         )
 
-        // Legitimate prose containing those words must remain intact
-        val prose = "Please read aloud the letter without commentary, she asked."
-        assertEquals(
-            prose,
-            client.buildPromptText(TtsRequest(text = prose, style = "neutral", languageCode = "en"))
+        val cue = client.buildMetadataStyleCue(
+            speaker = "Kim Dokja",
+            style = "quiet, wary disbelief",
+            personality = "guarded, analytical reader",
+            storyContext = "Subway stops mid-tunnel as scenarios begin."
         )
+        assertTrue(cue.orEmpty().contains("quiet, wary disbelief"))
+        assertTrue(cue.orEmpty().contains("portraying Kim Dokja (guarded, analytical reader)"))
+        assertTrue(cue.orEmpty().contains("scene (Subway stops mid-tunnel as scenarios begin.)"))
+        assertFalse(cue.orEmpty().contains("Say as"))
     }
 
     @Test
@@ -190,9 +154,11 @@ class InteractionsTtsClientTest {
 
         assertEquals(1, streamedChunks.size)
         assertArrayEquals(rawPcm, streamedChunks[0].data)
-        val secondSentText = json.parseToJsonElement(capturedBodies[1]).jsonObject["contents"]!!
-            .jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject["text"]!!.jsonPrimitive.content
-        assertEquals("Say in a warm tone: Bonjour!", secondSentText)
+        val secondPart = json.parseToJsonElement(capturedBodies[1]).jsonObject["contents"]!!
+            .jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        assertEquals("Bonjour!", secondPart["text"]!!.jsonPrimitive.content)
+        assertEquals("warm", secondPart["speechMetadata"]!!.jsonObject["style"]!!.jsonPrimitive.content)
+        assertNull(secondPart["speechMetadata"]!!.jsonObject["speaker"])
     }
 
     private fun wrapPcmAsWav(pcm: ByteArray): ByteArray {
@@ -225,20 +191,108 @@ class InteractionsTtsClientTest {
     }
 
     @Test
-    fun `buildPromptText includes personality and storyContext only when provided`() {
+    fun `buildRequestJson batches multi-segment acting cues via speechMetadata and strips on 2_5 fallback`() {
         val client = OkHttpInteractionsTtsClient()
-        val prompt = client.buildPromptText(
-            TtsRequest(
-                text = "Everything changed at 7:00 PM.",
-                speaker = "Kim Dokja",
-                style = "quiet, wary disbelief",
-                personality = "guarded, analytical reader",
-                storyContext = "Subway stops mid-tunnel as scenarios begin."
+        val request = TtsRequest(
+            text = "Line 1\n\nLine 2\n\nLine 3",
+            voiceName = "Charon",
+            storyContext = "Subway stops mid-tunnel as scenarios begin.",
+            segments = listOf(
+                TtsSegment(text = "The train jolted.", style = "tense", speaker = "Narrator"),
+                TtsSegment(text = "What is happening?", style = "tense", speaker = "Narrator"),
+                TtsSegment(
+                    text = "Hey, shut up!",
+                    style = "brash, aggressive",
+                    speaker = "Kim Namwoon",
+                    personality = "impulsive delinquent"
+                )
             )
         )
-        assertTrue(prompt.contains("Kim Dokja (guarded, analytical reader)"))
-        assertTrue(prompt.contains("quiet, wary disbelief tone"))
-        assertTrue(prompt.contains("given the scene (Subway stops mid-tunnel as scenarios begin.)"))
-        assertTrue(prompt.endsWith(": Everything changed at 7:00 PM."))
+
+        val v38Json = json.parseToJsonElement(
+            client.buildRequestJson(request, modelId = "gemini-3.8-flash-tts")
+        ).jsonObject
+        val parts38 = v38Json["contents"]!!.jsonArray[0].jsonObject["parts"]!!.jsonArray
+        // Segments 1 & 2 share narrator/tense cue and merge into part 1 (with scene), while segment 3 stays distinct.
+        assertEquals(2, parts38.size)
+        assertEquals("The train jolted.\n\nWhat is happening?", parts38[0].jsonObject["text"]!!.jsonPrimitive.content)
+        assertTrue(parts38[0].jsonObject["speechMetadata"]!!.jsonObject["style"]!!.jsonPrimitive.content.contains("scene (Subway stops mid-tunnel as scenarios begin.)"))
+        assertTrue(parts38.all { !it.jsonObject["text"]!!.jsonPrimitive.content.contains("Say as") })
+        assertEquals("Hey, shut up!", parts38[1].jsonObject["text"]!!.jsonPrimitive.content)
+        val namwoonPart = parts38[1].jsonObject
+        val namwoonStyle = namwoonPart["speechMetadata"]!!.jsonObject["style"]!!.jsonPrimitive.content
+        assertTrue(namwoonStyle.contains("portraying Kim Namwoon (impulsive delinquent)"))
+        assertNull(namwoonPart["speechMetadata"]!!.jsonObject["speaker"])
+
+        val v25Json = json.parseToJsonElement(
+            client.buildRequestJson(request, modelId = "gemini-2.5-flash-preview-tts")
+        ).jsonObject
+        val parts25 = v25Json["contents"]!!.jsonArray[0].jsonObject["parts"]!!.jsonArray
+        assertTrue(parts25.all { it.jsonObject["speechMetadata"] == null })
+        assertTrue(parts25.all { !it.jsonObject["text"]!!.jsonPrimitive.content.contains("Say as") })
+    }
+
+    @Test
+    fun `OkHttpInteractionsTtsClient retries plain verbatim text on HTTP 400 when speechMetadata was rejected`() = runTest {
+        val capturedBodies = mutableListOf<String>()
+        val rawPcm = byteArrayOf(1, 2, 3, 4)
+        val b64Audio = Base64.getEncoder().encodeToString(wrapPcmAsWav(rawPcm))
+        var calls = 0
+
+        val okHttp = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                calls += 1
+                val req = chain.request()
+                val buffer = Buffer()
+                req.body?.writeTo(buffer)
+                capturedBodies.add(buffer.readUtf8())
+
+                if (calls == 1) {
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(400)
+                        .message("Bad Request")
+                        .body("""{"error":{"message":"Unknown field speechMetadata"}}""".toResponseBody("application/json".toMediaType()))
+                        .build()
+                } else {
+                    val responseJson = """
+                        {
+                          "candidates": [
+                            { "content": { "parts": [ { "inlineData": { "mimeType": "audio/wav", "data": "$b64Audio" } } ] } }
+                          ]
+                        }
+                    """.trimIndent()
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(responseJson.toResponseBody("application/json".toMediaType()))
+                        .build()
+                }
+            })
+            .build()
+
+        val client = OkHttpInteractionsTtsClient(okHttpClient = okHttp, baseUrl = "https://mock.local")
+        val pcm = client.synthesizeUnary(
+            apiKey = "test-key",
+            request = TtsRequest(
+                text = "Hold on!",
+                voiceName = "Charon",
+                speaker = "Kim Dokja",
+                style = "urgent"
+            )
+        )
+
+        assertArrayEquals(rawPcm, pcm)
+        assertEquals(2, calls)
+        val firstPart = json.parseToJsonElement(capturedBodies[0]).jsonObject["contents"]!!
+            .jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        val retryPart = json.parseToJsonElement(capturedBodies[1]).jsonObject["contents"]!!
+            .jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        assertTrue(firstPart["speechMetadata"] != null)
+        assertNull(retryPart["speechMetadata"])
+        assertEquals("Hold on!", retryPart["text"]!!.jsonPrimitive.content)
     }
 }
