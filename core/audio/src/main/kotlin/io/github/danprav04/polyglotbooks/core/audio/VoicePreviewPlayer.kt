@@ -8,6 +8,7 @@ import dagger.Module
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -140,6 +141,11 @@ class AssetVoicePreviewPlayer internal constructor(
                     releaseSafely(finished)
                 },
                 onError = { message ->
+                    DiagnosticLogBuffer.record(
+                        "VoicePreviewPlayer",
+                        "Voice preview error for $canonicalVoiceId: $message",
+                        level = "WARN"
+                    )
                     val failed = synchronized(lock) {
                         if (requestGeneration == startToken) {
                             _playingVoiceId.value = null
@@ -171,6 +177,12 @@ class AssetVoicePreviewPlayer internal constructor(
 
             backend.start()
         } catch (t: Throwable) {
+            DiagnosticLogBuffer.record(
+                "VoicePreviewPlayer",
+                "Voice preview failed for $canonicalVoiceId",
+                level = "WARN",
+                throwable = t
+            )
             val cleanup = synchronized(lock) {
                 val detached = if (requestGeneration == startToken) {
                     _playingVoiceId.value = null

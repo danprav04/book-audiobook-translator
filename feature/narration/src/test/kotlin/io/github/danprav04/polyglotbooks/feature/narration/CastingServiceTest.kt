@@ -151,4 +151,102 @@ class CastingServiceTest {
         assertEquals(paragraph.length, result.lines[0].endOffset)
         assertEquals("narrator", result.lines[0].speakerId)
     }
+
+    @Test
+    fun testBuildCastingPromptIncludesKnownCastAliasesAndReadOnlyContext() {
+        val existingCast = listOf(
+            io.github.danprav04.polyglotbooks.core.model.Character(
+                id = "b1_elizabeth",
+                bookId = "b1",
+                name = "Elizabeth Bennet",
+                aliases = listOf("Lizzy", "Miss Bennet"),
+                gender = "female",
+                age = "young adult",
+                voiceTraits = "bright, sharp"
+            )
+        )
+        val prompt = castingService.buildCastingPrompt(
+            paragraphs = listOf(
+                "—Impossible!— she countered sharply.",
+                "«Never say never,» murmured Mr. Darcy."
+            ),
+            existingCharacters = existingCast,
+            previousContextParagraphs = listOf("Elizabeth stood by the window waiting for his reply."),
+            chapterTitle = "Chapter 3"
+        )
+
+        assertTrue(prompt.contains("Chapter title: Chapter 3"))
+        assertTrue(prompt.contains("""id="b1_elizabeth""""))
+        assertTrue(prompt.contains("Lizzy"))
+        assertTrue(prompt.contains("Miss Bennet"))
+        assertTrue(prompt.contains("[ctx-1] Elizabeth stood by the window waiting for his reply."))
+        assertTrue(prompt.contains("DO NOT emit 'lines' for these"))
+        assertTrue(prompt.contains("[0] —Impossible!— she countered sharply."))
+        assertTrue(prompt.contains("[1] «Never say never,» murmured Mr. Darcy."))
+    }
+
+    @Test
+    fun testParseAndValidateCastingReconcilesExistingCharactersByAliasAndStripsCodeFences() {
+        val existingCast = listOf(
+            io.github.danprav04.polyglotbooks.core.model.Character(
+                id = "b1_alice",
+                bookId = "b1",
+                name = "Alice",
+                aliases = listOf("Allie"),
+                gender = "female",
+                age = "unknown",
+                voiceTraits = "",
+                assignedVoiceId = "Kore"
+            )
+        )
+        val p0 = "\"Wait!\" Allie whispered in the dark."
+        val p1 = "\"Coming,\" Bob answered."
+        val fencedJson = """
+            ```json
+            {
+              "characters": [
+                { "id": "", "name": "Narrator" },
+                { "id": "c_allie", "name": "Alice L.", "aliases": ["Allie"], "age": "young", "voiceTraits": "soft, urgent" },
+                { "id": "c_bob", "name": "Bob", "gender": "male", "age": "adult", "voiceTraits": "steady" }
+              ],
+              "lines": [
+                { "para": 0, "start": 0, "end": 8, "speaker": "Allie", "style": "whispering" },
+                { "para": 0, "start": 9, "end": ${p0.length}, "speaker": "narrator" },
+                { "para": 1, "start": 0, "end": 10, "speaker": "c_bob", "style": "calm" }
+              ]
+            }
+            ```
+        """.trimIndent()
+
+        val result = castingService.parseAndValidateCasting(
+            jsonResponse = fencedJson,
+            paragraphs = listOf(p0, p1),
+            existingCharacters = existingCast,
+            bookId = "b1",
+            chapterId = "b1_chap_0"
+        )
+
+        val alice = result.characters.firstOrNull { it.id == "b1_alice" }
+        assertNotNull(alice)
+        assertEquals("Alice", alice!!.name)
+        assertEquals("Kore", alice.assignedVoiceId)
+        assertEquals("female", alice.gender)
+        assertEquals("young", alice.age)
+        assertEquals("soft, urgent", alice.voiceTraits)
+        assertTrue(alice.aliases.contains("Allie"))
+        assertTrue(alice.aliases.contains("Alice L."))
+
+        val bob = result.characters.firstOrNull { it.name == "Bob" }
+        assertNotNull(bob)
+
+        val p0Spans = result.lines.filter { it.paraIndex == 0 }
+        assertEquals("b1_alice", p0Spans[0].speakerId)
+        assertEquals("whispering", p0Spans[0].style)
+        assertEquals("narrator", p0Spans.last().speakerId)
+
+        val p1Spans = result.lines.filter { it.paraIndex == 1 }
+        assertEquals("c_bob", p1Spans[0].speakerId)
+        assertEquals("narrator", p1Spans[1].speakerId)
+        assertEquals(p1.length, p1Spans.last().endOffset)
+    }
 }

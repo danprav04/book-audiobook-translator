@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.core.gemini
 
 import android.util.Log
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
@@ -164,6 +165,10 @@ class DefaultLiveTranslateClient(
         ctx.triedModels.add(ctx.currentModel)
         ctx.attemptedConfigs.add(ctx.currentModel to ctx.setupMode)
         usingTranslationConfig = (ctx.setupMode == SetupMode.TRANSLATE_CONFIG)
+        DiagnosticLogBuffer.record(
+            TAG,
+            "Starting live translation model=${ctx.currentModel} mode=${ctx.setupMode} targetLang=${ctx.targetLanguageCode}"
+        )
 
         val currentCallerJob = coroutineContext[Job]
         val session = sessionFactory.create()
@@ -302,6 +307,12 @@ class DefaultLiveTranslateClient(
             isInvalidArgumentOrSetupError(serverError, throwable) -> 400
             else -> 503
         }
+        DiagnosticLogBuffer.record(
+            TAG,
+            "Live attempt failed model=${ctx.currentModel} mode=${ctx.setupMode} code=$errCode receivedContent=${ctx.hasReceivedContent}",
+            level = "WARN",
+            throwable = throwable
+        )
         quotaTracker?.recordHttpError(
             modelId = ctx.currentModel,
             httpCode = errCode,
@@ -643,6 +654,7 @@ class DefaultLiveTranslateClient(
     }
 
     private fun logE(msg: String, t: Throwable) {
+        DiagnosticLogBuffer.record(TAG, msg, level = "ERROR", throwable = t)
         try {
             Log.e(TAG, msg, t)
         } catch (_: Throwable) {

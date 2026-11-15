@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
@@ -66,6 +67,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -77,11 +79,14 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import io.github.danprav04.polyglotbooks.core.data.BugReportClipboardHelper
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
 import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
+import io.github.danprav04.polyglotbooks.core.model.BugReportContextFormatter
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -94,7 +99,45 @@ fun SettingsScreen(
     val uiState by viewModel.uiState.collectAsState()
     val snackbarHostState = remember { SnackbarHostState() }
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     var showVoicePickerDialog by remember { mutableStateOf(false) }
+
+    val modelSummary = remember(uiState.modelPerRole, uiState.defaultNarratorVoiceId, uiState.featureUsageStats.isFreeTier) {
+        buildString {
+            append("Tier=").append(if (uiState.featureUsageStats.isFreeTier) "Free" else "Paid")
+            append(", NarratorVoice=").append(uiState.defaultNarratorVoiceId)
+            append(", Models=").append(
+                ModelRole.entries.joinToString("; ") { role ->
+                    "${role.name}=${uiState.modelPerRole[role] ?: DefaultModels.get(role)}"
+                }
+            )
+        }
+    }
+    val quotaSummary = remember(uiState.quotaSnapshots) {
+        if (uiState.quotaSnapshots.isEmpty()) {
+            "No model quota activity recorded in current session"
+        } else {
+            uiState.quotaSnapshots.values.joinToString("; ") { snap ->
+                val rpmLim = if (snap.rpmLimit == Int.MAX_VALUE) "inf" else snap.rpmLimit.toString()
+                val rpdLim = if (snap.rpdLimit == Int.MAX_VALUE) "inf" else snap.rpdLimit.toString()
+                val cdSecs = (snap.cooldownRemainingMs + 999L) / 1000L
+                val status = when {
+                    snap.permanentlyUnavailable -> "unavail"
+                    snap.exhaustedForDay -> "day_exhausted"
+                    cdSecs > 0L -> "cd=${cdSecs}s"
+                    else -> "ok"
+                }
+                "${snap.modelId}: rpm=${snap.rpmUsedLastMinute}/$rpmLim, rpd=${snap.rpdUsedToday}/$rpdLim, $status"
+            }
+        }
+    }
+    val lastErrorSummary = remember(uiState.testKeyStatus, uiState.previewErrorMessage) {
+        when {
+            uiState.testKeyStatus is TestKeyStatus.Error -> (uiState.testKeyStatus as TestKeyStatus.Error).errorMessage
+            !uiState.previewErrorMessage.isNullOrBlank() -> uiState.previewErrorMessage
+            else -> null
+        }
+    }
 
     LaunchedEffect(uiState.userMessage) {
         uiState.userMessage?.let { msg ->
@@ -131,7 +174,22 @@ fun SettingsScreen(
                 onToggleVisibility = viewModel::toggleApiKeyVisibility,
                 onTestKey = viewModel::testApiKey,
                 onSaveKey = viewModel::saveApiKey,
-                onDeleteKey = viewModel::deleteApiKey
+                onDeleteKey = viewModel::deleteApiKey,
+                onCopyErrorContext = { errMsg ->
+                    val res = BugReportClipboardHelper.copyBugReport(
+                        context = context,
+                        screenOrArea = "Settings - API Key Verification",
+                        engineOrModelInfo = modelSummary,
+                        quotaStatus = quotaSummary,
+                        lastError = errMsg
+                    )
+                    coroutineScope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (res.copiedToClipboard) "Diagnostic context copied to clipboard"
+                            else "Failed to copy diagnostic context"
+                        )
+                    }
+                }
             )
 
             HorizontalDivider()
@@ -167,6 +225,40 @@ fun SettingsScreen(
 
             // Section 4: Privacy & Disclosure Notice
             PrivacyAndDisclosureSection(
+                onCopyDiagnosticContext = {
+                    val res = BugReportClipboardHelper.copyBugReport(
+                        context = context,
+                        screenOrArea = "Settings",
+                        engineOrModelInfo = modelSummary,
+                        quotaStatus = quotaSummary,
+                        lastError = lastErrorSummary
+                    )
+                    coroutineScope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (res.copiedToClipboard) "Diagnostic context copied to clipboard"
+                            else "Failed to copy diagnostic context"
+                        )
+                    }
+                },
+                onReportAiOutputIssue = {
+                    BugReportClipboardHelper.copyBugReport(
+                        context = context,
+                        screenOrArea = "Settings - AI Output Report",
+                        engineOrModelInfo = modelSummary,
+                        quotaStatus = quotaSummary,
+                        lastError = lastErrorSummary
+                    )
+                    val opened = BugReportClipboardHelper.openExternalUrl(
+                        context,
+                        BugReportContextFormatter.GITHUB_AI_REPORT_URL
+                    )
+                    coroutineScope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (opened) "Diagnostic context copied — paste into GitHub issue"
+                            else "Diagnostic context copied to clipboard"
+                        )
+                    }
+                },
                 onOpenUrl = { url ->
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
                     try {
@@ -210,7 +302,8 @@ private fun ApiKeySection(
     onToggleVisibility: () -> Unit,
     onTestKey: () -> Unit,
     onSaveKey: () -> Unit,
-    onDeleteKey: () -> Unit
+    onDeleteKey: () -> Unit,
+    onCopyErrorContext: (String) -> Unit
 ) {
     val focusManager = LocalFocusManager.current
 
@@ -300,20 +393,33 @@ private fun ApiKeySection(
                     }
                 }
                 is TestKeyStatus.Error -> {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Error,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.error
-                        )
-                        Text(
-                            text = status.errorMessage,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.error
-                        )
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Error,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Text(
+                                text = status.errorMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { onCopyErrorContext(status.errorMessage) }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Copy Context")
+                        }
                     }
                 }
             }
@@ -876,6 +982,8 @@ private fun AudioAndStorageSection(
 
 @Composable
 private fun PrivacyAndDisclosureSection(
+    onCopyDiagnosticContext: () -> Unit,
+    onReportAiOutputIssue: () -> Unit,
     onOpenUrl: (String) -> Unit
 ) {
     Card(
@@ -933,8 +1041,17 @@ private fun PrivacyAndDisclosureSection(
                 }
             }
 
+            OutlinedButton(
+                onClick = onCopyDiagnosticContext,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Copy Diagnostic Context")
+            }
+
             Button(
-                onClick = { onOpenUrl("https://github.com/danprav04/book-audiobook-translator/issues/new?template=ai_output_report.yml") },
+                onClick = onReportAiOutputIssue,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary)
             ) {

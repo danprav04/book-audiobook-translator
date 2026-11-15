@@ -6,6 +6,8 @@ import io.github.danprav04.polyglotbooks.core.audio.AudioTrackPcmPlayer
 import io.github.danprav04.polyglotbooks.core.audio.PcmPlayer
 import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
+import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
+import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.Blob
 import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
@@ -1254,5 +1256,469 @@ class ReaderNarrationSessionManagerTest {
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `flash tts multi-paragraph batch advances highlight and timeline in real time during AudioTrack write without 1x setSpeed`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-flash-realtime-sync").toFile()
+        try {
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_FLASH_TTS.name)
+                setReaderNarrationSpeed(1.0f)
+            }
+            val speedCalls = mutableListOf<Float>()
+            val writeSliceSizes = mutableListOf<Int>()
+            val headFrames = java.util.concurrent.atomic.AtomicLong(0L)
+            lateinit var player: AudioTrackPcmPlayer
+
+            val adapter = object : AudioTrackAdapter {
+                override fun write(data: ByteArray, offset: Int, size: Int): Int {
+                    writeSliceSizes += size
+                    return size
+                }
+                override fun play() {}
+                override fun pause() {}
+                override fun flush() {}
+                override fun stop() {}
+                override fun release() {}
+                override fun setSpeed(speed: Float): Boolean {
+                    speedCalls += speed
+                    return true
+                }
+                override fun setVolume(volume: Float) {}
+                override val playbackHeadPositionFrames: Long get() = headFrames.get()
+            }
+            player = AudioTrackPcmPlayer(AudioTrackAdapterFactory { _, _ -> adapter })
+
+            // 2.0s of 24kHz mono 16-bit PCM = 96,000 bytes (48,000 frames) across 2 paragraphs,
+            // plus a 3rd paragraph in batch 1 held on synthesis so batch 0 stays active in ticker.
+            val totalPcm = ByteArray(96_000) { 0x12 }
+            val holdBatch1 = CompletableDeferred<Unit>()
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = totalPcm
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    if (request.text.contains("BatchOneMarker")) {
+                        holdBatch1.await()
+                    }
+                    emit(PcmChunk(totalPcm, 24000, 1))
+                }
+            }
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("flash-sync-key"),
+                interactionsTtsClient = ttsClient,
+                quotaTracker = GeminiQuotaTracker(),
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { player }
+            }
+            runCurrent()
+
+            val p0 = ReaderParagraph(0, "p0", "First short paragraph in Flash TTS batch.", "epubcfi(/6/2!/4/2/1:0)")
+            val p1 = ReaderParagraph(1, "p1", "Second paragraph inside the exact same Flash TTS batch.", "epubcfi(/6/2!/4/2/2:0)")
+            val p2 = ReaderParagraph(2, "p2", "BatchOneMarker " + "Z".repeat(950), "epubcfi(/6/2!/4/2/3:0)")
+
+            manager.startOrResume(
+                bookId = "book-flash-sync",
+                bookTitle = "Flash Sync",
+                paragraphs = listOf(p0, p1, p2)
+            )
+            runCurrent()
+
+            // Verify 1.0x playback NEVER called AudioTrack.setSpeed and batch 0 wrote in bounded sub-chunks
+            assertTrue("1.0x narration must bypass AudioTrack.setSpeed", speedCalls.isEmpty())
+            assertTrue("Expected sub-chunked writes (<= 2048B)", writeSliceSizes.size > 1 && writeSliceSizes.all { it <= 2048 })
+            assertEquals(48_000L, player.totalFramesWritten)
+
+            // With headFrames still inside p0 (< ~20,000), highlight stays on p0
+            headFrames.set(5_000L)
+            advanceTimeBy(120)
+            runCurrent()
+            assertEquals("epubcfi(/6/2!/4/2/1:0)", manager.sessionState.value.highlightedCfi)
+            assertEquals(0, manager.sessionState.value.activeParagraphIndex)
+            assertTrue(manager.sessionState.value.chapterPositionMs > 0L)
+
+            // Advance hardware playback head into p1 within the SAME batch -> highlight & timeline follow voice
+            headFrames.set(36_000L)
+            advanceTimeBy(120)
+            runCurrent()
+            assertEquals("epubcfi(/6/2!/4/2/2:0)", manager.sessionState.value.highlightedCfi)
+            assertEquals(1, manager.sessionState.value.activeParagraphIndex)
+
+            holdBatch1.complete(Unit)
+            advanceUntilIdle()
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `flash tts prefetches next batch during playback without duplicate network calls`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-flash-prefetch-live").toFile()
+        try {
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_FLASH_TTS.name)
+            }
+            var ttsCallCount = 0
+            val synthesizedTexts = mutableListOf<String>()
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray {
+                    ttsCallCount++
+                    synthesizedTexts += request.text
+                    return ByteArray(4800) { 0x05 }
+                }
+
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    ttsCallCount++
+                    synthesizedTexts += request.text
+                    emit(PcmChunk(ByteArray(4800) { 0x05 }, 24000, 1))
+                }
+            }
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("flash-prefetch-key"),
+                interactionsTtsClient = ttsClient,
+                quotaTracker = GeminiQuotaTracker(),
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { RecordingPcmPlayer() }
+            }
+            runCurrent()
+
+            val p0 = ReaderParagraph(0, "p0", "First batch. " + "A".repeat(700), "epubcfi(/6/2!/4/2/1:0)")
+            val p1 = ReaderParagraph(1, "p1", "Second batch. " + "B".repeat(700), "epubcfi(/6/2!/4/2/2:0)")
+
+            manager.startOrResume(
+                bookId = "book-flash-prefetch",
+                bookTitle = "Flash Prefetch",
+                paragraphs = listOf(p0, p1)
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals("Two batches must make exactly 2 TTS network calls (no double synthesis)", 2, ttsCallCount)
+            assertEquals(2, synthesizedTexts.size)
+            assertFalse(manager.sessionState.value.isPlaying)
+            assertNull(manager.sessionState.value.errorMessage)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `buildSpeechChunks isolates silent dividers and expressive punctuation dialogue cleanly from prose batches`() {
+        val manager = ReaderNarrationSessionManager(
+            bookDao = FakeBookDao(),
+            chapterDao = FakeChapterDao(),
+            applicationScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        )
+        val paragraphs = listOf(
+            ReaderParagraph(0, "p0", "Opening narrative sentence.", "epubcfi(/6/2!/4/2/1:0)"),
+            ReaderParagraph(1, "p1", "\"......?\"", "epubcfi(/6/2!/4/2/2:0)"),
+            ReaderParagraph(2, "p2", "* * *", "epubcfi(/6/2!/4/2/3:0)"),
+            ReaderParagraph(3, "p3", "Closing narrative sentence.", "epubcfi(/6/2!/4/2/4:0)")
+        )
+
+        val chunks = manager.buildSpeechChunks(paragraphs, emptyList(), NarrationEngine.GEMINI_FLASH_TTS)
+        assertEquals(4, chunks.size)
+        assertEquals("Opening narrative sentence.", chunks[0].text)
+        assertEquals(null, chunks[0].style)
+
+        assertEquals("\"......?\"", chunks[1].text)
+        assertTrue(chunks[1].style.orEmpty().contains("puzzled", ignoreCase = true))
+
+        assertEquals("* * *", chunks[2].text)
+        assertEquals(null, chunks[2].style)
+
+        assertEquals("Closing narrative sentence.", chunks[3].text)
+        assertEquals(null, chunks[3].style)
+    }
+
+    @Test
+    fun `gemini live mid-turn error retries cleanly without partial drop double playback or corrupted cache`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-verify").toFile()
+        try {
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+            }
+            val p0Text = "First sentence survives a mid-turn interruption cleanly."
+            val partialBadBytes = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+            val goodBytes = ByteArray(2400) { 0x2A }
+            val partialB64 = Base64.getEncoder().encodeToString(partialBadBytes)
+            val goodB64 = Base64.getEncoder().encodeToString(goodBytes)
+            var sessionCreateCount = 0
+
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession {
+                    assertFalse("Reader Live narration must defer GoAway rotation to GeminiLiveEngine", reconnectOnGoAway)
+                    val idx = sessionCreateCount++
+                    return object : LiveSession {
+                        private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
+                        override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                        private var connected = false
+                        override val isConnected: Boolean get() = connected
+
+                        override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                            connected = true
+                        }
+
+                        override suspend fun send(message: LiveClientMessage) {
+                            if (idx == 0) {
+                                _incoming.emit(
+                                    LiveServerMessage.ServerContentMessage(
+                                        ServerContentData(
+                                            modelTurn = ModelTurn(parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", partialB64)))),
+                                            outputTranscription = TranscriptionData("First sentence"),
+                                            turnComplete = false
+                                        )
+                                    )
+                                )
+                                _incoming.emit(
+                                    LiveServerMessage.ErrorMessage(
+                                        io.github.danprav04.polyglotbooks.core.gemini.LiveErrorData(code = 503, message = "Overloaded")
+                                    )
+                                )
+                            } else {
+                                _incoming.emit(
+                                    LiveServerMessage.ServerContentMessage(
+                                        ServerContentData(
+                                            modelTurn = ModelTurn(parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", goodB64)))),
+                                            outputTranscription = TranscriptionData(p0Text),
+                                            turnComplete = true
+                                        )
+                                    )
+                                )
+                            }
+                        }
+
+                        override suspend fun disconnect() {
+                            connected = false
+                        }
+                    }
+                }
+            }
+
+            val writtenChunks = mutableListOf<ByteArray>()
+            val recordingPlayer = object : PcmPlayer {
+                override val currentPositionMs: StateFlow<Long> = MutableStateFlow(0L).asStateFlow()
+                override val supportsFrameTracking: Boolean = true
+                override var totalFramesWritten: Long = 0L
+                override fun init(sampleRate: Int, channels: Int) {}
+                override fun play() {}
+                override fun pause() {}
+                override fun stop() {}
+                override fun flush() {}
+                override fun release() {}
+                override fun setPlaybackSpeed(speed: Float) {}
+                override fun setOriginalAudioVolume(volume: Float) {}
+                override fun playbackHeadPositionFrames(): Long = totalFramesWritten
+                override fun write(chunk: PcmChunk): Int {
+                    if (chunk.data.isNotEmpty()) {
+                        writtenChunks += chunk.data
+                        totalFramesWritten += (chunk.data.size / 2).toLong()
+                    }
+                    return chunk.data.size
+                }
+            }
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("live-verify-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { recordingPlayer }
+            }
+            runCurrent()
+
+            manager.startOrResume(
+                bookId = "book-live-verify",
+                bookTitle = "Live Verify",
+                paragraphs = listOf(
+                    ReaderParagraph(0, "p0", p0Text, "epubcfi(/6/2!/4/2/1:0)")
+                )
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals(2, sessionCreateCount)
+            assertEquals(1, writtenChunks.size)
+            assertTrue("Only complete verified Live audio must play (no partial chunk before retry)", writtenChunks[0].contentEquals(goodBytes))
+
+            val cached = TranslationDiskCache(tempDir).loadAudioSegment(
+                engineTag = "GEMINI_LIVE",
+                voiceId = "Charon",
+                style = null,
+                text = p0Text
+            )
+            assertNotNull(cached)
+            assertTrue("Cache must store only complete verified audio", cached!!.pcmBytes.contentEquals(goodBytes))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `playback honors persisted NarrationLineEntity speakers styles and narrator override without inline attribution`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-lines-playback").toFile()
+        try {
+            val bookDao = FakeBookDao().apply {
+                insertBook(
+                    BookEntity(
+                        id = "book-cast-lines",
+                        title = "Persisted Cast Lines",
+                        author = "Author",
+                        format = "EPUB",
+                        filePath = "",
+                        coverUri = null,
+                        addedDate = 100L,
+                        lastReadDate = 100L,
+                        isAudiobook = false
+                    )
+                )
+            }
+            val chapterDao = FakeChapterDao(
+                listOf(
+                    ChapterEntity("c0", "book-cast-lines", 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 120)
+                )
+            )
+            val narrationDao = FakeNarrationDao(chapterDao).apply {
+                insertLines(
+                    listOf(
+                        NarrationLineEntity(
+                            id = "l0",
+                            chapterId = "c0",
+                            paraIndex = 0,
+                            startOffset = 0,
+                            endOffset = 34,
+                            speakerId = "narrator",
+                            style = "calm",
+                            cfi = "epubcfi(/6/2!/4/2/1:0)"
+                        ),
+                        NarrationLineEntity(
+                            id = "l1",
+                            chapterId = "c0",
+                            paraIndex = 1,
+                            startOffset = 0,
+                            endOffset = 22,
+                            speakerId = "book-cast-lines_alice",
+                            style = "whispering",
+                            cfi = "epubcfi(/6/2!/4/2/2:0)"
+                        ),
+                        NarrationLineEntity(
+                            id = "l2",
+                            chapterId = "c0",
+                            paraIndex = 2,
+                            startOffset = 0,
+                            endOffset = 19,
+                            speakerId = "bob",
+                            style = null,
+                            cfi = "epubcfi(/6/2!/4/2/3:0)"
+                        )
+                    )
+                )
+            }
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.SYSTEM_TTS.name)
+                setDefaultNarratorVoiceId("Charon")
+            }
+            val capturingEngine = CapturingSystemEngine()
+            val manager = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                settingsRepository = settingsRepo,
+                applicationScope = backgroundScope,
+                narrationDao = narrationDao
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { RecordingPcmPlayer() }
+                systemTtsFactory = { capturingEngine }
+            }
+            runCurrent()
+
+            val characters = listOf(
+                CharacterEntity("book-cast-lines_narrator", "book-cast-lines", "Narrator", "", "neutral", "mature", "storytelling", "Sulafat"),
+                CharacterEntity("book-cast-lines_alice", "book-cast-lines", "Alice", "", "female", "young", "warm", "Zephyr"),
+                CharacterEntity("book-cast-lines_bob", "book-cast-lines", "Bob", "", "male", "adult", "gruff", "Fenrir")
+            )
+            val paragraphs = listOf(
+                ReaderParagraph(0, "p0", "The train arrived right on time.", "epubcfi(/6/2!/4/2/1:0)"),
+                ReaderParagraph(1, "p1", "Did you bring the key?", "epubcfi(/6/2!/4/2/2:0)"),
+                ReaderParagraph(2, "p2", "It is in my coat.", "epubcfi(/6/2!/4/2/3:0)")
+            )
+
+            manager.startOrResume(
+                bookId = "book-cast-lines",
+                bookTitle = "Persisted Cast Lines",
+                chapters = chapterDao.chapters,
+                currentChapterIndex = 0,
+                paragraphs = paragraphs,
+                characters = characters
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals(3, capturingEngine.requests.size)
+            assertEquals("Sulafat", capturingEngine.requests[0].voiceId)
+            assertEquals("calm", capturingEngine.requests[0].style)
+
+            assertEquals("Zephyr", capturingEngine.requests[1].voiceId)
+            assertEquals("whispering", capturingEngine.requests[1].style)
+
+            assertEquals("Fenrir", capturingEngine.requests[2].voiceId)
+            assertEquals("gruff", capturingEngine.requests[2].style)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `buildSpeechChunks heuristic fallback handles multi-script quotes dashes aliases and whole-word boundaries`() {
+        val manager = ReaderNarrationSessionManager(
+            bookDao = FakeBookDao(),
+            chapterDao = FakeChapterDao(),
+            applicationScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        )
+        val characters = listOf(
+            CharacterEntity("b_narr", "b1", "Narrator", "", "neutral", "mature", "steady", "Sulafat"),
+            CharacterEntity("b_al", "b1", "Al", "", "male", "young", "brisk", "Puck"),
+            CharacterEntity("b_elena", "b1", "Elena", "Lena, Captain Elena", "female", "adult", "poised", "Kore"),
+            CharacterEntity("b_taro", "b1", "太郎", "", "male", "young", "bright", "Orus")
+        )
+        val paragraphs = listOf(
+            ReaderParagraph(0, "p0", "\"Always keep moving forward,\" remarked the traveler.", "epubcfi(/6/2!/4/2/1:0)"),
+            ReaderParagraph(1, "p1", "«Quel beau matin !» murmura Lena.", "epubcfi(/6/2!/4/2/2:0)"),
+            ReaderParagraph(2, "p2", "— Look out! — shouted Al.", "epubcfi(/6/2!/4/2/3:0)"),
+            ReaderParagraph(3, "p3", "「おはようございます」と太郎が言った。", "epubcfi(/6/2!/4/2/4:0)")
+        )
+
+        val chunks = manager.buildSpeechChunks(
+            paragraphs = paragraphs,
+            characters = characters,
+            engine = NarrationEngine.SYSTEM_TTS,
+            defaultNarratorVoiceId = "Charon"
+        )
+
+        assertEquals(4, chunks.size)
+        assertEquals("Sulafat", chunks[0].voiceId)
+        assertEquals("Kore", chunks[1].voiceId)
+        assertEquals("Puck", chunks[2].voiceId)
+        assertEquals("Orus", chunks[3].voiceId)
     }
 }

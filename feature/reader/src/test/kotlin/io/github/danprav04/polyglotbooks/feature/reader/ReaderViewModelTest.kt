@@ -9,8 +9,11 @@ import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterDao
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
+import io.github.danprav04.polyglotbooks.core.data.db.NarrationDao
+import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateEntity
+import io.github.danprav04.polyglotbooks.core.data.db.TtsSegmentEntity
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -323,6 +326,58 @@ class FakeCharacterDao : CharacterDao {
 
     override suspend fun deleteCharactersByBookId(bookId: String) {
         characters.value = characters.value.filterNot { it.bookId == bookId }
+    }
+}
+
+class FakeNarrationDao(
+    private val chapterDao: FakeChapterDao? = null
+) : NarrationDao {
+    private val linesFlow = MutableStateFlow<List<NarrationLineEntity>>(emptyList())
+    private val ttsSegments = linkedMapOf<String, TtsSegmentEntity>()
+
+    override fun getLinesForChapter(chapterId: String): Flow<List<NarrationLineEntity>> =
+        linesFlow.map { list ->
+            list.filter { it.chapterId == chapterId }
+                .sortedWith(compareBy({ it.paraIndex }, { it.startOffset }))
+        }
+
+    override suspend fun getLinesForChapterOnce(chapterId: String): List<NarrationLineEntity> =
+        linesFlow.value
+            .filter { it.chapterId == chapterId }
+            .sortedWith(compareBy({ it.paraIndex }, { it.startOffset }))
+
+    override suspend fun insertLines(lines: List<NarrationLineEntity>) {
+        val incomingIds = lines.map { it.id }.toSet()
+        linesFlow.value = linesFlow.value.filterNot { it.id in incomingIds } + lines
+    }
+
+    override suspend fun deleteLinesForChapter(chapterId: String) {
+        linesFlow.value = linesFlow.value.filterNot { it.chapterId == chapterId }
+    }
+
+    override suspend fun reassignSpeakerForBook(bookId: String, oldSpeakerId: String, newSpeakerId: String) {
+        val bookChapterIds = chapterDao?.chapters
+            ?.filter { it.bookId == bookId }
+            ?.map { it.id }
+            ?.toSet()
+        linesFlow.value = linesFlow.value.map { line ->
+            val inBook = bookChapterIds == null || line.chapterId in bookChapterIds
+            if (inBook && line.speakerId == oldSpeakerId) {
+                line.copy(speakerId = newSpeakerId)
+            } else {
+                line
+            }
+        }
+    }
+
+    override suspend fun getTtsSegment(lineId: String): TtsSegmentEntity? = ttsSegments[lineId]
+
+    override suspend fun insertTtsSegment(segment: TtsSegmentEntity) {
+        ttsSegments[segment.lineId] = segment
+    }
+
+    override suspend fun deleteTtsSegment(segment: TtsSegmentEntity) {
+        ttsSegments.remove(segment.lineId)
     }
 }
 
@@ -1755,5 +1810,317 @@ class ReaderViewModelTest {
         } finally {
             tempDir.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `analyzeCastForCurrentChapter chunks full chapter beyond 35 paragraphs carries context and persists lines`() = runTest {
+        val bookId = "book-chunked"
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook(bookId, "Long Chapter Novel"))
+        }
+        val chapterDao = FakeChapterDao(
+            listOf(
+                ChapterEntity("${bookId}_chap_0", bookId, 0, "The Long Hall", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 2500)
+            )
+        )
+        val characterDao = FakeCharacterDao()
+        val narrationDao = FakeNarrationDao(chapterDao)
+        val keyStore = FakeSecureKeyStore("gemini-chunk-key")
+        val capturedPrompts = mutableListOf<String>()
+        val textClient = FakeTextModelClient { prompt ->
+            capturedPrompts.add(prompt)
+            if (prompt.contains("Look at this corridor")) {
+                """
+                {
+                  "characters": [
+                    {"id": "narrator", "name": "Narrator", "gender": "neutral", "age": "mature", "voiceTraits": "storytelling"},
+                    {"id": "alice", "name": "Alice", "aliases": ["Ally"], "gender": "female", "age": "young", "voiceTraits": "curious"}
+                  ],
+                  "lines": [
+                    {"para": 0, "start": 0, "end": 41, "speaker": "alice", "style": "excited"}
+                  ]
+                }
+                """.trimIndent()
+            } else {
+                """
+                {
+                  "characters": [
+                    {"id": "marcus", "name": "Marcus", "aliases": ["Captain Marcus"], "gender": "male", "age": "adult", "voiceTraits": "commanding"}
+                  ],
+                  "lines": [
+                    {"para": 5, "start": 0, "end": 12, "speaker": "marcus", "style": "firm"}
+                  ]
+                }
+                """.trimIndent()
+            }
+        }
+        val paragraphs = (0 until 45).map { idx ->
+            when (idx) {
+                0 -> "\"Look at this corridor!\" exclaimed Alice."
+                34 -> "Wait here, I'll check the door."
+                40 -> "Open it now."
+                else -> "Paragraph $idx described the vaulted stone hall."
+            }
+        }
+        val extracted = EbookContentExtractor.ExtractedBook(
+            format = "EPUB",
+            title = "Long Chapter Novel",
+            author = "Author",
+            pageCount = 1,
+            chapters = listOf(
+                EbookContentExtractor.ExtractedChapter(0, "The Long Hall", "ch0.xhtml", "", paragraphs)
+            )
+        )
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "")),
+            characterDao = characterDao,
+            narrationDao = narrationDao,
+            secureKeyStore = keyStore,
+            textModelClient = textClient
+        ).apply {
+            ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+            bookExtractor = { _, _ -> extracted }
+        }
+        viewModel.loadBookAndChapters(bookId)
+        advanceUntilIdle()
+
+        assertEquals("45 paragraphs must split into 2 casting batches", 2, capturedPrompts.size)
+        assertTrue(
+            "Batch 2 prompt must carry recent context from batch 1",
+            capturedPrompts[1].contains("Wait here, I'll check the door.")
+        )
+        assertTrue(
+            "Batch 2 prompt must include known cast and aliases from batch 1",
+            capturedPrompts[1].contains("Alice") && capturedPrompts[1].contains("Ally")
+        )
+
+        val cast = characterDao.getCharactersForBook(bookId).first()
+        val marcus = cast.firstOrNull { it.name == "Marcus" }
+        assertNotNull(marcus)
+        assertTrue(marcus!!.id.startsWith("${bookId}_"))
+        assertTrue(marcus.aliases.contains("Captain Marcus"))
+
+        val lines = narrationDao.getLinesForChapterOnce("${bookId}_chap_0")
+        val linePara0 = lines.firstOrNull { it.paraIndex == 0 }
+        val linePara40 = lines.firstOrNull { it.paraIndex == 40 }
+        assertNotNull(linePara0)
+        assertNotNull(linePara40)
+        assertEquals(cast.first { it.name == "Alice" }.id, linePara0!!.speakerId)
+        assertEquals(marcus.id, linePara40!!.speakerId)
+        assertEquals("firm", linePara40.style)
+    }
+
+    @Test
+    fun `auto pre-scan runs current chapter and lookahead skips cached chapters on reopen and force-reanalyzes on demand`() = runTest {
+        val bookId = "book-lookahead"
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook(bookId, "Two Chapter Book"))
+        }
+        val chapterDao = FakeChapterDao(
+            listOf(
+                ChapterEntity("${bookId}_chap_0", bookId, 0, "Chapter One", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+                ChapterEntity("${bookId}_chap_1", bookId, 1, "Chapter Two", 1000L, 2000L, "epubcfi(/6/4!/4/2/1:0)", 100)
+            )
+        )
+        val characterDao = FakeCharacterDao()
+        val narrationDao = FakeNarrationDao(chapterDao)
+        val keyStore = FakeSecureKeyStore("gemini-auto-key")
+        val scannedPrompts = mutableListOf<String>()
+        val textClient = FakeTextModelClient { prompt ->
+            scannedPrompts.add(prompt)
+            if (prompt.contains("[0] We meet at the tea shop.")) {
+                """
+                {
+                  "characters": [
+                    {"id": "narrator", "name": "Narrator", "gender": "neutral", "age": "mature", "voiceTraits": "warm"},
+                    {"id": "elizabeth", "name": "Elizabeth Bennet", "aliases": ["Lizzie"], "gender": "female", "age": "young", "voiceTraits": "witty"}
+                  ],
+                  "lines": [
+                    {"para": 0, "start": 0, "end": 24, "speaker": "elizabeth", "style": "playful"}
+                  ]
+                }
+                """.trimIndent()
+            } else {
+                """
+                {
+                  "characters": [
+                    {"id": "char_alias_match", "name": "Lizzie", "aliases": ["Miss Bennet"], "gender": "female", "age": "young", "voiceTraits": "lively"}
+                  ],
+                  "lines": [
+                    {"para": 0, "start": 0, "end": 25, "speaker": "char_alias_match", "style": "determined"}
+                  ]
+                }
+                """.trimIndent()
+            }
+        }
+        val extracted = EbookContentExtractor.ExtractedBook(
+            format = "EPUB",
+            title = "Two Chapter Book",
+            author = "Author",
+            pageCount = 2,
+            chapters = listOf(
+                EbookContentExtractor.ExtractedChapter(0, "Chapter One", "ch0.xhtml", "", listOf("We meet at the tea shop.")),
+                EbookContentExtractor.ExtractedChapter(1, "Chapter Two", "ch1.xhtml", "", listOf("Tomorrow we travel north."))
+            )
+        )
+
+        val vm1 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "")),
+            characterDao = characterDao,
+            narrationDao = narrationDao,
+            secureKeyStore = keyStore,
+            textModelClient = textClient
+        ).apply {
+            ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+            bookExtractor = { _, _ -> extracted }
+        }
+        vm1.loadBookAndChapters(bookId)
+        advanceUntilIdle()
+
+        assertEquals("Opening chapter 0 must auto-scan Ch 0 and lookahead Ch 1", 2, scannedPrompts.size)
+        assertTrue(
+            "Lookahead scan of Ch 1 must receive Ch 0 cast and alias 'Lizzie'",
+            scannedPrompts[1].contains("Elizabeth Bennet") && scannedPrompts[1].contains("Lizzie")
+        )
+
+        val castAfterOpen = characterDao.getCharactersForBook(bookId).first()
+        val elizabeth = castAfterOpen.first { it.name == "Elizabeth Bennet" }
+        assertTrue(elizabeth.aliases.contains("Miss Bennet"))
+        assertEquals(
+            "Reconciled alias speaker in Ch 1 must link to canonical Elizabeth character id",
+            elizabeth.id,
+            narrationDao.getLinesForChapterOnce("${bookId}_chap_1").first().speakerId
+        )
+
+        // Reopen with a brand-new ViewModel against persisted DB: auto-scan must skip already-scanned chapters
+        scannedPrompts.clear()
+        val vm2 = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to "")),
+            characterDao = characterDao,
+            narrationDao = narrationDao,
+            secureKeyStore = keyStore,
+            textModelClient = textClient
+        ).apply {
+            ioDispatcher = UnconfinedTestDispatcher(testScheduler)
+            bookExtractor = { _, _ -> extracted }
+        }
+        vm2.loadBookAndChapters(bookId)
+        advanceUntilIdle()
+        assertEquals("Previously scanned chapters must not call AI again on reopen", 0, scannedPrompts.size)
+
+        // Explicit Re-analyze button must force a fresh AI scan of the current chapter
+        vm2.reanalyzeCastForCurrentChapter()
+        advanceUntilIdle()
+        assertEquals("Manual re-analyze must force a fresh scan of Ch 0", 1, scannedPrompts.size)
+    }
+
+    @Test
+    fun `cast editor CRUD adds updates merges aliases and deletes characters with scoped line reassignment`() = runTest {
+        val bookId = "book-crud"
+        val otherBookId = "book-other"
+        val bookDao = FakeBookDao().apply {
+            insertBook(createTestBook(otherBookId, "Other Book"))
+            insertBook(createTestBook(bookId, "CRUD Novel"))
+        }
+        val chapterDao = FakeChapterDao(
+            listOf(
+                ChapterEntity("${bookId}_chap_0", bookId, 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100),
+                ChapterEntity("${otherBookId}_chap_0", otherBookId, 0, "Other Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 100)
+            )
+        )
+        val narrator = CharacterEntity("${bookId}_narrator", bookId, "Narrator", "", "neutral", "mature", "calm", "Charon")
+        val lizzie = CharacterEntity("${bookId}_lizzie", bookId, "Lizzie", "Elizabeth", "unknown", "unknown", "", "Puck")
+        val elizabeth = CharacterEntity("${bookId}_elizabeth", bookId, "Elizabeth Bennet", "Miss Bennet", "female", "young", "witty", "Zephyr")
+        val marcus = CharacterEntity("${bookId}_marcus", bookId, "Marcus", "", "male", "adult", "gruff", "Fenrir")
+        val characterDao = FakeCharacterDao().apply {
+            insertCharacters(listOf(narrator, lizzie, elizabeth, marcus))
+        }
+        val narrationDao = FakeNarrationDao(chapterDao).apply {
+            insertLines(
+                listOf(
+                    NarrationLineEntity("l1", "${bookId}_chap_0", 0, 0, 10, "${bookId}_lizzie", null, null),
+                    NarrationLineEntity("l2", "${bookId}_chap_0", 1, 0, 10, "lizzie", null, null),
+                    NarrationLineEntity("l3", "${bookId}_chap_0", 2, 0, 10, "${bookId}_marcus", null, null),
+                    NarrationLineEntity("l_other", "${otherBookId}_chap_0", 0, 0, 10, "${bookId}_lizzie", null, null)
+                )
+            )
+        }
+
+        val viewModel = ReaderViewModel(
+            bookDao = bookDao,
+            chapterDao = chapterDao,
+            savedStateHandle = SavedStateHandle(mapOf("bookId" to bookId)),
+            characterDao = characterDao,
+            narrationDao = narrationDao
+        )
+        advanceUntilIdle()
+
+        // 1. Add character
+        viewModel.addCharacter(
+            name = "Darcy",
+            aliases = "Mr. Darcy, Fitzwilliam",
+            gender = "male",
+            age = "adult",
+            voiceTraits = "reserved",
+            assignedVoiceId = null
+        )
+        advanceUntilIdle()
+        val darcy = viewModel.uiState.value.characters.firstOrNull { it.name == "Darcy" }
+        assertNotNull(darcy)
+        assertTrue(darcy!!.aliases.contains("Mr. Darcy"))
+        assertFalse(darcy.assignedVoiceId.isNullOrBlank())
+
+        // 2. Update character details
+        viewModel.updateCharacterDetails(
+            character = darcy,
+            name = "Fitzwilliam Darcy",
+            aliases = "Darcy, Mr. Darcy",
+            gender = "male",
+            age = "adult",
+            voiceTraits = "composed, proud",
+            assignedVoiceId = "Alnilam"
+        )
+        advanceUntilIdle()
+        val updatedDarcy = characterDao.getCharacterById(darcy.id)
+        assertEquals("Fitzwilliam Darcy", updatedDarcy?.name)
+        assertEquals("Alnilam", updatedDarcy?.assignedVoiceId)
+        assertEquals("composed, proud", updatedDarcy?.voiceTraits)
+
+        // 3. Merge Lizzie -> Elizabeth Bennet (unions aliases + reassigns lines within this book only)
+        viewModel.mergeCharacters(source = lizzie, target = elizabeth)
+        advanceUntilIdle()
+        assertNull(characterDao.getCharacterById(lizzie.id))
+        val mergedElizabeth = characterDao.getCharacterById(elizabeth.id)
+        assertNotNull(mergedElizabeth)
+        assertTrue(mergedElizabeth!!.aliases.contains("Miss Bennet"))
+        assertTrue(mergedElizabeth.aliases.contains("Lizzie"))
+        assertTrue(mergedElizabeth.aliases.contains("Elizabeth"))
+
+        val bookLinesAfterMerge = narrationDao.getLinesForChapterOnce("${bookId}_chap_0")
+        assertEquals(elizabeth.id, bookLinesAfterMerge.first { it.id == "l1" }.speakerId)
+        assertEquals(elizabeth.id, bookLinesAfterMerge.first { it.id == "l2" }.speakerId)
+        assertEquals(
+            "Lines in other books must never be mutated by merge",
+            "${bookId}_lizzie",
+            narrationDao.getLinesForChapterOnce("${otherBookId}_chap_0").first().speakerId
+        )
+
+        // 4. Deleting Narrator must be ignored; deleting Marcus reassigns his lines to Narrator
+        viewModel.deleteCharacter(narrator)
+        viewModel.deleteCharacter(marcus)
+        advanceUntilIdle()
+        assertNotNull("Narrator cannot be deleted", characterDao.getCharacterById(narrator.id))
+        assertNull(characterDao.getCharacterById(marcus.id))
+        assertEquals(
+            "narrator",
+            narrationDao.getLinesForChapterOnce("${bookId}_chap_0").first { it.id == "l3" }.speakerId
+        )
     }
 }

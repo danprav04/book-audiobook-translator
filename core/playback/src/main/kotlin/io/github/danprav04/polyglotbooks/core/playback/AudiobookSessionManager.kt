@@ -23,6 +23,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.model.Chapter
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.CoroutineScope
@@ -56,6 +57,7 @@ data class AudiobookServiceState(
     val bookId: String = "",
     val bookTitle: String = "",
     val author: String = "",
+    val bookFormat: String = "",
     val coverUri: String? = null,
     val chapters: List<Chapter> = emptyList(),
     val currentChapterIndex: Int = 0,
@@ -426,11 +428,18 @@ class AudiobookSessionManager @Inject constructor(
         override fun onPlayerError(error: PlaybackException) {
             if (isBookHandoffInProgress) return
             stopPeriodicCheckpointing()
+            val errorText = error.message ?: "Playback error: ${error.errorCodeName}"
+            DiagnosticLogBuffer.record(
+                tag = "AudiobookSession",
+                message = "ExoPlayer error (${error.errorCodeName}): $errorText",
+                level = "ERROR",
+                throwable = error
+            )
             _state.update {
                 it.copy(
                     isPlaying = false,
                     isLoading = false,
-                    errorMessage = error.message ?: "Playback error: ${error.errorCodeName}"
+                    errorMessage = errorText
                 )
             }
             if (liveTranslationBackend.state.value.isRunning) {
@@ -459,8 +468,19 @@ class AudiobookSessionManager @Inject constructor(
 
     private fun observeBackendState() {
         applicationScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            var lastLoggedBackendError: String? = null
             liveTranslationBackend.state.collect { backendState ->
                 val backendErr = backendState.errorMessage
+                if (backendErr != null && backendErr != lastLoggedBackendError) {
+                    lastLoggedBackendError = backendErr
+                    DiagnosticLogBuffer.record(
+                        tag = "AudiobookSession",
+                        message = "Live translation backend error: $backendErr",
+                        level = "WARN"
+                    )
+                } else if (backendErr == null) {
+                    lastLoggedBackendError = null
+                }
                 var shouldPauseForBackendError = false
                 _state.update { prev ->
                     val nextError = when {
@@ -793,6 +813,12 @@ class AudiobookSessionManager @Inject constructor(
             val book = try {
                 bookDao?.getBookById(bookId)
             } catch (e: Throwable) {
+                DiagnosticLogBuffer.record(
+                    tag = "AudiobookSession",
+                    message = "Failed querying book id=$bookId",
+                    level = "ERROR",
+                    throwable = e
+                )
                 null
             }
 
@@ -802,6 +828,11 @@ class AudiobookSessionManager @Inject constructor(
                 } else {
                     isBookHandoffInProgress = false
                 }
+                DiagnosticLogBuffer.record(
+                    tag = "AudiobookSession",
+                    message = "Book not found id=$bookId",
+                    level = "WARN"
+                )
                 _state.update {
                     it.copy(
                         bookId = bookId,
@@ -924,6 +955,7 @@ class AudiobookSessionManager @Inject constructor(
                     bookId = bookId,
                     bookTitle = book?.title ?: it.bookTitle,
                     author = book?.author ?: it.author,
+                    bookFormat = book?.format.orEmpty(),
                     coverUri = coverPath,
                     chapters = mappedChapters,
                     currentChapterIndex = restoredChapterIndex,
@@ -1018,14 +1050,26 @@ class AudiobookSessionManager @Inject constructor(
                     }
                     isBookHandoffInProgress = false
                     p.prepare()
-                } catch (_: Throwable) {
+                } catch (t: Throwable) {
                     isBookHandoffInProgress = false
+                    DiagnosticLogBuffer.record(
+                        tag = "AudiobookSession",
+                        message = "ExoPlayer prepare failed (format=${s.bookFormat.ifBlank { "unknown" }})",
+                        level = "ERROR",
+                        throwable = t
+                    )
                     try {
                         if (targetPos > 0L) {
                             p.seekTo(targetPos)
                         }
                         p.prepare()
-                    } catch (_: Throwable) {
+                    } catch (fallbackErr: Throwable) {
+                        DiagnosticLogBuffer.record(
+                            tag = "AudiobookSession",
+                            message = "ExoPlayer fallback prepare failed",
+                            level = "ERROR",
+                            throwable = fallbackErr
+                        )
                     }
                 }
             } else {
@@ -1109,6 +1153,11 @@ class AudiobookSessionManager @Inject constructor(
     }
 
     private fun failPlayForMissingApiKey() {
+        DiagnosticLogBuffer.record(
+            tag = "AudiobookSession",
+            message = "Live translation playback blocked: missing Gemini API key",
+            level = "WARN"
+        )
         lastBackendErrorMessage = NoOpLiveTranslationBackend.MISSING_API_KEY_MESSAGE
         stopPeriodicCheckpointing()
         _state.update {

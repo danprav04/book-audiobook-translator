@@ -124,6 +124,41 @@ class EbookContentExtractorTest {
         }
     }
 
+    @Test
+    fun `extractParagraphsFromHtml extracts leaf div blocks while skipping wrapper and image divs`() {
+        val html = """
+            <html><body>
+              <div class="chapter">
+                <h2>Chapter Title</h2>
+                <div class="cover"><img src="cover.jpg" alt="Cover"/></div>
+                <div class="spacer"/>
+                <div class="para">First div paragraph with <em>inline</em> text.</div>
+                <div class="dialogue">"......?"</div>
+                <div class="wrapper">
+                  <div class="inner">Nested leaf div text.</div>
+                  <p>Followed by normal paragraph.</p>
+                </div>
+                <p>Unclosed paragraph before div
+                <div class="tail">Trailing leaf div text.</div>
+              </div>
+            </body></html>
+        """.trimIndent()
+
+        val extracted = EbookContentExtractor.extractParagraphsFromHtml(html)
+        assertEquals(
+            listOf(
+                "Chapter Title",
+                "First div paragraph with inline text.",
+                "\"......?\"",
+                "Nested leaf div text.",
+                "Followed by normal paragraph.",
+                "Unclosed paragraph before div",
+                "Trailing leaf div text."
+            ),
+            extracted
+        )
+    }
+
     private fun buildMinimalEpub(spineFiles: List<Pair<String, String>>): ByteArray {
         val bos = ByteArrayOutputStream()
         ZipOutputStream(bos).use { zos ->

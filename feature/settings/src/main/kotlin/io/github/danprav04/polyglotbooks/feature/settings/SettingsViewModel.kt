@@ -14,6 +14,7 @@ import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.ModelItem
 import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
@@ -185,8 +186,13 @@ class SettingsViewModel @Inject constructor(
                     val response = modelCatalogService.listModels(key)
                     _availableModels.value = response.models
                     quotaTracker?.registerCatalogModels(response.models)
-                } catch (_: Exception) {
-                    // Ignore background catalog load failure on init
+                } catch (e: Exception) {
+                    DiagnosticLogBuffer.record(
+                        tag = "SettingsVM",
+                        message = "Background model catalog preload failed",
+                        level = "WARN",
+                        throwable = e
+                    )
                 }
             }
         }
@@ -211,8 +217,19 @@ class SettingsViewModel @Inject constructor(
             try {
                 secureKeyStore.saveApiKey(key)
                 settingsRepository.saveApiKey(key)
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "Saved Gemini API key (length=${key.length})",
+                    level = "INFO"
+                )
                 _userMessage.value = "Gemini API key saved securely"
             } catch (e: Exception) {
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "Failed to save Gemini API key",
+                    level = "ERROR",
+                    throwable = e
+                )
                 _userMessage.value = "Failed to save key: ${e.message}"
             }
         }
@@ -225,8 +242,19 @@ class SettingsViewModel @Inject constructor(
                 settingsRepository.clearApiKey()
                 _apiKeyInput.value = ""
                 _testKeyStatus.value = TestKeyStatus.Idle
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "Deleted Gemini API key",
+                    level = "INFO"
+                )
                 _userMessage.value = "Gemini API key deleted"
             } catch (e: Exception) {
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "Failed to delete Gemini API key",
+                    level = "ERROR",
+                    throwable = e
+                )
                 _userMessage.value = "Failed to delete key: ${e.message}"
             }
         }
@@ -235,6 +263,11 @@ class SettingsViewModel @Inject constructor(
     fun testApiKey() {
         val keyToTest = _apiKeyInput.value.trim()
         if (keyToTest.isBlank()) {
+            DiagnosticLogBuffer.record(
+                tag = "SettingsVM",
+                message = "API key test aborted: empty input",
+                level = "WARN"
+            )
             _testKeyStatus.value = TestKeyStatus.Error("Please enter an API key first")
             return
         }
@@ -245,12 +278,23 @@ class SettingsViewModel @Inject constructor(
                 val response = modelCatalogService.listModels(keyToTest)
                 _availableModels.value = response.models
                 quotaTracker?.registerCatalogModels(response.models)
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "API key verified (${response.models.size} models cataloged)",
+                    level = "INFO"
+                )
                 _testKeyStatus.value = TestKeyStatus.Success(
                     message = "Key verified successfully!",
                     modelCount = response.models.size
                 )
             } catch (e: Exception) {
                 val errorMsg = e.message ?: "Failed to verify key with Gemini API"
+                DiagnosticLogBuffer.record(
+                    tag = "SettingsVM",
+                    message = "API key verification failed: $errorMsg",
+                    level = "ERROR",
+                    throwable = e
+                )
                 _testKeyStatus.value = TestKeyStatus.Error(errorMsg)
             }
         }
@@ -356,6 +400,11 @@ class SettingsViewModel @Inject constructor(
             settingsRepository.setModel(ModelRole.TEXT_ANALYSIS, bestAnalysis)
             settingsRepository.setModel(ModelRole.LIVE_NARRATION, bestLiveNarration)
             settingsRepository.setModel(ModelRole.LIVE_TRANSLATE, bestLiveTranslate)
+            DiagnosticLogBuffer.record(
+                tag = "SettingsVM",
+                message = "Applied free-tier preset: text=$bestText analysis=$bestAnalysis liveNarration=$bestLiveNarration liveTranslate=$bestLiveTranslate",
+                level = "INFO"
+            )
             _userMessage.value = "Applied free-tier multi-model preset"
         }
     }

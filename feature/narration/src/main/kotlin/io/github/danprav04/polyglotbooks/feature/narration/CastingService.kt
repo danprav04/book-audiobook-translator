@@ -17,8 +17,8 @@ data class RawCastingResponse(
 
 @Serializable
 data class RawCharacter(
-    val id: String,
-    val name: String,
+    val id: String = "",
+    val name: String = "",
     val aliases: List<String> = emptyList(),
     val gender: String = "unknown",
     val age: String = "unknown",
@@ -97,6 +97,75 @@ class CastingService {
         """.trimIndent()
     }
 
+    /**
+     * Builds a context-aware casting prompt for a bounded slice of chapter paragraphs,
+     * cross-referencing previously detected book characters & aliases and preceding paragraphs
+     * so implied/conversational speakers beyond explicit "Name: Sentence" lines are resolved.
+     */
+    fun buildCastingPrompt(
+        paragraphs: List<String>,
+        existingCharacters: List<Character> = emptyList(),
+        previousContextParagraphs: List<String> = emptyList(),
+        chapterTitle: String? = null
+    ): String = buildString {
+        append("Analyze the book chapter text below to identify every speaking character, ")
+        append("reconcile them with the existing book cast, and attribute character-offset spans for every paragraph.\n")
+        if (!chapterTitle.isNullOrBlank()) {
+            append("Chapter title: ").append(chapterTitle.trim()).append('\n')
+        }
+        append(
+            """
+            Attribution rules:
+            1. Always reuse the exact character 'id' from Known Cast when a known character speaks (including via nicknames, titles, honorifics, or aliases). Record any newly discovered names/nicknames in 'aliases'.
+            2. Detect speakers beyond explicit "Name: Sentence" script format: infer speakers from quotation marks ("...", “...”, ‘...’, «...», 「...」, 『...』), dialogue dashes (— / –), surrounding narrative beats ("Alice froze. \"Enough!\""), pronoun/action cues ("he whispered", "she countered"), vocatives, and back-and-forth conversational alternation across paragraphs.
+            3. Use 'speaker': "narrator" for third-person prose, descriptions, and dialogue tags/reporting verbs (e.g. "said Elizabeth", "he muttered"). Use the character's 'id' for their spoken dialogue spans (or their inner/direct monologue if distinct), with an optional concise delivery 'style' (e.g. "whispering", "tense", "warm").
+            4. Emit exact [start, end) character offsets within each target paragraph 0..${paragraphs.lastIndex}. Leave 'lines' only for target paragraphs, NOT for the read-only context paragraphs.
+            """.trimIndent()
+        )
+        append("\n\n")
+
+        val nonNarratorCast = existingCharacters.filterNot { isNarratorDescriptor(it.id, it.name) }
+        val existingNarrator = existingCharacters.firstOrNull { isNarratorDescriptor(it.id, it.name) }
+        append("Known Cast:\n")
+        if (existingNarrator != null) {
+            append("- id=\"narrator\" (name=\"Narrator\")\n")
+        }
+        if (nonNarratorCast.isEmpty()) {
+            append("(No characters detected earlier in the book yet.)\n\n")
+        } else {
+            nonNarratorCast.forEach { c ->
+                append("- id=\"${c.id}\", name=\"${c.name}\"")
+                if (c.aliases.isNotEmpty()) {
+                    append(", aliases=${c.aliases.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }}")
+                }
+                if (c.gender.isNotBlank() && !c.gender.equals("unknown", ignoreCase = true)) {
+                    append(", gender=\"${c.gender}\"")
+                }
+                if (c.age.isNotBlank() && !c.age.equals("unknown", ignoreCase = true)) {
+                    append(", age=\"${c.age}\"")
+                }
+                if (c.voiceTraits.isNotBlank()) {
+                    append(", voiceTraits=\"${c.voiceTraits}\"")
+                }
+                append('\n')
+            }
+            append('\n')
+        }
+
+        if (previousContextParagraphs.isNotEmpty()) {
+            append("Preceding context paragraphs (read-only continuity — DO NOT emit 'lines' for these):\n")
+            previousContextParagraphs.forEachIndexed { i, text ->
+                append("[ctx-${previousContextParagraphs.size - i}] ").append(text).append('\n')
+            }
+            append('\n')
+        }
+
+        append("Target paragraphs (emit characters and complete 'lines' with 0-based para indices 0..${paragraphs.lastIndex}):\n")
+        paragraphs.forEachIndexed { idx, text ->
+            append("[$idx] ").append(text).append('\n')
+        }
+    }
+
     fun parseAndValidateCasting(
         jsonResponse: String,
         paragraphs: List<String>,
@@ -104,19 +173,13 @@ class CastingService {
         bookId: String = "book-1",
         chapterId: String = "chap-1"
     ): CastingResult {
-        val result = validateAndNormalize(
+        return validateAndNormalizeInternal(
             rawJson = jsonResponse,
             paragraphTexts = paragraphs,
+            existingCharacters = existingCharacters,
             bookId = bookId,
             chapterId = chapterId
         )
-        if (existingCharacters.isEmpty()) return result
-        val existingByName = existingCharacters.associateBy { it.name.lowercase() }
-        val mergedChars = result.characters.map { c ->
-            val existing = existingByName[c.name.lowercase()]
-            if (existing != null) c.copy(assignedVoiceId = existing.assignedVoiceId) else c
-        }
-        return result.copy(characters = mergedChars)
     }
 
     /**
@@ -134,23 +197,177 @@ class CastingService {
         bookId: String = "book-default",
         chapterId: String = "chap-default"
     ): CastingResult {
-        val parsed = try {
-            json.decodeFromString<RawCastingResponse>(rawJson)
-        } catch (_: Exception) {
-            return createFullNarratorFallback(paragraphTexts, bookId, chapterId)
+        return validateAndNormalizeInternal(
+            rawJson = rawJson,
+            paragraphTexts = paragraphTexts,
+            existingCharacters = emptyList(),
+            bookId = bookId,
+            chapterId = chapterId
+        )
+    }
+
+    private fun validateAndNormalizeInternal(
+        rawJson: String,
+        paragraphTexts: List<String>,
+        existingCharacters: List<Character>,
+        bookId: String,
+        chapterId: String
+    ): CastingResult {
+        val cleaned = stripCodeFences(rawJson)
+        val parsed = tryDecodeResponse(cleaned)
+            ?: return createFullNarratorFallback(paragraphTexts, bookId, chapterId)
+
+        val existingById = existingCharacters.associateBy { it.id.trim().lowercase() }
+        val existingNarrator = existingCharacters.firstOrNull { isNarratorDescriptor(it.id, it.name) }
+
+        val rawIdToCanonicalId = mutableMapOf<String, String>()
+        val termToCanonicalId = mutableMapOf<String, String>()
+        val usedIds = mutableSetOf<String>()
+        val mergedCharacters = linkedMapOf<String, Character>()
+
+        existingCharacters.forEach { existing ->
+            val canonId = existing.id.trim()
+            if (canonId.isNotEmpty()) {
+                usedIds.add(canonId.lowercase())
+                if (isNarratorDescriptor(canonId, existing.name)) {
+                    rawIdToCanonicalId[canonId.lowercase()] = "narrator"
+                } else {
+                    rawIdToCanonicalId[canonId.lowercase()] = canonId
+                    val normName = normalizeTerm(existing.name)
+                    if (normName.isNotEmpty()) {
+                        termToCanonicalId.putIfAbsent(normName, canonId)
+                    }
+                    existing.aliases.forEach { alias ->
+                        val normAlias = normalizeTerm(alias)
+                        if (normAlias.isNotEmpty()) {
+                            termToCanonicalId.putIfAbsent(normAlias, canonId)
+                        }
+                    }
+                }
+            }
         }
 
-        val characterMap = parsed.characters.associateBy { it.id }
-        val finalCharacters = parsed.characters.map { raw ->
-            Character(
-                id = raw.id,
-                bookId = bookId,
-                name = raw.name,
-                aliases = raw.aliases,
-                gender = raw.gender,
-                age = raw.age,
-                voiceTraits = raw.voiceTraits
-            )
+        parsed.characters.forEachIndexed { idx, raw ->
+            val rawIdTrimmed = raw.id.trim()
+            val rawNameTrimmed = raw.name.trim()
+            if (rawIdTrimmed.isEmpty() && rawNameTrimmed.isEmpty()) return@forEachIndexed
+
+            if (isNarratorDescriptor(rawIdTrimmed, rawNameTrimmed)) {
+                val canonId = existingNarrator?.id ?: rawIdTrimmed.ifBlank { "narrator" }
+                if (rawIdTrimmed.isNotEmpty()) {
+                    rawIdToCanonicalId[rawIdTrimmed.lowercase()] = "narrator"
+                }
+                mergedCharacters[canonId] = Character(
+                    id = canonId,
+                    bookId = bookId,
+                    name = existingNarrator?.name ?: rawNameTrimmed.ifBlank { "Narrator" },
+                    aliases = mergeAliases(
+                        baseName = existingNarrator?.name ?: "Narrator",
+                        first = existingNarrator?.aliases.orEmpty(),
+                        second = raw.aliases
+                    ),
+                    gender = pickNonUnknown(existingNarrator?.gender, raw.gender),
+                    age = pickNonUnknown(existingNarrator?.age, raw.age),
+                    voiceTraits = existingNarrator?.voiceTraits?.takeIf { it.isNotBlank() } ?: raw.voiceTraits.trim(),
+                    assignedVoiceId = existingNarrator?.assignedVoiceId
+                )
+                return@forEachIndexed
+            }
+
+            val candidateTerms = (listOf(rawNameTrimmed) + raw.aliases)
+                .map(::normalizeTerm)
+                .filter { it.isNotEmpty() }
+                .distinct()
+
+            val matchedExisting = existingById[rawIdTrimmed.lowercase()]?.takeUnless { isNarratorDescriptor(it.id, it.name) }
+                ?: candidateTerms.firstNotNullOfOrNull { term ->
+                    termToCanonicalId[term]?.let { cid ->
+                        mergedCharacters[cid] ?: existingCharacters.firstOrNull { it.id == cid }
+                    }
+                }
+
+            val canonicalCharacter = if (matchedExisting != null) {
+                val cid = matchedExisting.id
+                val extraAlias = if (
+                    rawNameTrimmed.isNotEmpty() &&
+                    !rawNameTrimmed.equals(matchedExisting.name, ignoreCase = true)
+                ) {
+                    listOf(rawNameTrimmed)
+                } else {
+                    emptyList()
+                }
+                val updated = matchedExisting.copy(
+                    bookId = bookId,
+                    aliases = mergeAliases(
+                        baseName = matchedExisting.name,
+                        first = matchedExisting.aliases,
+                        second = extraAlias + raw.aliases
+                    ),
+                    gender = pickNonUnknown(matchedExisting.gender, raw.gender),
+                    age = pickNonUnknown(matchedExisting.age, raw.age),
+                    voiceTraits = matchedExisting.voiceTraits.takeIf { it.isNotBlank() } ?: raw.voiceTraits.trim(),
+                    assignedVoiceId = matchedExisting.assignedVoiceId
+                )
+                mergedCharacters[cid] = updated
+                usedIds.add(cid.lowercase())
+                cid to updated
+            } else {
+                val preferredBase = rawIdTrimmed.ifBlank {
+                    slugifyId(rawNameTrimmed.ifBlank { "char_${idx + 1}" })
+                }
+                val cid = ensureUniqueId(preferredBase, usedIds)
+                usedIds.add(cid.lowercase())
+                val resolvedName = rawNameTrimmed.ifBlank { cid }
+                val created = Character(
+                    id = cid,
+                    bookId = bookId,
+                    name = resolvedName,
+                    aliases = cleanAliases(raw.aliases, resolvedName),
+                    gender = raw.gender.trim().ifBlank { "unknown" },
+                    age = raw.age.trim().ifBlank { "unknown" },
+                    voiceTraits = raw.voiceTraits.trim(),
+                    assignedVoiceId = null
+                )
+                mergedCharacters[cid] = created
+                cid to created
+            }
+
+            val (canonId, canonChar) = canonicalCharacter
+            if (rawIdTrimmed.isNotEmpty()) {
+                rawIdToCanonicalId[rawIdTrimmed.lowercase()] = canonId
+            }
+            rawIdToCanonicalId[canonId.lowercase()] = canonId
+            val normCanonName = normalizeTerm(canonChar.name)
+            if (normCanonName.isNotEmpty()) {
+                termToCanonicalId[normCanonName] = canonId
+            }
+            canonChar.aliases.forEach { alias ->
+                val normAlias = normalizeTerm(alias)
+                if (normAlias.isNotEmpty()) {
+                    termToCanonicalId.putIfAbsent(normAlias, canonId)
+                }
+            }
+            candidateTerms.forEach { term ->
+                termToCanonicalId.putIfAbsent(term, canonId)
+            }
+        }
+
+        fun resolveSpeaker(rawSpeaker: String): String {
+            val trimmed = rawSpeaker.trim()
+            if (trimmed.isEmpty() || trimmed.equals("narrator", ignoreCase = true)) {
+                return "narrator"
+            }
+            rawIdToCanonicalId[trimmed.lowercase()]?.let { return it }
+            val norm = normalizeTerm(trimmed)
+            termToCanonicalId[norm]?.let { mappedId ->
+                if (!mergedCharacters.containsKey(mappedId)) {
+                    existingCharacters.firstOrNull { it.id == mappedId }?.let { existing ->
+                        mergedCharacters[mappedId] = existing.copy(bookId = bookId)
+                    }
+                }
+                return mappedId
+            }
+            return "narrator"
         }
 
         val normalizedLines = mutableListOf<NarrationLine>()
@@ -182,11 +399,7 @@ class CastingService {
                 }
                 val adjustedStart = maxOf(span.start, currentPos)
                 if (adjustedStart < span.end) {
-                    val resolvedSpeaker = if (span.speaker == "narrator" || characterMap.containsKey(span.speaker)) {
-                        span.speaker
-                    } else {
-                        "narrator"
-                    }
+                    val resolvedSpeaker = resolveSpeaker(span.speaker)
                     nonOverlappingSpans.add(
                         span.copy(
                             start = adjustedStart,
@@ -222,7 +435,7 @@ class CastingService {
                         startOffset = span.start,
                         endOffset = span.end,
                         speakerId = span.speaker,
-                        style = span.style
+                        style = span.style?.trim()?.ifBlank { null }
                     )
                 )
                 cursor = span.end
@@ -244,9 +457,81 @@ class CastingService {
         }
 
         return CastingResult(
-            characters = finalCharacters,
+            characters = mergedCharacters.values.toList(),
             lines = normalizedLines
         )
+    }
+
+    private fun tryDecodeResponse(cleanedJson: String): RawCastingResponse? {
+        if (cleanedJson.isBlank()) return null
+        try {
+            return json.decodeFromString<RawCastingResponse>(cleanedJson)
+        } catch (_: Exception) {
+        }
+        val firstBrace = cleanedJson.indexOf('{')
+        val lastBrace = cleanedJson.lastIndexOf('}')
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+            val sliced = cleanedJson.substring(firstBrace, lastBrace + 1)
+            try {
+                return json.decodeFromString<RawCastingResponse>(sliced)
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun stripCodeFences(raw: String): String {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("```")) return trimmed
+        val lines = trimmed.lines()
+        val dropFirst = if (lines.firstOrNull()?.trimStart()?.startsWith("```") == true) lines.drop(1) else lines
+        val dropLast = if (dropFirst.lastOrNull()?.trim()?.startsWith("```") == true) dropFirst.dropLast(1) else dropFirst
+        return dropLast.joinToString("\n").trim()
+    }
+
+    private fun isNarratorDescriptor(id: String, name: String): Boolean {
+        val cleanId = id.trim()
+        val cleanName = name.trim()
+        return cleanId.equals("narrator", ignoreCase = true) ||
+            cleanId.endsWith("_narrator", ignoreCase = true) ||
+            cleanName.equals("Narrator", ignoreCase = true)
+    }
+
+    private fun normalizeTerm(raw: String): String =
+        raw.trim().lowercase().replace(Regex("\\s+"), " ")
+
+    private fun slugifyId(name: String): String {
+        val slug = name.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        return slug.ifBlank { "char" }
+    }
+
+    private fun ensureUniqueId(base: String, usedLowerIds: Set<String>): String {
+        if (base.lowercase() !in usedLowerIds) return base
+        var suffix = 2
+        while ("${base}_$suffix".lowercase() in usedLowerIds) {
+            suffix++
+        }
+        return "${base}_$suffix"
+    }
+
+    private fun cleanAliases(aliases: List<String>, canonicalName: String): List<String> =
+        aliases
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals(canonicalName, ignoreCase = true) }
+            .distinctBy { it.lowercase() }
+
+    private fun mergeAliases(
+        baseName: String,
+        first: List<String>,
+        second: List<String>
+    ): List<String> = cleanAliases(first + second, baseName)
+
+    private fun pickNonUnknown(primary: String?, secondary: String?): String {
+        val first = primary?.trim().orEmpty()
+        if (first.isNotEmpty() && !first.equals("unknown", ignoreCase = true)) return first
+        val second = secondary?.trim().orEmpty()
+        if (second.isNotEmpty() && !second.equals("unknown", ignoreCase = true)) return second
+        return first.ifEmpty { second.ifEmpty { "unknown" } }
     }
 
     private fun createFullNarratorFallback(
@@ -267,5 +552,12 @@ class CastingService {
             )
         }
         return CastingResult(characters = emptyList(), lines = lines)
+    }
+
+    companion object {
+        const val CASTING_SYSTEM_INSTRUCTION: String =
+            "You are a literary dialogue and character attribution assistant for multi-voice audiobooks. " +
+                "Reuse known character IDs, detect implied speakers and conversational alternation beyond explicit 'Name: Sentence' lines, " +
+                "and output strictly valid JSON matching the schema."
     }
 }

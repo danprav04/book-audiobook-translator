@@ -5,8 +5,10 @@ import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.QuotaExhaustedException
 import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.flow
@@ -45,16 +47,19 @@ class GeminiTtsEngine(
 
         val apiKey = apiKeyProvider?.invoke()?.trim()
         if (apiKey.isNullOrBlank()) {
+            DiagnosticLogBuffer.record("GeminiTtsEngine", "Missing API key for Flash TTS", level = "ERROR")
             throw IllegalStateException("Missing API key")
         }
 
-        if (request.text.isBlank()) {
-            return@flow
-        }
-        if (request.text.none { it.isLetterOrDigit() }) {
-            // Punctuation-only dividers (e.g. "* * *", "---") should pause briefly rather than being sent to TTS.
-            emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
-            return@flow
+        val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+        when (resolved.kind) {
+            PunctuationDialogueHelper.PunctuationKind.EMPTY -> return@flow
+            PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER -> {
+                // Structural scene dividers (e.g. "* * *", "---") should pause briefly rather than being sent to TTS.
+                emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
+                return@flow
+            }
+            else -> Unit
         }
 
         val model = modelProvider?.invoke()?.trim()?.takeIf { it.isNotEmpty() }
@@ -62,6 +67,11 @@ class GeminiTtsEngine(
 
         if (quotaTracker != null && quotaTracker.isTtsQuotaLikelyExhausted()) {
             val pool = quotaTracker.ttsCandidatePool(model)
+            DiagnosticLogBuffer.record(
+                "GeminiTtsEngine",
+                "Flash TTS quota likely exhausted across ${pool.joinToString()}",
+                level = "WARN"
+            )
             throw QuotaExhaustedException(
                 message = "Free-tier TTS quota limit reached for ${pool.joinToString(", ")}. Switch to Gemini Live or try again later.",
                 retryAfterMs = quotaTracker.shortestCooldownMs(pool),
@@ -69,12 +79,12 @@ class GeminiTtsEngine(
             )
         }
 
-        val normalizedStyle = request.style
+        val normalizedStyle = resolved.styleCue
             ?.trim()
             ?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) }
 
         val ttsRequest = TtsRequest(
-            text = request.text,
+            text = resolved.spokenText,
             voiceName = request.voiceId.takeIf { it.isNotBlank() },
             style = normalizedStyle,
             model = model,
@@ -87,6 +97,7 @@ class GeminiTtsEngine(
             emit(chunk)
         }
         if (emittedCount == 0) {
+            DiagnosticLogBuffer.record("GeminiTtsEngine", "Gemini TTS returned empty audio stream (model=$model)", level = "ERROR")
             throw IllegalStateException("Gemini TTS returned empty audio stream")
         }
     }

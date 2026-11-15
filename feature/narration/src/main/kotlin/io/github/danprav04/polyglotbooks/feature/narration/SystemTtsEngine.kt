@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -48,10 +49,23 @@ class SystemTtsEngine(
     }
 
     override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+        val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+        when (resolved.kind) {
+            PunctuationDialogueHelper.PunctuationKind.EMPTY -> return@flow
+            PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER -> {
+                val sampleRate = if (context != null) TARGET_SAMPLE_RATE else 16000
+                val pauseBytes = (sampleRate * 0.2).toInt() * 2
+                emit(PcmChunk(data = ByteArray(pauseBytes) { 0 }, sampleRate = sampleRate, channels = 1))
+                return@flow
+            }
+            else -> Unit
+        }
+        val textToSpeak = resolved.spokenText
+
         if (context == null) {
             // Pure-Kotlin fallback generator simulating PCM audio with pitch/speed factors
             val sampleRate = 16000
-            val durationMs = (request.text.length * 50 / request.speed).toLong().coerceAtLeast(100)
+            val durationMs = (textToSpeak.length * 50 / request.speed).toLong().coerceAtLeast(100)
             val byteCount = (sampleRate * (durationMs / 1000.0)).toInt() * 2
             val dummyData = ByteArray(byteCount) { 0 }
             emit(PcmChunk(data = dummyData, sampleRate = sampleRate, channels = 1))
@@ -70,7 +84,7 @@ class SystemTtsEngine(
             withContext(Dispatchers.Main) {
                 applyLanguage(tts, request.languageCode)
                 tts.setSpeechRate(request.speed.coerceIn(0.25f, 4.0f))
-                val result = tts.synthesizeToFile(request.text, Bundle(), tempFile, utteranceId)
+                val result = tts.synthesizeToFile(textToSpeak, Bundle(), tempFile, utteranceId)
                 if (result != TextToSpeech.SUCCESS) {
                     throw IOException("TextToSpeech.synthesizeToFile failed with code $result")
                 }

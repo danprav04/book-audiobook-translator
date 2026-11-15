@@ -415,4 +415,130 @@ class GeminiLiveEngineStreamingTest {
             live.close()
         }
     }
+
+    @Test
+    fun `generationComplete waits for trailing audio and transcription until turnComplete arrives`() = runTest {
+        lateinit var activeSession: FakeReplayLiveSession
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { activeSession = it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        val receivedChunks = mutableListOf<PcmChunk>()
+        val collectJob = launch(dispatcher) {
+            live.synthesizeTurnStreaming(
+                SynthesisRequest(text = "It was the best of times, it was the worst of times.", voiceId = "Charon")
+            ).collect { receivedChunks += it }
+        }
+
+        runCurrent()
+        // 1. First half arrives with generationComplete=true BEFORE turnComplete=true -> must NOT emit or terminate early.
+        activeSession.emitServerMessage(
+            LiveServerMessage.ServerContentMessage(
+                ServerContentData(
+                    modelTurn = ModelTurn(
+                        parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(byteArrayOf(11, 12)))))
+                    ),
+                    outputTranscription = TranscriptionData("It was the best of times,"),
+                    generationComplete = true,
+                    turnComplete = false
+                )
+            )
+        )
+        runCurrent()
+        assertTrue("Turn must still be awaiting trailing chunks and turnComplete", receivedChunks.isEmpty())
+
+        // 2. Trailing tail audio + final transcript + turnComplete=true arrives -> emits full turn cleanly.
+        activeSession.emitServerMessage(
+            audioServerMessage(
+                pcmBytes = byteArrayOf(21, 22),
+                transcript = "it was the worst of times.",
+                turnComplete = true
+            )
+        )
+        runCurrent()
+        collectJob.join()
+        live.close()
+
+        assertEquals(2, receivedChunks.size)
+        assertEquals(11.toByte(), receivedChunks[0].data[0])
+        assertEquals(21.toByte(), receivedChunks[1].data[0])
+    }
+
+    @Test
+    fun `bufferAndVerifyTurns discards partial interrupted or errored turns and avoids double playback on fallback`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val fallbackMarker = byteArrayOf(91, 92, 93)
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.GEMINI_TTS
+            override val capabilities = EngineCapabilities(true, true, true, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> =
+                flowOf(PcmChunk(fallbackMarker, 24000, 1))
+        }
+
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                val idx = createdSessions.size
+                FakeReplayLiveSession { session, _ ->
+                    when (idx) {
+                        0 -> {
+                            // Candidate 0 emits partial audio then server interrupts turn with turnComplete=true
+                            session.emitServerMessage(audioServerMessage(byteArrayOf(1, 2), turnComplete = false))
+                            session.emitServerMessage(
+                                LiveServerMessage.ServerContentMessage(
+                                    ServerContentData(
+                                        modelTurn = null,
+                                        interrupted = true,
+                                        turnComplete = true
+                                    )
+                                )
+                            )
+                        }
+                        1 -> {
+                            // Candidate 1 emits partial audio then mid-turn 503 error
+                            session.emitServerMessage(audioServerMessage(byteArrayOf(3, 4), turnComplete = false))
+                            session.emitServerMessage(LiveServerMessage.ErrorMessage(LiveErrorData(code = 503, message = "Overloaded")))
+                        }
+                        else -> {
+                            // Candidate 2 completes full verbatim turn cleanly
+                            session.emitServerMessage(
+                                audioServerMessage(
+                                    pcmBytes = byteArrayOf(55, 56),
+                                    transcript = "Reliable complete narration",
+                                    turnComplete = true
+                                )
+                            )
+                        }
+                    }
+                }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        val chunks = try {
+            live.synthesizeTurnStreaming(
+                SynthesisRequest(text = "Reliable complete narration", voiceId = "Charon")
+            ).toList()
+        } finally {
+            live.close()
+        }
+
+        // Only candidate 2's complete verified audio must be emitted (no partial chunks 1/3, no fallback double audio!)
+        assertEquals(3, createdSessions.size)
+        assertEquals(1, chunks.size)
+        assertEquals(55.toByte(), chunks[0].data[0])
+    }
 }

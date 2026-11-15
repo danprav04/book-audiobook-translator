@@ -1,8 +1,10 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -109,13 +111,24 @@ class OkHttpInteractionsTtsClient(
                     val shortestCooldown = quotaTracker.shortestCooldownMs(candidates)
                     if (!didCooldownWait && shortestCooldown != null && shortestCooldown <= maxCooldownWaitMs) {
                         didCooldownWait = true
+                        DiagnosticLogBuffer.record(
+                            "InteractionsTtsClient",
+                            "Waiting ${shortestCooldown + 100L}ms for TTS quota cooldown",
+                            level = "WARN"
+                        )
                         delay(shortestCooldown + 100L)
                         triedThisPass.clear()
                         continue
                     }
                     val failed = if (attemptedModels.isNotEmpty()) attemptedModels else candidates
+                    val errMsg = quotaTracker.formatConciseError(failed, shortestCooldown, lastErrorBody)
+                    DiagnosticLogBuffer.record(
+                        "InteractionsTtsClient",
+                        "TTS quota exhausted across ${failed.distinct().joinToString()}",
+                        level = "ERROR"
+                    )
                     throw QuotaExhaustedException(
-                        message = quotaTracker.formatConciseError(failed, shortestCooldown, lastErrorBody),
+                        message = errMsg,
                         retryAfterMs = shortestCooldown,
                         attemptedModels = failed.distinct()
                     )
@@ -141,12 +154,22 @@ class OkHttpInteractionsTtsClient(
                     }
 
                     if (response.code == 401 || response.code == 403) {
+                        DiagnosticLogBuffer.record(
+                            "InteractionsTtsClient",
+                            "TTS authentication failed HTTP ${response.code} (model=$modelId)",
+                            level = "ERROR"
+                        )
                         throw IOException(
                             "Gemini API authentication error (HTTP ${response.code}). Check your API key in Settings."
                         )
                     }
 
                     lastErrorBody = responseBody
+                    DiagnosticLogBuffer.record(
+                        "InteractionsTtsClient",
+                        "TTS request failed HTTP ${response.code} (model=$modelId)",
+                        level = "WARN"
+                    )
                     quotaTracker.recordHttpError(
                         modelId = modelId,
                         httpCode = response.code,
@@ -218,13 +241,16 @@ class OkHttpInteractionsTtsClient(
     }
 
     internal fun buildPromptText(request: TtsRequest): String {
-        if (request.text.isBlank() || request.text.none { it.isLetterOrDigit() }) {
+        val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+        if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EMPTY ||
+            resolved.kind == PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER
+        ) {
             return request.text
         }
         val speaker = sanitizeDirectiveValue(request.speaker)
-        val style = sanitizeStyle(request.style)
+        val style = sanitizeStyle(resolved.styleCue)
         if (speaker == null && style == null) {
-            return request.text
+            return resolved.spokenText
         }
         return buildString {
             append("Say")
@@ -237,7 +263,7 @@ class OkHttpInteractionsTtsClient(
                 }
             }
             append(": ")
-            append(request.text)
+            append(resolved.spokenText)
         }
     }
 

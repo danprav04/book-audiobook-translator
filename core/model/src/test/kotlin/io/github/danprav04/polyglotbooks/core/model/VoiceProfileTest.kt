@@ -30,4 +30,17 @@ class VoiceProfileTest {
         assertNull(GeminiStudioVoices.getVoice("non-existent"))
         assertEquals("voice_previews/charon.m4a", GeminiStudioVoices.previewAssetPath("Charon"))
     }
+
+    @Test
+    fun correctedVoiceGendersMatchStudioVoiceCatalog() {
+        assertEquals("male", GeminiStudioVoices.getVoice("Algieba")?.gender)
+        assertEquals("female", GeminiStudioVoices.getVoice("Achernar")?.gender)
+        assertEquals("female", GeminiStudioVoices.getVoice("Gacrux")?.gender)
+        assertEquals("male", GeminiStudioVoices.getVoice("Zubenelgenubi")?.gender)
+
+        val femaleCount = GeminiStudioVoices.catalog.count { it.gender == "female" }
+        val maleCount = GeminiStudioVoices.catalog.count { it.gender == "male" }
+        assertEquals(13, femaleCount)
+        assertEquals(17, maleCount)
+    }
 }

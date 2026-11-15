@@ -8,6 +8,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.BookEntity
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterDao
 import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
 import io.github.danprav04.polyglotbooks.core.model.Chapter
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -51,7 +52,15 @@ class SafLibraryImporter(
                 context.contentResolver.openInputStream(uri)?.use { stream ->
                     stream.read(headerBuffer)
                 } ?: 0
-            } catch (_: Exception) { 0 }
+            } catch (e: Exception) {
+                DiagnosticLogBuffer.record(
+                    tag = "SafLibraryImporter",
+                    message = "Failed to open header stream (ext=${ext.ifBlank { "none" }})",
+                    level = "WARN",
+                    throwable = e
+                )
+                0
+            }
             val headerBytes = if (headerLen > 0) headerBuffer.copyOf(headerLen) else byteArrayOf()
             val format = FormatDetector.detect(headerBytes, fileName)
 
@@ -311,9 +320,21 @@ class SafLibraryImporter(
 
                     bookDao.insertBookWithChapters(bookEntity, chapterEntities)
                     importedBookIds.add(bookModel.id)
+                } else {
+                    DiagnosticLogBuffer.record(
+                        tag = "SafLibraryImporter",
+                        message = "Metadata extraction returned null (format=${format.name})",
+                        level = "WARN"
+                    )
                 }
             } catch (e: Exception) {
-                android.util.Log.e("SafLibraryImporter", "Failed to import file $fileName", e)
+                DiagnosticLogBuffer.record(
+                    tag = "SafLibraryImporter",
+                    message = "Failed to import file (format=${format.name})",
+                    level = "ERROR",
+                    throwable = e
+                )
+                runCatching { android.util.Log.e("SafLibraryImporter", "Failed to import file $fileName", e) }
             }
         }
         importedBookIds
@@ -457,11 +478,19 @@ class SafLibraryImporter(
             destFile
         } catch (e: Exception) {
             tempFile.delete()
-            android.util.Log.w(
-                "SafLibraryImporter",
-                "Failed to copy URI to internal storage: ${destFile.name}",
-                e
+            DiagnosticLogBuffer.record(
+                tag = "SafLibraryImporter",
+                message = "Failed copying URI to internal storage (ext=${destFile.extension.ifBlank { "unknown" }})",
+                level = "WARN",
+                throwable = e
             )
+            runCatching {
+                android.util.Log.w(
+                    "SafLibraryImporter",
+                    "Failed to copy URI to internal storage: ${destFile.name}",
+                    e
+                )
+            }
             null
         }
     }

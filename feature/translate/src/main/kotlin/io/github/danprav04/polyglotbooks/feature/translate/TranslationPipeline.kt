@@ -12,6 +12,7 @@ import io.github.danprav04.polyglotbooks.core.data.cache.TranslatedCacheIndex
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveTranslateClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveTranslateClient
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
@@ -135,6 +136,11 @@ class TranslationPipeline(
             cancelRunningJobsLocked()
 
             if (apiKey.isNullOrBlank()) {
+                DiagnosticLogBuffer.record(
+                    "TranslationPipeline",
+                    "Cannot start live translation: API key missing",
+                    level = "WARN"
+                )
                 _state.value = _state.value.copy(
                     isRunning = false,
                     sourcePositionMs = startPositionMs,
@@ -143,6 +149,10 @@ class TranslationPipeline(
                 )
                 shouldStopStaleClient = hasActiveClientSession
             } else {
+                DiagnosticLogBuffer.record(
+                    "TranslationPipeline",
+                    "Starting live translation pipeline model=$modelId lang=${targetLanguage.code} speed=${playbackSpeed}x startMs=$initialPosMs"
+                )
                 shouldStopStaleClient = false
                 currentPlaybackPositionMs.set(initialPosMs)
                 sourceDecodedCursorMs.set(initialPosMs)
@@ -152,8 +162,8 @@ class TranslationPipeline(
 
                 resampler.reset()
                 chunker.reset()
-                pcmPlayer.init(sampleRate = OUTPUT_SAMPLE_RATE, channels = 1)
                 pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
+                pcmPlayer.init(sampleRate = OUTPUT_SAMPLE_RATE, channels = 1)
                 pcmPlayer.play()
 
                 _state.value = TranslationPipelineState(
@@ -214,6 +224,13 @@ class TranslationPipeline(
                         if (!output.errorMessage.isNullOrBlank()) {
                             abortedByError.set(true)
                             val pausedWhenClosed = isPaused.get()
+                            if (!pausedWhenClosed) {
+                                DiagnosticLogBuffer.record(
+                                    "TranslationPipeline",
+                                    "Live translation error: ${output.errorMessage}",
+                                    level = "ERROR"
+                                )
+                            }
                             _state.update {
                                 it.copy(
                                     isRunning = false,
@@ -265,8 +282,11 @@ class TranslationPipeline(
                                 if (chunkRate != activeOutputSampleRate || chunkChannels != activeOutputChannels) {
                                     activeOutputSampleRate = chunkRate
                                     activeOutputChannels = chunkChannels
+                                    val speed = currentPlaybackSpeed
                                     pcmPlayer.init(activeOutputSampleRate, activeOutputChannels)
-                                    pcmPlayer.setPlaybackSpeed(currentPlaybackSpeed)
+                                    if (kotlin.math.abs(speed - 1.0f) > 0.001f) {
+                                        pcmPlayer.setPlaybackSpeed(speed)
+                                    }
                                     if (!isPaused.get()) {
                                         pcmPlayer.play()
                                     }
@@ -449,6 +469,12 @@ class TranslationPipeline(
                 throw ce
             } catch (e: Throwable) {
                 if (!abortedByError.get() && pipelineGeneration.get() == runGen && !isPaused.get()) {
+                    DiagnosticLogBuffer.record(
+                        "TranslationPipeline",
+                        "Live translation pipeline exception",
+                        level = "ERROR",
+                        throwable = e
+                    )
                     _state.update {
                         it.copy(
                             isRunning = false,

@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.CallMerge
 import androidx.compose.material.icons.automirrored.filled.NavigateBefore
 import androidx.compose.material.icons.automirrored.filled.NavigateNext
 import androidx.compose.material.icons.filled.*
@@ -38,10 +39,13 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import io.github.danprav04.polyglotbooks.core.data.BugReportClipboardHelper
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
+import io.github.danprav04.polyglotbooks.core.model.BugReportContextFormatter
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.feature.settings.VoicePickerDialog
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -62,6 +66,9 @@ fun ReaderScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val latestUiState by rememberUpdatedState(uiState)
+    val context = LocalContext.current
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
     val readerBridge = remember(viewModel) { ReaderBridge(viewModel) }
     var webViewInstance by remember { mutableStateOf<WebView?>(null) }
     var isWebViewPageFinished by remember { mutableStateOf(false) }
@@ -70,6 +77,25 @@ fun ReaderScreen(
     var lastSyncedChapterIndex by remember(bookId) { mutableStateOf<Int?>(null) }
     var isAppearanceDialogOpen by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    val diagnosticEngineInfo = remember(
+        uiState.narrationEngine,
+        uiState.defaultNarratorVoiceId,
+        uiState.narrateTranslatedText,
+        uiState.targetLanguage,
+        uiState.isBilingualEnabled,
+        uiState.playbackSpeed,
+        uiState.currentChapterIndex,
+        uiState.activeParagraphIndex,
+        uiState.paragraphs.size,
+        uiState.isNarrationPlaying
+    ) {
+        "Engine=${uiState.narrationEngine.name}, Voice=${uiState.defaultNarratorVoiceId}, " +
+            "Playing=${uiState.isNarrationPlaying}, TranslatedSpeech=${uiState.narrateTranslatedText}, " +
+            "Bilingual=${uiState.isBilingualEnabled}, TargetLang=${uiState.targetLanguage.code}, " +
+            "Speed=${uiState.playbackSpeed}x, Chapter=${uiState.currentChapterIndex}, " +
+            "Para=${uiState.activeParagraphIndex}/${uiState.paragraphs.size}"
+    }
 
     LaunchedEffect(bookId) {
         if (bookId.isNotBlank() && viewModel.uiState.value.bookId != bookId) {
@@ -227,6 +253,7 @@ fun ReaderScreen(
     }
 
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -374,13 +401,40 @@ fun ReaderScreen(
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                             )
                         }
-                        if (uiState.isBilingualEnabled || uiState.narrateTranslatedText) {
-                            TextButton(onClick = { viewModel.retryTranslation() }) {
-                                Text("Retry")
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (uiState.isBilingualEnabled || uiState.narrateTranslatedText) {
+                                TextButton(onClick = { viewModel.retryTranslation() }) {
+                                    Text("Retry")
+                                }
                             }
-                        }
-                        IconButton(onClick = { viewModel.clearError() }) {
-                            Icon(Icons.Default.Close, contentDescription = "Dismiss Error")
+                            TextButton(
+                                onClick = {
+                                    val res = BugReportClipboardHelper.copyBugReport(
+                                        context = context,
+                                        screenOrArea = "Reader",
+                                        bookFormat = uiState.bookFormat,
+                                        engineOrModelInfo = diagnosticEngineInfo,
+                                        lastError = errorMsg
+                                    )
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            if (res.copiedToClipboard) "Diagnostic context copied to clipboard"
+                                            else "Failed to copy diagnostic context"
+                                        )
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Copy Bug")
+                            }
+                            IconButton(onClick = { viewModel.clearError() }) {
+                                Icon(Icons.Default.Close, contentDescription = "Dismiss Error")
+                            }
                         }
                     }
                 }
@@ -573,7 +627,11 @@ fun ReaderScreen(
                         onFontSizeChange = viewModel::setFontSize,
                         onFontFamilySelected = viewModel::setFontFamily,
                         onTargetLanguageSelected = viewModel::setTargetLanguage,
-                        onNarrateTranslatedSelected = viewModel::setNarrateTranslatedText
+                        onNarrateTranslatedSelected = viewModel::setNarrateTranslatedText,
+                        onOpenReportDialog = {
+                            isAppearanceDialogOpen = false
+                            viewModel.setReportDialogOpen(true)
+                        }
                     )
                 }
 
@@ -606,6 +664,10 @@ fun ReaderScreen(
                         onOpenCastEditor = {
                             viewModel.setNarrationSheetExpanded(false)
                             viewModel.setCastEditorOpen(true)
+                        },
+                        onOpenReportDialog = {
+                            viewModel.setNarrationSheetExpanded(false)
+                            viewModel.setReportDialogOpen(true)
                         }
                     )
                 }
@@ -618,8 +680,36 @@ fun ReaderScreen(
                         previewErrorMessage = uiState.previewErrorMessage,
                         isAnalyzing = uiState.isCastAnalyzing,
                         onAnalyzeCast = { viewModel.analyzeCastForCurrentChapter() },
+                        onReanalyzeCast = { viewModel.reanalyzeCastForCurrentChapter() },
+                        onAddCharacter = { name, aliases, gender, age, voiceTraits, voiceId ->
+                            viewModel.addCharacter(
+                                name = name,
+                                aliases = aliases,
+                                gender = gender,
+                                age = age,
+                                voiceTraits = voiceTraits,
+                                assignedVoiceId = voiceId
+                            )
+                        },
+                        onUpdateCharacter = { character, name, aliases, gender, age, voiceTraits, voiceId ->
+                            viewModel.updateCharacterDetails(
+                                character = character,
+                                name = name,
+                                aliases = aliases,
+                                gender = gender,
+                                age = age,
+                                voiceTraits = voiceTraits,
+                                assignedVoiceId = voiceId
+                            )
+                        },
                         onUpdateVoice = { character, voiceId, style ->
                             viewModel.updateCharacterVoice(character, voiceId, style)
+                        },
+                        onDeleteCharacter = { character ->
+                            viewModel.deleteCharacter(character)
+                        },
+                        onMergeCharacters = { source, target ->
+                            viewModel.mergeCharacters(source, target)
                         },
                         onTogglePreview = viewModel::toggleVoicePreview,
                         onStopPreview = viewModel::stopVoicePreview,
@@ -628,25 +718,70 @@ fun ReaderScreen(
                 }
 
                 if (uiState.isReportDialogOpen) {
-                    var feedbackText by remember { mutableStateOf("") }
+                    var feedbackText by remember(uiState.bookId) { mutableStateOf("") }
                     AlertDialog(
                         onDismissRequest = { viewModel.setReportDialogOpen(false) },
-                        title = { Text("Report AI Output") },
+                        title = { Text("Report AI Output & Diagnostics") },
                         text = {
-                            Column {
-                                Text("Submit translation or pronunciation feedback for improvement.")
-                                Spacer(modifier = Modifier.height(8.dp))
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Copy sanitized device/engine diagnostic context or open a pre-directed GitHub AI Output report.")
                                 OutlinedTextField(
                                     value = feedbackText,
                                     onValueChange = { feedbackText = it },
                                     label = { Text("Details (optional)") },
-                                    modifier = Modifier.fillMaxWidth()
+                                    modifier = Modifier.fillMaxWidth(),
+                                    maxLines = 4
                                 )
+                                OutlinedButton(
+                                    onClick = {
+                                        val res = BugReportClipboardHelper.copyBugReport(
+                                            context = context,
+                                            screenOrArea = "Reader - AI Output Report",
+                                            bookFormat = uiState.bookFormat,
+                                            engineOrModelInfo = diagnosticEngineInfo,
+                                            lastError = uiState.errorMessage ?: uiState.narrationStatusMessage,
+                                            userNotes = feedbackText.takeIf { it.isNotBlank() }
+                                        )
+                                        coroutineScope.launch {
+                                            snackbarHostState.showSnackbar(
+                                                if (res.copiedToClipboard) "Diagnostic context copied to clipboard"
+                                                else "Failed to copy diagnostic context"
+                                            )
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Copy Report")
+                                }
                             }
                         },
                         confirmButton = {
-                            TextButton(onClick = { viewModel.setReportDialogOpen(false) }) {
-                                Text("Submit")
+                            Button(
+                                onClick = {
+                                    BugReportClipboardHelper.copyBugReport(
+                                        context = context,
+                                        screenOrArea = "Reader - AI Output Report",
+                                        bookFormat = uiState.bookFormat,
+                                        engineOrModelInfo = diagnosticEngineInfo,
+                                        lastError = uiState.errorMessage ?: uiState.narrationStatusMessage,
+                                        userNotes = feedbackText.takeIf { it.isNotBlank() }
+                                    )
+                                    val opened = BugReportClipboardHelper.openExternalUrl(
+                                        context,
+                                        BugReportContextFormatter.GITHUB_AI_REPORT_URL
+                                    )
+                                    viewModel.setReportDialogOpen(false)
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            if (opened) "Report context copied — paste into GitHub issue"
+                                            else "Report context copied to clipboard"
+                                        )
+                                    }
+                                }
+                            ) {
+                                Text("Open Issue")
                             }
                         },
                         dismissButton = {
@@ -669,7 +804,8 @@ private fun AppearanceAndLanguageDialog(
     onFontSizeChange: (Int) -> Unit,
     onFontFamilySelected: (String) -> Unit,
     onTargetLanguageSelected: (LanguageCode) -> Unit,
-    onNarrateTranslatedSelected: (Boolean) -> Unit
+    onNarrateTranslatedSelected: (Boolean) -> Unit,
+    onOpenReportDialog: () -> Unit
 ) {
     var langMenuExpanded by remember { mutableStateOf(false) }
 
@@ -772,6 +908,16 @@ private fun AppearanceAndLanguageDialog(
                         }
                     }
                 }
+
+                HorizontalDivider()
+                OutlinedButton(
+                    onClick = onOpenReportDialog,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Copy Diagnostics / Report Issue")
+                }
             }
         },
         confirmButton = {
@@ -790,11 +936,21 @@ private fun CastEditorDialog(
     previewErrorMessage: String?,
     isAnalyzing: Boolean,
     onAnalyzeCast: () -> Unit,
+    onReanalyzeCast: () -> Unit,
+    onAddCharacter: (String, String, String, String, String, String?) -> Unit,
+    onUpdateCharacter: (CharacterEntity, String, String, String, String, String, String?) -> Unit,
     onUpdateVoice: (CharacterEntity, String, String?) -> Unit,
+    onDeleteCharacter: (CharacterEntity) -> Unit,
+    onMergeCharacters: (CharacterEntity, CharacterEntity) -> Unit,
     onTogglePreview: (String) -> Unit,
     onStopPreview: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    var showAddDialog by remember { mutableStateOf(false) }
+    var editingCharacter by remember { mutableStateOf<CharacterEntity?>(null) }
+    var deletingCharacter by remember { mutableStateOf<CharacterEntity?>(null) }
+    var mergingSourceCharacter by remember { mutableStateOf<CharacterEntity?>(null) }
+
     DisposableEffect(Unit) {
         onDispose { onStopPreview() }
     }
@@ -808,31 +964,53 @@ private fun CastEditorDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 420.dp),
+                    .heightIn(max = 480.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Button(
-                    onClick = onAnalyzeCast,
-                    enabled = !isAnalyzing,
-                    modifier = Modifier.fillMaxWidth()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (isAnalyzing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp
+                    Button(
+                        onClick = if (characters.isEmpty()) onAnalyzeCast else onReanalyzeCast,
+                        enabled = !isAnalyzing,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (isAnalyzing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Analyzing...")
+                        } else {
+                            Icon(
+                                imageVector = if (characters.isEmpty()) Icons.Default.AutoAwesome else Icons.Default.Refresh,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(if (characters.isEmpty()) "Auto-Detect" else "Re-analyze")
+                        }
+                    }
+                    OutlinedButton(
+                        onClick = { showAddDialog = true },
+                        enabled = !isAnalyzing
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PersonAdd,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Detecting Characters...")
-                    } else {
-                        Icon(Icons.Default.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Auto-Detect Characters")
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Add")
                     }
                 }
 
                 if (characters.isEmpty()) {
                     Text(
-                        text = "No characters detected yet. Tap Auto-Detect Characters to assign distinct Gemini voices for dialogue in this chapter.",
+                        text = "No characters detected yet. Tap Auto-Detect to scan dialogue in this chapter, or tap Add to create a character manually.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -844,9 +1022,13 @@ private fun CastEditorDialog(
                         items(characters, key = { it.id }) { character ->
                             CastCharacterRow(
                                 character = character,
+                                canMerge = characters.size > 1,
                                 defaultNarratorVoiceId = defaultNarratorVoiceId,
                                 playingPreviewVoiceId = playingPreviewVoiceId,
                                 previewErrorMessage = previewErrorMessage,
+                                onEdit = { editingCharacter = character },
+                                onMerge = { mergingSourceCharacter = character },
+                                onDelete = { deletingCharacter = character },
                                 onUpdateVoice = onUpdateVoice,
                                 onTogglePreview = onTogglePreview,
                                 onStopPreview = onStopPreview
@@ -867,22 +1049,190 @@ private fun CastEditorDialog(
             }
         }
     )
+
+    if (showAddDialog) {
+        CastCharacterEditDialog(
+            initialCharacter = null,
+            defaultNarratorVoiceId = defaultNarratorVoiceId,
+            playingPreviewVoiceId = playingPreviewVoiceId,
+            previewErrorMessage = previewErrorMessage,
+            onTogglePreview = onTogglePreview,
+            onStopPreview = onStopPreview,
+            onSave = { name, aliases, gender, age, voiceTraits, voiceId ->
+                showAddDialog = false
+                onAddCharacter(name, aliases, gender, age, voiceTraits, voiceId)
+            },
+            onDismiss = { showAddDialog = false }
+        )
+    }
+
+    editingCharacter?.let { targetChar ->
+        CastCharacterEditDialog(
+            initialCharacter = targetChar,
+            defaultNarratorVoiceId = defaultNarratorVoiceId,
+            playingPreviewVoiceId = playingPreviewVoiceId,
+            previewErrorMessage = previewErrorMessage,
+            onTogglePreview = onTogglePreview,
+            onStopPreview = onStopPreview,
+            onSave = { name, aliases, gender, age, voiceTraits, voiceId ->
+                editingCharacter = null
+                onUpdateCharacter(targetChar, name, aliases, gender, age, voiceTraits, voiceId)
+            },
+            onDismiss = { editingCharacter = null }
+        )
+    }
+
+    deletingCharacter?.let { targetChar ->
+        AlertDialog(
+            onDismissRequest = { deletingCharacter = null },
+            title = { Text("Delete ${targetChar.name}?") },
+            text = {
+                Text(
+                    "Remove ${targetChar.name} from this book's cast? Any dialogue lines assigned to ${targetChar.name} will revert to the Narrator."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        deletingCharacter = null
+                        onDeleteCharacter(targetChar)
+                    }
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletingCharacter = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    mergingSourceCharacter?.let { sourceChar ->
+        val candidates = remember(characters, sourceChar.id) {
+            characters.filter { it.id != sourceChar.id }
+        }
+        var selectedTargetId by remember(sourceChar.id, candidates) {
+            mutableStateOf(candidates.firstOrNull()?.id)
+        }
+        AlertDialog(
+            onDismissRequest = { mergingSourceCharacter = null },
+            title = { Text("Merge \"${sourceChar.name}\"") },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Choose which character absorbs \"${sourceChar.name}\". Aliases and dialogue lines will transfer cleanly.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 260.dp)
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        candidates.forEach { candidate ->
+                            val selected = candidate.id == selectedTargetId
+                            Surface(
+                                tonalElevation = if (selected) 3.dp else 0.dp,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { selectedTargetId = candidate.id }
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    RadioButton(
+                                        selected = selected,
+                                        onClick = { selectedTargetId = candidate.id }
+                                    )
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = candidate.name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                        if (candidate.aliases.isNotBlank()) {
+                                            Text(
+                                                text = "Aliases: ${candidate.aliases}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = selectedTargetId != null,
+                    onClick = {
+                        val targetChar = candidates.firstOrNull { it.id == selectedTargetId }
+                        mergingSourceCharacter = null
+                        if (targetChar != null) {
+                            onMergeCharacters(sourceChar, targetChar)
+                        }
+                    }
+                ) {
+                    Text("Merge")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { mergingSourceCharacter = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
 private fun CastCharacterRow(
     character: CharacterEntity,
+    canMerge: Boolean,
     defaultNarratorVoiceId: String,
     playingPreviewVoiceId: String?,
     previewErrorMessage: String?,
+    onEdit: () -> Unit,
+    onMerge: () -> Unit,
+    onDelete: () -> Unit,
     onUpdateVoice: (CharacterEntity, String, String?) -> Unit,
     onTogglePreview: (String) -> Unit,
     onStopPreview: () -> Unit
 ) {
+    val isNarrator = remember(character.id, character.name) {
+        character.id.equals("narrator", ignoreCase = true) ||
+            character.id.endsWith("_narrator", ignoreCase = true) ||
+            character.name.equals("Narrator", ignoreCase = true)
+    }
     var showVoicePicker by remember { mutableStateOf(false) }
     var styleText by remember(character.id, character.voiceTraits) { mutableStateOf(character.voiceTraits) }
     val selectedVoice = character.assignedVoiceId?.takeIf { it.isNotBlank() } ?: defaultNarratorVoiceId
     val voiceProfile = remember(selectedVoice) { GeminiStudioVoices.getVoice(selectedVoice) }
+    val metadataSummary = remember(character.gender, character.age, character.aliases) {
+        val tags = listOf(character.gender, character.age)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals("unknown", ignoreCase = true) }
+        buildList {
+            if (tags.isNotEmpty()) add(tags.joinToString(" · "))
+            if (character.aliases.isNotBlank()) add("Aliases: ${character.aliases}")
+        }.joinToString(" • ")
+    }
 
     Surface(
         tonalElevation = 2.dp,
@@ -898,26 +1248,75 @@ private fun CastCharacterRow(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = character.name,
-                    style = MaterialTheme.typography.titleSmall,
-                    modifier = Modifier.weight(1f)
-                )
-                OutlinedButton(
-                    onClick = { showVoicePicker = true },
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.RecordVoiceOver,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = voiceProfile?.let { "${it.name} (${it.gender})" } ?: selectedVoice,
-                        style = MaterialTheme.typography.labelMedium
+                        text = character.name,
+                        style = MaterialTheme.typography.titleSmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
+                    if (metadataSummary.isNotBlank()) {
+                        Text(
+                            text = metadataSummary,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = onEdit,
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Edit,
+                            contentDescription = "Edit Character",
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                    if (!isNarrator && canMerge) {
+                        IconButton(
+                            onClick = onMerge,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.CallMerge,
+                                contentDescription = "Merge Character",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    if (!isNarrator) {
+                        IconButton(
+                            onClick = onDelete,
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Delete,
+                                contentDescription = "Delete Character",
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+            }
+            OutlinedButton(
+                onClick = { showVoicePicker = true },
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(
+                    imageVector = Icons.Default.RecordVoiceOver,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = voiceProfile?.let { "${it.name} (${it.gender})" } ?: selectedVoice,
+                    style = MaterialTheme.typography.labelMedium
+                )
             }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -956,6 +1355,188 @@ private fun CastCharacterRow(
                 showVoicePicker = false
             },
             title = "Voice for ${character.name}",
+            subtitle = "Choose a Gemini Studio voice and tap play to preview"
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CastCharacterEditDialog(
+    initialCharacter: CharacterEntity?,
+    defaultNarratorVoiceId: String,
+    playingPreviewVoiceId: String?,
+    previewErrorMessage: String?,
+    onTogglePreview: (String) -> Unit,
+    onStopPreview: () -> Unit,
+    onSave: (
+        name: String,
+        aliases: String,
+        gender: String,
+        age: String,
+        voiceTraits: String,
+        assignedVoiceId: String?
+    ) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val isNarrator = remember(initialCharacter?.id, initialCharacter?.name) {
+        initialCharacter != null && (
+            initialCharacter.id.equals("narrator", ignoreCase = true) ||
+                initialCharacter.id.endsWith("_narrator", ignoreCase = true) ||
+                initialCharacter.name.equals("Narrator", ignoreCase = true)
+            )
+    }
+    var nameText by remember(initialCharacter?.id) { mutableStateOf(initialCharacter?.name.orEmpty()) }
+    var aliasesText by remember(initialCharacter?.id) { mutableStateOf(initialCharacter?.aliases.orEmpty()) }
+    var genderValue by remember(initialCharacter?.id) {
+        mutableStateOf(initialCharacter?.gender?.takeIf { it.isNotBlank() } ?: "unknown")
+    }
+    var ageValue by remember(initialCharacter?.id) {
+        mutableStateOf(initialCharacter?.age?.takeIf { it.isNotBlank() } ?: "unknown")
+    }
+    var traitsText by remember(initialCharacter?.id) { mutableStateOf(initialCharacter?.voiceTraits.orEmpty()) }
+    var selectedVoiceId by remember(initialCharacter?.id) { mutableStateOf(initialCharacter?.assignedVoiceId) }
+    var showVoicePicker by remember { mutableStateOf(false) }
+
+    val genderOptions = remember { listOf("unknown", "female", "male", "neutral") }
+    val ageOptions = remember { listOf("unknown", "child", "young", "adult", "elderly") }
+    val effectiveVoiceId = selectedVoiceId?.takeIf { it.isNotBlank() } ?: defaultNarratorVoiceId
+    val voiceProfile = remember(effectiveVoiceId) { GeminiStudioVoices.getVoice(effectiveVoiceId) }
+
+    AlertDialog(
+        onDismissRequest = {
+            onStopPreview()
+            onDismiss()
+        },
+        title = { Text(if (initialCharacter == null) "Add Character" else "Edit Character") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 460.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedTextField(
+                    value = nameText,
+                    onValueChange = { if (!isNarrator) nameText = it },
+                    enabled = !isNarrator,
+                    label = { Text("Character Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (!isNarrator) {
+                    OutlinedTextField(
+                        value = aliasesText,
+                        onValueChange = { aliasesText = it },
+                        label = { Text("Aliases (comma-separated)") },
+                        placeholder = { Text("e.g. Liz, Miss Bennet") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Text("Gender", style = MaterialTheme.typography.labelLarge)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    genderOptions.forEach { option ->
+                        FilterChip(
+                            selected = genderValue.equals(option, ignoreCase = true),
+                            onClick = { genderValue = option },
+                            label = { Text(option.replaceFirstChar { it.uppercase() }) }
+                        )
+                    }
+                }
+                Text("Age", style = MaterialTheme.typography.labelLarge)
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    ageOptions.forEach { option ->
+                        FilterChip(
+                            selected = ageValue.equals(option, ignoreCase = true),
+                            onClick = { ageValue = option },
+                            label = { Text(option.replaceFirstChar { it.uppercase() }) }
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = traitsText,
+                    onValueChange = { traitsText = it },
+                    label = { Text("Voice traits / delivery style") },
+                    placeholder = { Text("e.g. warm, dramatic, brisk") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("Voice Assignment", style = MaterialTheme.typography.labelLarge)
+                OutlinedButton(
+                    onClick = { showVoicePicker = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.RecordVoiceOver,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = if (selectedVoiceId.isNullOrBlank() && initialCharacter == null) {
+                            "Auto-assign matching voice (tap to choose)"
+                        } else {
+                            voiceProfile?.let { "${it.name} (${it.gender})" } ?: effectiveVoiceId
+                        }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                enabled = isNarrator || nameText.isNotBlank(),
+                onClick = {
+                    onStopPreview()
+                    onSave(
+                        if (isNarrator) "Narrator" else nameText.trim(),
+                        if (isNarrator) "" else aliasesText,
+                        genderValue,
+                        ageValue,
+                        traitsText,
+                        selectedVoiceId
+                    )
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    onStopPreview()
+                    onDismiss()
+                }
+            ) {
+                Text("Cancel")
+            }
+        }
+    )
+
+    if (showVoicePicker) {
+        VoicePickerDialog(
+            selectedVoiceId = effectiveVoiceId,
+            playingVoiceId = playingPreviewVoiceId,
+            previewErrorMessage = previewErrorMessage,
+            onSelectVoice = { voiceId ->
+                onStopPreview()
+                selectedVoiceId = voiceId
+                showVoicePicker = false
+            },
+            onTogglePreview = onTogglePreview,
+            onStopPreview = onStopPreview,
+            onDismiss = {
+                onStopPreview()
+                showVoicePicker = false
+            },
+            title = "Voice for ${nameText.ifBlank { "Character" }}",
             subtitle = "Choose a Gemini Studio voice and tap play to preview"
         )
     }
@@ -1174,7 +1755,8 @@ private fun ExpandedNarrationSheet(
     onSelectSleepTimer: (Int) -> Unit,
     onToggleFollowHighlight: (Boolean) -> Unit,
     onJumpToCurrent: () -> Unit,
-    onOpenCastEditor: () -> Unit
+    onOpenCastEditor: () -> Unit,
+    onOpenReportDialog: () -> Unit
 ) {
     val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
@@ -1598,6 +2180,16 @@ private fun ExpandedNarrationSheet(
                     Spacer(modifier = Modifier.width(4.dp))
                     Text("Jump to current")
                 }
+            }
+
+            HorizontalDivider()
+            OutlinedButton(
+                onClick = onOpenReportDialog,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Copy Diagnostics / Report AI Output")
             }
         }
     }
