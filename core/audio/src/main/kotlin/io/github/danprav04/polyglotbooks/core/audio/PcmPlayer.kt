@@ -38,7 +38,7 @@ interface PcmPlayer {
 
     /**
      * Signals the end of a spoken utterance/turn so real hardware outputs can apply a clean
-     * micro fade-out and silence pad to avoid click artifacts on turn boundaries.
+     * fade-out and inter-utterance silence pause to separate consecutive chunks cleanly.
      */
     fun onUtteranceEnd() {}
 
@@ -223,29 +223,13 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
         if (alignedSize <= 0) return track.write(data, offset, size, AudioTrack.WRITE_BLOCKING)
 
         if (needsBoundaryFadeIn) {
-            val preRollFrames = (sampleRateHz / 50).coerceAtLeast(1) // 20 ms silence pre-roll
-            val preRollBytes = ByteArray(preRollFrames * bytesPerFrame)
+            val preRollBytes = buildBoundaryPreRollBytes(sampleRateHz, bytesPerFrame)
             val preWritten = track.write(preRollBytes, 0, preRollBytes.size, AudioTrack.WRITE_BLOCKING)
             if (preWritten > 0) {
                 paddingTracker.recordPaddingFrames(preWritten.toLong() / bytesPerFrame)
             }
 
-            val fadeFrames = minOf((sampleRateHz / 250).coerceAtLeast(1), alignedSize / bytesPerFrame) // 4 ms ramp
-            val faded = ByteArray(alignedSize)
-            data.copyInto(faded, destinationOffset = 0, startIndex = offset, endIndex = offset + alignedSize)
-            for (f in 0 until fadeFrames) {
-                val gain = (f + 1).toFloat() / fadeFrames.toFloat()
-                for (ch in 0 until channelCount) {
-                    val i = (f * channelCount + ch) * 2
-                    val lo = faded[i].toInt() and 0xFF
-                    val hi = faded[i + 1].toInt()
-                    val sample = ((hi shl 8) or lo).toShort()
-                    val scaled = kotlin.math.round(sample.toFloat() * gain).toInt()
-                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                    faded[i] = (scaled and 0xFF).toByte()
-                    faded[i + 1] = ((scaled shr 8) and 0xFF).toByte()
-                }
-            }
+            val faded = applyBoundaryFadeIn(data, offset, alignedSize, sampleRateHz, channelCount)
             needsBoundaryFadeIn = false
             val written = track.write(faded, 0, alignedSize, AudioTrack.WRITE_BLOCKING)
             if (written > 0) {
@@ -264,27 +248,11 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     }
 
     override fun endUtterance() {
-        val fadeFrames = (sampleRateHz / 125).coerceAtLeast(1) // 8 ms smooth taper to zero
-        val padFrames = (sampleRateHz * 36 / 1000).coerceAtLeast(1) // 36 ms silence tail
-        val totalFrames = fadeFrames + padFrames
-        val tail = ByteArray(totalFrames * bytesPerFrame)
-        val hasNonZeroTail = lastFrameSamples.any { it.toInt() != 0 }
-        if (hasNonZeroTail) {
-            for (f in 0 until fadeFrames) {
-                val gain = 1.0f - ((f + 1).toFloat() / fadeFrames.toFloat())
-                for (ch in 0 until channelCount) {
-                    val sample = kotlin.math.round(lastFrameSamples[ch].toFloat() * gain).toInt()
-                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                    val i = (f * channelCount + ch) * 2
-                    tail[i] = (sample and 0xFF).toByte()
-                    tail[i + 1] = ((sample shr 8) and 0xFF).toByte()
-                }
-            }
-        }
+        val tail = buildEndUtteranceTailBytes(sampleRateHz, channelCount, lastFrameSamples)
         val written = track.write(tail, 0, tail.size, AudioTrack.WRITE_BLOCKING)
         if (written > 0) {
             // Record the utterance tail as a padding span so hardware continues draining through
-            // endFrame while speech-frame tracking plateaus without accumulating 44 ms drift/turn.
+            // endFrame while speech-frame tracking plateaus without accumulating inter-chunk drift.
             paddingTracker.recordPaddingFrames(written.toLong() / bytesPerFrame)
         }
         lastFrameSamples.fill(0)
@@ -349,6 +317,80 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
             val lo = data[i].toInt() and 0xFF
             val hi = data[i + 1].toInt()
             lastFrameSamples[ch] = ((hi shl 8) or lo).toShort()
+        }
+    }
+
+    internal companion object {
+        const val PRE_ROLL_SILENCE_MS = 20
+        const val BOUNDARY_FADE_IN_MS = 4
+        const val END_UTTERANCE_FADE_OUT_MS = 8
+        const val END_UTTERANCE_SILENCE_MS = 250
+
+        /** Builds the silence pre-roll buffer prepended before a new utterance begins. */
+        fun buildBoundaryPreRollBytes(sampleRateHz: Int, bytesPerFrame: Int): ByteArray {
+            val preRollFrames = (sampleRateHz * PRE_ROLL_SILENCE_MS / 1000).coerceAtLeast(1)
+            return ByteArray(preRollFrames * bytesPerFrame)
+        }
+
+        /** Returns a copy of [data] in `[offset, offset + alignedSize)` with a short fade-in ramp. */
+        fun applyBoundaryFadeIn(
+            data: ByteArray,
+            offset: Int,
+            alignedSize: Int,
+            sampleRateHz: Int,
+            channelCount: Int
+        ): ByteArray {
+            val bytesPerFrame = channelCount * 2
+            val fadeFrames = minOf(
+                (sampleRateHz * BOUNDARY_FADE_IN_MS / 1000).coerceAtLeast(1),
+                alignedSize / bytesPerFrame
+            )
+            val faded = ByteArray(alignedSize)
+            data.copyInto(faded, destinationOffset = 0, startIndex = offset, endIndex = offset + alignedSize)
+            for (f in 0 until fadeFrames) {
+                val gain = (f + 1).toFloat() / fadeFrames.toFloat()
+                for (ch in 0 until channelCount) {
+                    val i = (f * channelCount + ch) * 2
+                    val lo = faded[i].toInt() and 0xFF
+                    val hi = faded[i + 1].toInt()
+                    val sample = ((hi shl 8) or lo).toShort()
+                    val scaled = kotlin.math.round(sample.toFloat() * gain).toInt()
+                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                    faded[i] = (scaled and 0xFF).toByte()
+                    faded[i + 1] = ((scaled shr 8) and 0xFF).toByte()
+                }
+            }
+            return faded
+        }
+
+        /**
+         * Builds the end-of-utterance PCM tail containing an 8 ms fade-out taper from
+         * [lastFrameSamples] followed by a sentence-like silence pause ([END_UTTERANCE_SILENCE_MS]).
+         */
+        fun buildEndUtteranceTailBytes(
+            sampleRateHz: Int,
+            channelCount: Int,
+            lastFrameSamples: ShortArray
+        ): ByteArray {
+            val bytesPerFrame = channelCount * 2
+            val fadeFrames = (sampleRateHz * END_UTTERANCE_FADE_OUT_MS / 1000).coerceAtLeast(1)
+            val padFrames = (sampleRateHz * END_UTTERANCE_SILENCE_MS / 1000).coerceAtLeast(1)
+            val totalFrames = fadeFrames + padFrames
+            val tail = ByteArray(totalFrames * bytesPerFrame)
+            val hasNonZeroTail = lastFrameSamples.any { it.toInt() != 0 }
+            if (hasNonZeroTail) {
+                for (f in 0 until fadeFrames) {
+                    val gain = 1.0f - ((f + 1).toFloat() / fadeFrames.toFloat())
+                    for (ch in 0 until channelCount) {
+                        val sample = kotlin.math.round(lastFrameSamples[ch].toFloat() * gain).toInt()
+                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                        val i = (f * channelCount + ch) * 2
+                        tail[i] = (sample and 0xFF).toByte()
+                        tail[i + 1] = ((sample shr 8) and 0xFF).toByte()
+                    }
+                }
+            }
+            return tail
         }
     }
 }

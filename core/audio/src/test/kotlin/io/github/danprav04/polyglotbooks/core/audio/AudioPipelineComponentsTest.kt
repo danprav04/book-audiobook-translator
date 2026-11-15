@@ -247,4 +247,62 @@ class AudioPipelineComponentsTest {
         tracker.reset()
         assertEquals(500L, tracker.adjustedHeadFrames(500L))
     }
+
+    @Test
+    fun testEndUtteranceTailAppliesSentencePauseAndExcludesPaddingFromHeadFrames() {
+        val sampleRate = 24_000
+        val channels = 1
+        val bytesPerFrame = channels * 2
+
+        val preRollBytes = AndroidAudioTrackAdapter.buildBoundaryPreRollBytes(sampleRate, bytesPerFrame)
+        val tailBytes = AndroidAudioTrackAdapter.buildEndUtteranceTailBytes(
+            sampleRateHz = sampleRate,
+            channelCount = channels,
+            lastFrameSamples = shortArrayOf(12_000)
+        )
+
+        val expectedPreRollFrames = sampleRate * AndroidAudioTrackAdapter.PRE_ROLL_SILENCE_MS / 1000 // 480 (20 ms)
+        val expectedFadeFrames = sampleRate * AndroidAudioTrackAdapter.END_UTTERANCE_FADE_OUT_MS / 1000 // 192 (8 ms)
+        val expectedSilenceFrames = sampleRate * AndroidAudioTrackAdapter.END_UTTERANCE_SILENCE_MS / 1000 // 6000 (250 ms)
+        val expectedTailFrames = expectedFadeFrames + expectedSilenceFrames // 6192 (258 ms)
+
+        assertEquals(expectedPreRollFrames * bytesPerFrame, preRollBytes.size)
+        assertTrue(preRollBytes.all { it == 0.toByte() })
+        assertEquals(expectedTailFrames * bytesPerFrame, tailBytes.size)
+
+        // First fade sample tapers below lastFrameSamples[0]; silence tail is strictly zero.
+        val tailBuf = ByteBuffer.wrap(tailBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val firstFadeSample = tailBuf.getShort(0).toInt()
+        val lastFadeSample = tailBuf.getShort((expectedFadeFrames - 1) * bytesPerFrame).toInt()
+        assertTrue(firstFadeSample in 1 until 12_000)
+        assertEquals(0, lastFadeSample)
+        for (frame in expectedFadeFrames until expectedTailFrames) {
+            assertEquals(0, tailBuf.getShort(frame * bytesPerFrame).toInt())
+        }
+
+        // Across 3 consecutive turns, inter-chunk sentence pauses must not drift speech head tracking.
+        val tracker = PaddingFrameTracker()
+        val speechFramesPerTurn = 12_000L
+        repeat(3) {
+            tracker.recordPaddingFrames(expectedPreRollFrames.toLong())
+            tracker.recordSpeechFrames(speechFramesPerTurn)
+            tracker.recordPaddingFrames(expectedTailFrames.toLong())
+        }
+
+        val fullTurnRawFrames = expectedPreRollFrames + speechFramesPerTurn + expectedTailFrames
+        assertEquals(0L, tracker.adjustedHeadFrames(expectedPreRollFrames.toLong()))
+        assertEquals(
+            speechFramesPerTurn,
+            tracker.adjustedHeadFrames(expectedPreRollFrames + speechFramesPerTurn)
+        )
+        assertEquals(speechFramesPerTurn, tracker.adjustedHeadFrames(fullTurnRawFrames))
+        assertEquals(
+            speechFramesPerTurn,
+            tracker.adjustedHeadFrames(fullTurnRawFrames + expectedPreRollFrames)
+        )
+        assertEquals(
+            speechFramesPerTurn * 3,
+            tracker.adjustedHeadFrames(fullTurnRawFrames * 3)
+        )
+    }
 }

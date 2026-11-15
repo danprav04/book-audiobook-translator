@@ -376,4 +376,42 @@ class AudioTrackPcmPlayerTest {
         player.setPlaybackSpeed(1.0f)
         assertTrue(speedCalls.isEmpty())
     }
+
+    @Test
+    fun `onUtteranceEnd delegates to adapter without altering speech frame totals or failing in fallback`() {
+        var endUtteranceCalls = 0
+        val adapter = object : AudioTrackAdapter {
+            var head = 0L
+            override fun write(data: ByteArray, offset: Int, size: Int): Int = size
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override fun endUtterance() {
+                endUtteranceCalls++
+            }
+            override val playbackHeadPositionFrames: Long get() = head
+        }
+
+        val player = AudioTrackPcmPlayer(AudioTrackAdapterFactory { _, _ -> adapter })
+        player.init(24000, 1)
+        player.play()
+        player.write(PcmChunk(ByteArray(4800), sampleRate = 24000, channels = 1)) // 2400 speech frames
+        player.onUtteranceEnd()
+        adapter.head = 2400L
+
+        assertEquals(1, endUtteranceCalls)
+        assertEquals(2400L, player.totalFramesWritten)
+        assertEquals(2400L, player.playbackHeadPositionFrames())
+
+        // Fallback mode (no adapter) safely ignores onUtteranceEnd()
+        val fallbackPlayer = AudioTrackPcmPlayer { _, _ -> null }
+        fallbackPlayer.init(24000, 1)
+        fallbackPlayer.write(PcmChunk(ByteArray(4800), sampleRate = 24000, channels = 1))
+        fallbackPlayer.onUtteranceEnd()
+        assertEquals(2400L, fallbackPlayer.totalFramesWritten)
+    }
 }
