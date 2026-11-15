@@ -118,9 +118,15 @@ class GeminiLiveEngine(
         if (liveSessionFactory == null) {
             try {
                 val outputText = transcriptProvider(effectiveRequest)
+                val isExpressive = resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE
                 val similarity = calculateWordOverlapSimilarity(effectiveRequest.text, outputText)
+                val sourceWordCount = countWords(effectiveRequest.text)
+                val outputWordCount = countWords(outputText)
+                val excessiveExpansion = !isExpressive && isExcessiveWordExpansion(sourceWordCount, outputWordCount)
+                val repeatedPhrase = !isExpressive && outputText.isNotBlank() &&
+                    hasRepeatedSentenceOrPhrase(effectiveRequest.text, outputText)
 
-                if (similarity >= SIMILARITY_THRESHOLD) {
+                if (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase) {
                     val dummyData = ByteArray(4800) { 0 }
                     emit(PcmChunk(data = dummyData, sampleRate = 24000, channels = 1))
                 } else {
@@ -689,17 +695,20 @@ class GeminiLiveEngine(
             val similarity = if (outputTranscript.isEmpty()) 1.0 else calculateWordOverlapSimilarity(request.text, outputTranscript)
             val sourceWordCount = countWords(request.text)
             val outputWordCount = countWords(outputTranscript)
-            val excessiveExpansion = sourceWordCount >= 4 &&
-                outputWordCount > ((sourceWordCount * 1.75).toInt() + 3)
+            val excessiveExpansion = !isExpressivePunctuation &&
+                isExcessiveWordExpansion(sourceWordCount, outputWordCount)
+            val repeatedPhrase = !isExpressivePunctuation &&
+                outputTranscript.isNotEmpty() &&
+                hasRepeatedSentenceOrPhrase(request.text, outputTranscript)
             val expressiveTranscriptAcceptable = isExpressivePunctuation &&
                 outputWordCount <= 4
             val similarityOk = outputTranscript.isEmpty() ||
                 expressiveTranscriptAcceptable ||
-                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion)
+                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase)
             if (!similarityOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount) on model=$cleanModel; rotating session",
+                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
             }
@@ -853,8 +862,10 @@ class GeminiLiveEngine(
         return intersection.toDouble() / sourceWords.size.toDouble()
     }
 
-    private fun tokenizeForSimilarity(text: String): Set<String> =
-        text.lowercase()
+    private fun tokenizeForSimilarity(text: String): Set<String> {
+        val ordered = tokenizeWordsOrdered(text)
+        if (ordered.isNotEmpty()) return ordered.toSet()
+        return text.lowercase()
             .split(Regex("\\s+"))
             .filter { it.isNotEmpty() }
             .map { token ->
@@ -862,9 +873,16 @@ class GeminiLiveEngine(
                 stripped.ifEmpty { token }
             }
             .toSet()
+    }
 
-    private fun countWords(text: String): Int =
-        text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
+    private fun countWords(text: String): Int {
+        val ordered = tokenizeWordsOrdered(text)
+        return if (ordered.isNotEmpty()) {
+            ordered.size
+        } else {
+            text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
+        }
+    }
 
     companion object {
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
@@ -874,12 +892,234 @@ class GeminiLiveEngine(
         private const val POST_AUDIO_IDLE_TIMEOUT_MS = 1_500L
         private const val MIN_TRIM_DURATION_MS = 300L
         private const val LEAD_SILENCE_THRESHOLD_MS = 180L
-        private const val LEAD_KEEP_MS = 40L
-        private const val TAIL_SILENCE_THRESHOLD_MS = 200L
-        private const val TAIL_KEEP_MS = 80L
+        private const val LEAD_KEEP_MS = 60L
+        private const val TAIL_SILENCE_THRESHOLD_MS = 300L
+        private const val TAIL_KEEP_MS = 150L
         private const val EDGE_FADE_IN_MS = 4L
         private const val EDGE_FADE_OUT_MS = 8L
         private const val SILENCE_AMPLITUDE_THRESHOLD = 300
+        private val TOKEN_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026]+")
+        private val SENTENCE_SPLIT_REGEX = Regex("[.!?\\n]+")
+
+        /**
+         * Splits [text] into lowercased word tokens in appearance order while preserving internal
+         * apostrophes in contractions/possessives (e.g. `don't`, `Dokja's`) and normalizing
+         * lookalike apostrophe glyphs.
+         */
+        internal fun tokenizeWordsOrdered(text: String): List<String> {
+            if (text.isBlank()) return emptyList()
+            val normalizedApostrophes = buildString(text.length) {
+                for (ch in text) {
+                    when (ch) {
+                        '\u2018', '\u2019', '\u02BC', '\u02BB', '\u02BD', '\uFF07', '\u2032' -> append('\'')
+                        else -> append(ch)
+                    }
+                }
+            }
+            return normalizedApostrophes
+                .lowercase()
+                .split(TOKEN_SPLIT_REGEX)
+                .mapNotNull { raw ->
+                    val trimmed = raw.trim { !it.isLetterOrDigit() }
+                    trimmed.takeIf { it.isNotEmpty() }
+                }
+        }
+
+        internal fun isExcessiveWordExpansion(sourceWordCount: Int, outputWordCount: Int): Boolean =
+            when {
+                sourceWordCount <= 0 -> false
+                sourceWordCount < 4 -> outputWordCount > (sourceWordCount * 2 + 1)
+                else -> outputWordCount > ((sourceWordCount * 1.35).toInt() + 2)
+            }
+
+        /**
+         * Detects when a model transcript echoes/repeats the final sentence, clause, or phrase
+         * beyond what is already present in [source], including multi-sentence turns whose total
+         * word count stays below [isExcessiveWordExpansion].
+         */
+        internal fun hasRepeatedSentenceOrPhrase(source: String, output: String): Boolean {
+            val sourceTokens = tokenizeWordsOrdered(source)
+            val outputTokens = tokenizeWordsOrdered(output)
+            if (sourceTokens.isEmpty() || outputTokens.size < 2) return false
+
+            val sourceSentences = splitSentencesIntoTokens(source)
+            val outputSentences = splitSentencesIntoTokens(output)
+            val sourceAlreadyEndsRepeated = endsWithRepeatedSegment(sourceTokens, sourceSentences)
+
+            // 1. Trailing tandem repeat (... + A + A) at the end of outputTokens.
+            val maxBlock = outputTokens.size / 2
+            for (k in maxBlock downTo 1) {
+                if (k == 1) {
+                    if (sourceTokens.size > 2 || outputTokens.size <= sourceTokens.size) continue
+                    val tok = outputTokens.last()
+                    if (outputTokens[outputTokens.size - 2] != tok) continue
+                    val hyphenExpanded = sourceTokens.any { it.contains('-') && it.split('-') == listOf(tok, tok) }
+                    if (hyphenExpanded) continue
+                    val srcRepeatedSingle = sourceTokens.size >= 2 &&
+                        sourceTokens[sourceTokens.size - 1] == tok &&
+                        sourceTokens[sourceTokens.size - 2] == tok
+                    if (!srcRepeatedSingle) return true
+                    continue
+                }
+
+                val tail = outputTokens.subList(outputTokens.size - k, outputTokens.size)
+                val prev = outputTokens.subList(outputTokens.size - 2 * k, outputTokens.size - k)
+                if (prev == tail) {
+                    val sourceHasExactTandem = sourceTokens.size >= 2 * k &&
+                        sourceTokens.subList(sourceTokens.size - 2 * k, sourceTokens.size) == prev + tail
+                    val outputRepeatCount = countTrailingRepeats(outputTokens, tail)
+                    if (sourceHasExactTandem) {
+                        val sourceRepeatCount = countTrailingRepeats(sourceTokens, tail)
+                        if (outputRepeatCount > sourceRepeatCount && outputRepeatCount >= 2 && outputTokens.size > sourceTokens.size) {
+                            return true
+                        }
+                    } else if (!sourceAlreadyEndsRepeated || outputSentences.size > sourceSentences.size) {
+                        return true
+                    } else {
+                        val sourceTrailingCopies = countMaxTrailingCopies(sourceTokens, sourceSentences)
+                        if (outputRepeatCount > sourceTrailingCopies && outputTokens.size > sourceTokens.size) {
+                            return true
+                        }
+                    }
+                }
+            }
+
+            // 2. Extra trailing sentence matching the penultimate output sentence or last source sentence
+            // (catches slight wording variations or partial restarts of the final sentence).
+            if (outputTokens.size > sourceTokens.size &&
+                outputSentences.size > sourceSentences.size &&
+                outputSentences.size >= 2
+            ) {
+                val lastOut = outputSentences.last()
+                val prevOut = outputSentences[outputSentences.size - 2]
+                val lastSrc = sourceSentences.lastOrNull()
+                if (lastOut.size >= 2 && (lastOut == prevOut || (lastSrc != null && lastOut == lastSrc))) {
+                    return true
+                }
+                if (lastOut.size >= 3) {
+                    val prevContainment = multisetIntersectionSize(lastOut, prevOut).toDouble() / lastOut.size.toDouble()
+                    val srcSymmetricOverlap = if (lastSrc != null && lastSrc.size >= 3) {
+                        multisetIntersectionSize(lastOut, lastSrc).toDouble() / maxOf(lastOut.size, lastSrc.size).toDouble()
+                    } else {
+                        0.0
+                    }
+                    if (prevContainment >= 0.75 || srcSymmetricOverlap >= 0.70) {
+                        return true
+                    }
+                }
+            }
+
+            // 3. Non-tandem repeated trailing n-gram (catches echoed clauses when sentence punctuation is omitted).
+            if (outputTokens.size >= sourceTokens.size + 2 &&
+                !(sourceAlreadyEndsRepeated && outputSentences.size <= sourceSentences.size)
+            ) {
+                val lastSrc = sourceSentences.lastOrNull() ?: sourceTokens
+                val tailWindowStart = (outputTokens.size - maxOf(lastSrc.size + 6, 12)).coerceAtLeast(0)
+                if (outputTokens.size >= 6) {
+                    for (i in tailWindowStart..(outputTokens.size - 3)) {
+                        val trigram = outputTokens.subList(i, i + 3)
+                        val outCount = countNonOverlappingSublist(outputTokens, trigram)
+                        if (outCount >= 2 && outCount > countNonOverlappingSublist(sourceTokens, trigram)) {
+                            return true
+                        }
+                    }
+                }
+                if (lastSrc.size == 2) {
+                    val outCount = countNonOverlappingSublist(outputTokens, lastSrc)
+                    if (outCount >= 2 && outCount > countNonOverlappingSublist(sourceTokens, lastSrc)) {
+                        return true
+                    }
+                }
+            }
+
+            return false
+        }
+
+        private fun splitSentencesIntoTokens(text: String): List<List<String>> =
+            text.split(SENTENCE_SPLIT_REGEX)
+                .map(::tokenizeWordsOrdered)
+                .filter { it.isNotEmpty() }
+
+        private fun endsWithRepeatedSegment(tokens: List<String>, sentences: List<List<String>>): Boolean {
+            if (sentences.size >= 2 && sentences.last().size >= 2 && sentences.last() == sentences[sentences.size - 2]) {
+                return true
+            }
+            val maxBlock = tokens.size / 2
+            for (k in 2..maxBlock) {
+                if (tokens.subList(tokens.size - k, tokens.size) == tokens.subList(tokens.size - 2 * k, tokens.size - k)) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun countTrailingRepeats(tokens: List<String>, block: List<String>): Int {
+            val k = block.size
+            if (k == 0 || tokens.size < k) return 0
+            var count = 0
+            var end = tokens.size
+            while (end >= k && tokens.subList(end - k, end) == block) {
+                count++
+                end -= k
+            }
+            return count
+        }
+
+        private fun countMaxTrailingCopies(tokens: List<String>, sentences: List<List<String>>): Int {
+            var maxCopies = 1
+            if (sentences.size >= 2) {
+                val lastSent = sentences.last()
+                if (lastSent.size >= 2) {
+                    var sentCopies = 1
+                    var idx = sentences.lastIndex - 1
+                    while (idx >= 0 && sentences[idx] == lastSent) {
+                        sentCopies++
+                        idx--
+                    }
+                    if (sentCopies > maxCopies) maxCopies = sentCopies
+                }
+            }
+            val maxBlock = tokens.size / 2
+            for (k in 2..maxBlock) {
+                val tail = tokens.subList(tokens.size - k, tokens.size)
+                val copies = countTrailingRepeats(tokens, tail)
+                if (copies > maxCopies) maxCopies = copies
+            }
+            return maxCopies
+        }
+
+        private fun multisetIntersectionSize(a: List<String>, b: List<String>): Int {
+            if (a.isEmpty() || b.isEmpty()) return 0
+            val counts = HashMap<String, Int>(b.size)
+            for (tok in b) {
+                counts[tok] = (counts[tok] ?: 0) + 1
+            }
+            var hits = 0
+            for (tok in a) {
+                val rem = counts[tok] ?: 0
+                if (rem > 0) {
+                    hits++
+                    counts[tok] = rem - 1
+                }
+            }
+            return hits
+        }
+
+        private fun countNonOverlappingSublist(tokens: List<String>, pattern: List<String>): Int {
+            val n = pattern.size
+            if (n == 0 || tokens.size < n) return 0
+            var count = 0
+            var i = 0
+            while (i <= tokens.size - n) {
+                if (tokens.subList(i, i + n) == pattern) {
+                    count++
+                    i += n
+                } else {
+                    i++
+                }
+            }
+            return count
+        }
 
         private fun buildEffectiveSpeechRequest(
             request: SynthesisRequest,
@@ -1102,6 +1342,7 @@ class GeminiLiveEngine(
             append("paraphrasing, replying conversationally, or repeating these instructions. ")
             append("Read each phrase once and only once—never repeat, echo, or restart a sentence. ")
             append("Stop cleanly if a line ends mid-thought with a trailing dash (—) or ellipsis (...) without guessing unfinished words, while pronouncing hyphenated compounds smoothly. ")
+            append("Pronounce contractions, possessives, and apostrophe-containing words (such as don't, it's, or Kim's) smoothly as single continuous words without pausing or breaking before an apostrophe. ")
             append("Never speak stage directions, speaker labels, or delivery metadata aloud. ")
             append("Perform with natural human warmth, expressive cadence, emotional presence, vivid intonation, ")
             append("and authentic pauses at punctuation (dashes, ellipses, questions, and exclamations) rather than a flat monotone. ")

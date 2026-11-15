@@ -6,6 +6,7 @@ import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
+import io.github.danprav04.polyglotbooks.core.model.SpeechTextNormalizer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
@@ -60,7 +61,7 @@ class SystemTtsEngine(
             }
             else -> Unit
         }
-        val textToSpeak = resolved.spokenText
+        val textToSpeak = SpeechTextNormalizer.normalizeForSpeech(resolved.spokenText)
 
         if (context == null) {
             // Pure-Kotlin fallback generator simulating PCM audio with pitch/speed factors

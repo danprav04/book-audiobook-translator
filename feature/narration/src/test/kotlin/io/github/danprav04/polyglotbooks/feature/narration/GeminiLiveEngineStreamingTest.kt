@@ -29,6 +29,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.Base64
@@ -710,7 +711,7 @@ class GeminiLiveEngineStreamingTest {
         )
         try {
             val line1 = "[The constellation 'Demon-like Judge of Fire' wasn't pleased.]"
-            val expected1 = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn't pleased.]"
+            val expected1 = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn\u2019t pleased.]"
             val j1 = launch(dispatcher) {
                 live.synthesizeTurnStreaming(SynthesisRequest(text = line1, voiceId = "Charon")).toList()
             }
@@ -719,7 +720,7 @@ class GeminiLiveEngineStreamingTest {
             j1.join()
 
             val line2 = "He muttered, 'Wait 'til I'm home.'"
-            val expected2 = "He muttered, \u201CWait 'til I'm home.\u201D"
+            val expected2 = "He muttered, \u201CWait \u2019til I\u2019m home.\u201D"
             val j2 = launch(dispatcher) {
                 live.synthesizeTurnStreaming(SynthesisRequest(text = line2, voiceId = "Charon")).toList()
             }
@@ -731,6 +732,7 @@ class GeminiLiveEngineStreamingTest {
                 .filterIsInstance<LiveClientMessage.ClientContentMessage>()
                 .mapNotNull { it.clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text }
             assertEquals(listOf(expected1, expected2), sentTexts)
+            assertTrue(sentTexts.none { '\'' in it })
         } finally {
             live.close()
         }
@@ -775,18 +777,170 @@ class GeminiLiveEngineStreamingTest {
 
         val trimmed = GeminiLiveEngine.trimExcessiveEdgeSilence(chunks)
         assertEquals(1, trimmed.size)
-        // Kept: 40 ms lead (960) + 200 ms speech (4800) + 80 ms tail (1920) = 7680 frames
+        // Kept: 60 ms lead (1440) + 200 ms speech (4800) + 150 ms tail (3600) = 9840 frames
         val trimmedBytes = trimmed.single().data
-        assertEquals(7680 * 2, trimmedBytes.size)
+        assertEquals(9840 * 2, trimmedBytes.size)
         assertEquals(0.toShort(), decodeSample(trimmedBytes, 0))
-        assertEquals(5000.toShort(), decodeSample(trimmedBytes, 960))
-        assertEquals(0.toShort(), decodeSample(trimmedBytes, 7679))
+        assertEquals(5000.toShort(), decodeSample(trimmedBytes, 1440))
+        assertEquals(0.toShort(), decodeSample(trimmedBytes, 9839))
 
-        // Modest edge silence (100 ms lead, 120 ms tail, total 420 ms) stays untouched.
-        val modestSamples = ShortArray(2400 + 4800 + 2880) { i ->
+        // Modest edge silence (100 ms lead, 250 ms tail <= 300 ms threshold, total 550 ms) stays untouched.
+        val modestSamples = ShortArray(2400 + 4800 + 6000) { i ->
             if (i in 2400 until 7200) 5000 else 0
         }
         val modestChunks = listOf(PcmChunk(encodeSamples(modestSamples), sampleRate = 24000, channels = 1))
         assertEquals(modestChunks, GeminiLiveEngine.trimExcessiveEdgeSilence(modestChunks))
+    }
+
+    @Test
+    fun `tokenizeWordsOrdered preserves contractions and apostrophes cleanly`() {
+        val tokens = GeminiLiveEngine.tokenizeWordsOrdered(
+            "He whispered, 'Don’t move, Dokja's watching—'til it's over.'"
+        )
+        assertEquals(
+            listOf("he", "whispered", "don't", "move", "dokja's", "watching", "til", "it's", "over"),
+            tokens
+        )
+    }
+
+    @Test
+    fun `hasRepeatedSentenceOrPhrase detects repeated trailing sentences while allowing legitimate source repeats`() {
+        // Multi-sentence chunk repeating ONLY the last sentence (13 -> 19 words, under 1.75x + 3)
+        val multiSource = "The train stopped cleanly. Emergency lights flickered. Why are you staring at me?"
+        val multiRepeated = "$multiSource Why are you staring at me?"
+        assertTrue(GeminiLiveEngine.hasRepeatedSentenceOrPhrase(multiSource, multiRepeated))
+
+        // Slight wording variation / restart of the final sentence
+        val variedRepeated = "$multiSource Why are you just staring at me?"
+        assertTrue(GeminiLiveEngine.hasRepeatedSentenceOrPhrase(multiSource, variedRepeated))
+
+        // Unpunctuated clause echo at the end of a turn
+        val clauseSource = "Nobody saw him enter the dark room."
+        val clauseRepeated = "Nobody saw him enter the dark room, the dark room."
+        assertTrue(GeminiLiveEngine.hasRepeatedSentenceOrPhrase(clauseSource, clauseRepeated))
+
+        // Doubled short single-sentence turns (1, 3, and 7 words)
+        assertTrue(GeminiLiveEngine.hasRepeatedSentenceOrPhrase("Wait.", "Wait. Wait."))
+        assertTrue(GeminiLiveEngine.hasRepeatedSentenceOrPhrase("Wait for me.", "Wait for me. Wait for me."))
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Why would you do such a thing?",
+                "Why would you do such a thing? Why would you do such a thing?"
+            )
+        )
+
+        // Contraction repeat at sentence end
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "He knew he couldn't stop.",
+                "He knew he couldn't stop. He knew he couldn’t stop."
+            )
+        )
+
+        // Legitimate intentional repeats in the source text must NOT be rejected
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Wait for me! Wait for me!",
+                "Wait for me! Wait for me!"
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "She'd gone home. She'd gone home.",
+                "She had gone home. She had gone home."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Bye-bye.",
+                "Bye, bye."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Mr. Kim walked out, and it was raining.",
+                "Mr. Kim walked out. And it was raining."
+            )
+        )
+        // But adding an EXTRA 3rd copy of an already-repeated line IS rejected
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Wait for me! Wait for me!",
+                "Wait for me! Wait for me! Wait for me!"
+            )
+        )
+    }
+
+    @Test
+    fun `streaming Live session rejects multi-sentence turn that repeats only the last sentence and rotates to clean retry`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> =
+                flowOf(PcmChunk(byteArrayOf(99, 100), 24000, 1))
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            val sourceText = "The train stopped cleanly. Emergency lights flickered. Why are you staring at me?"
+            val repeatedLastSentenceTranscript = "$sourceText Why are you staring at me?"
+            val received = mutableListOf<PcmChunk>()
+
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = sourceText, voiceId = "Charon")
+                ).collect { received += it }
+            }
+
+            // First attempt (session 0, gemini-3.8-live) repeats the last sentence -> discarded & rotated
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(
+                    pcmBytes = byteArrayOf(5, 6),
+                    transcript = repeatedLastSentenceTranscript,
+                    turnComplete = true
+                )
+            )
+            runCurrent()
+
+            // Candidate 2 (session 1, fallback Live model) delivers clean verbatim transcript -> emitted
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            createdSessions[1].emitServerMessage(
+                audioServerMessage(
+                    pcmBytes = byteArrayOf(7, 8),
+                    transcript = sourceText,
+                    turnComplete = true
+                )
+            )
+            job.join()
+
+            assertEquals(1, received.size)
+            assertEquals(7.toByte(), received[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `buildSystemInstruction instructs smooth pronunciation of contractions and apostrophes`() {
+        val instruction = GeminiLiveEngine.buildSystemInstruction(
+            SynthesisRequest(text = "It's fine.", voiceId = "Charon")
+        )
+        assertTrue(instruction.contains("contractions, possessives, and apostrophe-containing words", ignoreCase = true))
+        assertTrue(instruction.contains("without pausing or breaking before an apostrophe", ignoreCase = true))
     }
 }
