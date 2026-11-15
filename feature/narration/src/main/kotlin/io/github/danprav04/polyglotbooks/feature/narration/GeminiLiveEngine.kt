@@ -734,6 +734,7 @@ class GeminiLiveEngine(
             }
 
             val audioGlitch = bufferedChunks != null && collectedAnyAudio && !isExpressivePunctuation &&
+                completedTurn && !failed &&
                 hasPcmGlitch(bufferedChunks)
             if (audioGlitch) {
                 DiagnosticLogBuffer.record(
@@ -864,6 +865,9 @@ class GeminiLiveEngine(
     private fun inferErrorCode(e: Throwable): Int? {
         val msg = e.message.orEmpty().lowercase()
         return when {
+            // A dropped/expired resumption session (WebSocket 1008) says nothing about the model;
+            // never map it to "model not found", which would permanently disable the model.
+            msg.contains("session not found") || msg.contains("expired") -> null
             msg.contains("429") || msg.contains("quota") || msg.contains("resource_exhausted") -> 429
             msg.contains("404") || msg.contains("1008") || msg.contains("not found") -> 404
             msg.contains("400") || msg.contains("1007") -> 400
@@ -967,6 +971,7 @@ class GeminiLiveEngine(
             if (sa == sb) return true
             val maxLen = maxOf(sa.length, sb.length)
             if (maxLen < 4) return false
+            if (sa[0] != sb[0]) return false
             if (kotlin.math.abs(sa.length - sb.length) > 2) return false
             // Tolerate small ASR spelling differences (names, rare words) but not clipped fragments.
             return editDistance(sa, sb) <= maxOf(1, maxLen / 4)
@@ -996,6 +1001,12 @@ class GeminiLiveEngine(
             val src = tokenizeForAlignment(source)
             val out = tokenizeForAlignment(output)
             if (src.isEmpty()) return 0
+            // Fast path: most turns are an exact in-order subsequence of the transcript.
+            var si = 0
+            for (tok in out) {
+                if (si < src.size && tok == src[si]) si++
+            }
+            if (si == src.size) return 0
             val n = src.size
             val m = out.size
             val dp = Array(n + 1) { IntArray(m + 1) }
