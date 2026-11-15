@@ -398,6 +398,8 @@ class GeminiLiveEngine(
                     model = normalizedModel,
                     generationConfig = GenerationConfig(
                         responseModalities = listOf("AUDIO"),
+                        // Lower sampling randomness reduces stray audio tokens (clipped/stuttering words).
+                        temperature = LIVE_NARRATION_TEMPERATURE,
                         speechConfig = request.voiceId.takeIf { it.isNotBlank() }?.let { voice ->
                             SpeechConfig(VoiceConfig(PrebuiltVoiceConfig(voice)))
                         }
@@ -702,13 +704,21 @@ class GeminiLiveEngine(
                 hasRepeatedSentenceOrPhrase(request.text, outputTranscript)
             val expressiveTranscriptAcceptable = isExpressivePunctuation &&
                 outputWordCount <= 4
+            // The set-based similarity above cannot see a single swallowed/clipped word, so also
+            // require an ordered alignment with no missing source words.
+            val swallowedWords = if (isExpressivePunctuation || outputTranscript.isEmpty()) {
+                0
+            } else {
+                countSwallowedSourceWords(request.text, outputTranscript)
+            }
             val similarityOk = outputTranscript.isEmpty() ||
                 expressiveTranscriptAcceptable ||
-                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase)
+                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase &&
+                    swallowedWords <= allowedSwallowedWords(sourceWordCount))
             if (!similarityOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase) on model=$cleanModel; rotating session",
+                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, swallowed=$swallowedWords) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
             }
@@ -723,7 +733,16 @@ class GeminiLiveEngine(
                 }
             }
 
-            val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk
+            val audioGlitch = bufferedChunks != null && collectedAnyAudio && !isExpressivePunctuation &&
+                hasPcmGlitch(bufferedChunks)
+            if (audioGlitch) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Detected mid-speech audio glitch (dropout/click) in Live turn on model=$cleanModel; regenerating",
+                    level = "WARN"
+                )
+            }
+            val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk && !audioGlitch
             if (bufferedChunks != null && turnVerifiedComplete) {
                 val chunksToEmit = if (isExpressivePunctuation) {
                     bufferedChunks
@@ -747,7 +766,7 @@ class GeminiLiveEngine(
                 quotaTracker?.recordSuccess(cleanModel, estimatedTokens)
             }
 
-            val rotateAfterTurn = failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
+            val rotateAfterTurn = audioGlitch || failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
             return TurnOutcome(
                 emittedAnyAudio = emittedAnyAudio,
                 rotateAfterTurn = rotateAfterTurn,
@@ -898,6 +917,9 @@ class GeminiLiveEngine(
         private const val EDGE_FADE_IN_MS = 4L
         private const val EDGE_FADE_OUT_MS = 8L
         private const val SILENCE_AMPLITUDE_THRESHOLD = 300
+        private const val LIVE_NARRATION_TEMPERATURE = 0.4f
+        private const val GLITCH_JUMP_THRESHOLD = 16_000
+        private const val GLITCH_EDGE_AMPLITUDE = 1_500
         private val TOKEN_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026]+")
         private val SENTENCE_SPLIT_REGEX = Regex("[.!?\\n]+")
 
@@ -923,6 +945,130 @@ class GeminiLiveEngine(
                     val trimmed = raw.trim { !it.isLetterOrDigit() }
                     trimmed.takeIf { it.isNotEmpty() }
                 }
+        }
+
+        private val WORD_PART_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026\\-/]+")
+
+        /** Number of swallowed source words tolerated for a turn of [sourceWordCount] words. */
+        internal fun allowedSwallowedWords(sourceWordCount: Int): Int =
+            if (sourceWordCount <= 30) 0 else sourceWordCount / 30
+
+        private fun tokenizeForAlignment(text: String): List<String> =
+            tokenizeWordsOrdered(text).flatMap { tok ->
+                tok.split(WORD_PART_SPLIT_REGEX).mapNotNull { part ->
+                    part.trim { !it.isLetterOrDigit() }.takeIf { it.isNotEmpty() }
+                }
+            }
+
+        private fun wordsMatch(a: String, b: String): Boolean {
+            if (a == b) return true
+            val sa = a.replace("'", "")
+            val sb = b.replace("'", "")
+            if (sa == sb) return true
+            val maxLen = maxOf(sa.length, sb.length)
+            if (maxLen < 4) return false
+            if (kotlin.math.abs(sa.length - sb.length) > 2) return false
+            // Tolerate small ASR spelling differences (names, rare words) but not clipped fragments.
+            return editDistance(sa, sb) <= maxOf(1, maxLen / 4)
+        }
+
+        private fun editDistance(a: String, b: String): Int {
+            var prev = IntArray(b.length + 1) { it }
+            var cur = IntArray(b.length + 1)
+            for (i in 1..a.length) {
+                cur[0] = i
+                for (j in 1..b.length) {
+                    val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                    cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+                }
+                val t = prev; prev = cur; cur = t
+            }
+            return prev[b.length]
+        }
+
+        /**
+         * Counts source words that have no in-order counterpart in the spoken [output] transcript
+         * (an ordered alignment, so a single swallowed or clipped word is detected even when the
+         * word appears elsewhere). The last two source words are ignored because the transcript
+         * can still be arriving when the turn completes.
+         */
+        internal fun countSwallowedSourceWords(source: String, output: String): Int {
+            val src = tokenizeForAlignment(source)
+            val out = tokenizeForAlignment(output)
+            if (src.isEmpty()) return 0
+            val n = src.size
+            val m = out.size
+            val dp = Array(n + 1) { IntArray(m + 1) }
+            for (i in 1..n) {
+                for (j in 1..m) {
+                    dp[i][j] = if (wordsMatch(src[i - 1], out[j - 1])) {
+                        dp[i - 1][j - 1] + 1
+                    } else {
+                        maxOf(dp[i - 1][j], dp[i][j - 1])
+                    }
+                }
+            }
+            // Backtrack to find which source words were matched.
+            val matched = BooleanArray(n)
+            var i = n
+            var j = m
+            while (i > 0 && j > 0) {
+                if (wordsMatch(src[i - 1], out[j - 1]) && dp[i][j] == dp[i - 1][j - 1] + 1) {
+                    matched[i - 1] = true
+                    i--; j--
+                } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+                    i--
+                } else {
+                    j--
+                }
+            }
+            val considered = (n - 2).coerceAtLeast(0)
+            var missing = 0
+            for (k in 0 until considered) if (!matched[k]) missing++
+            return missing
+        }
+
+        /**
+         * Detects model-side audio defects inside a buffered 16-bit PCM turn: abrupt waveform
+         * discontinuities (clicks from dropped samples) and short digital-silence dropouts that
+         * begin and end abruptly in loud speech (the "word cut in half / stutter" artifact).
+         * Natural pauses decay smoothly, so they are not flagged.
+         */
+        internal fun hasPcmGlitch(chunks: List<PcmChunk>): Boolean {
+            if (chunks.isEmpty()) return false
+            val channels = chunks.first().channels.coerceAtLeast(1)
+            val sampleRate = chunks.first().sampleRate.takeIf { it > 0 } ?: 24000
+            val bytesPerFrame = channels * 2
+            val total = chunks.sumOf { it.data.size }
+            val frames = total / bytesPerFrame
+            if (frames < 2) return false
+            val pcm = ByteArray(total)
+            var off = 0
+            for (c in chunks) { c.data.copyInto(pcm, off); off += c.data.size }
+            fun at(f: Int): Int {
+                val i = f * bytesPerFrame
+                return (pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)
+            }
+            val minDropout = (sampleRate * 3 / 1000).coerceAtLeast(2)
+            val maxDropout = sampleRate * 150 / 1000
+            var f = 1
+            while (f < frames) {
+                val prev = at(f - 1)
+                val cur = at(f)
+                if (abs(cur - prev) > GLITCH_JUMP_THRESHOLD) return true
+                if (cur == 0 && abs(prev) > GLITCH_EDGE_AMPLITUDE) {
+                    var end = f
+                    while (end < frames && at(end) == 0) end++
+                    val run = end - f
+                    if (run in minDropout..maxDropout && end < frames && abs(at(end)) > GLITCH_EDGE_AMPLITUDE) {
+                        return true
+                    }
+                    f = end
+                    continue
+                }
+                f++
+            }
+            return false
         }
 
         internal fun isExcessiveWordExpansion(sourceWordCount: Int, outputWordCount: Int): Boolean =
