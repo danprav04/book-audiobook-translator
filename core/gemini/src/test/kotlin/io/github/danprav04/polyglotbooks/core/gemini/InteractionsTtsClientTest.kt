@@ -303,7 +303,7 @@ class InteractionsTtsClientTest {
             baseUrl = "https://mock.local"
         )
         val input = "[The constellation 'Demon-like Judge of Fire' wasn't pleased with Kim Namwoon's choice.]"
-        val expected = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn't pleased with Kim Namwoon's choice.]"
+        val expected = "[The constellation \u201CDemon-like Judge of Fire\u201D wasn\u2019t pleased with Kim Namwoon\u2019s choice.]"
         val request = TtsRequest(text = input, voiceName = "Charon")
 
         assertEquals(expected, client.buildPromptText(request))
