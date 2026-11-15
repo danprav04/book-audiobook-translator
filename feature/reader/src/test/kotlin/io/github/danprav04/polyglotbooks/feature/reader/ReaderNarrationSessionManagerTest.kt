@@ -1721,4 +1721,208 @@ class ReaderNarrationSessionManagerTest {
         assertEquals("Puck", chunks[2].voiceId)
         assertEquals("Orus", chunks[3].voiceId)
     }
+
+    @Test
+    fun `TranslationDiskCache persists and reloads BookNarrationContext with story progression and personalities`() {
+        val tempDir = Files.createTempDirectory("reader-narration-context").toFile()
+        try {
+            val cache = TranslationDiskCache(tempDir)
+            val empty = cache.loadNarrationContext("book-ctx")
+            assertEquals("", empty.storySummary)
+            assertTrue(empty.chapterSummaries.isEmpty())
+            assertTrue(empty.characterPersonalities.isEmpty())
+
+            val expected = TranslationDiskCache.BookNarrationContext(
+                storySummary = "Alice unlocks the lower archive while Station Nine loses hull pressure.",
+                chapterSummaries = mapOf(
+                    0 to "Alice boards the silent relay station.",
+                    1 to "The backup core activates with a lockdown alert."
+                ),
+                characterPersonalities = mapOf(
+                    "alice" to "Resourceful engineer; composed even under extreme stress.",
+                    "narrator" to "Steady, atmospheric, and keenly observant."
+                ),
+                contextVersion = TranslationDiskCache.CURRENT_NARRATION_CONTEXT_VERSION
+            )
+            cache.saveNarrationContext("book-ctx", expected)
+
+            val reloaded = TranslationDiskCache(tempDir).loadNarrationContext("book-ctx")
+            assertEquals(expected, reloaded)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `gemini live receives book context personalities tailored styles and reuses session beyond two turns`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-ctx").toFile()
+        try {
+            val bookId = "book-live-ctx"
+            val p0Text = "Stay behind me."
+            val p1Text = "[Security lockdown engaged.]"
+            val p2Text = "The corridor lights flickered out."
+            val p3Text = "Water crept over the steel grating."
+            val p4Text = "Someone tapped twice from the dark."
+            val allTexts = listOf(p0Text, p1Text, p2Text, p3Text, p4Text)
+
+            val bookDao = FakeBookDao().apply {
+                insertBook(
+                    BookEntity(
+                        id = bookId,
+                        title = "Deep Relay",
+                        author = "Author",
+                        format = "EPUB",
+                        filePath = "",
+                        coverUri = null,
+                        addedDate = 100L,
+                        lastReadDate = 100L,
+                        isAudiobook = false
+                    )
+                )
+            }
+            val chapterDao = FakeChapterDao(
+                listOf(ChapterEntity("c0", bookId, 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 200))
+            )
+            val narrationDao = FakeNarrationDao(chapterDao).apply {
+                insertLines(
+                    listOf(
+                        NarrationLineEntity("l0", "c0", 0, 0, p0Text.length, "${bookId}_alice", "quiet, urgent command", "epubcfi(/6/2!/4/2/1:0)"),
+                        NarrationLineEntity("l1", "c0", 1, 0, p1Text.length, "narrator", null, "epubcfi(/6/2!/4/2/2:0)"),
+                        NarrationLineEntity("l2", "c0", 2, 0, p2Text.length, "narrator", "tense, measured dread", "epubcfi(/6/2!/4/2/3:0)"),
+                        NarrationLineEntity("l3", "c0", 3, 0, p3Text.length, "narrator", "tense, measured dread", "epubcfi(/6/2!/4/2/4:0)"),
+                        NarrationLineEntity("l4", "c0", 4, 0, p4Text.length, "narrator", "tense, measured dread", "epubcfi(/6/2!/4/2/5:0)")
+                    )
+                )
+            }
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+                setDefaultNarratorVoiceId("Charon")
+            }
+
+            data class SessionRecord(
+                val systemInstruction: String,
+                val prompts: MutableList<String> = mutableListOf()
+            )
+            val sessionRecords = mutableListOf<SessionRecord>()
+            val pcmBase64 = Base64.getEncoder().encodeToString(ByteArray(4800) { 0x15 })
+
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession {
+                    return object : LiveSession {
+                        private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 32)
+                        override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                        private var connected = false
+                        private var currentRecord: SessionRecord? = null
+                        override val isConnected: Boolean get() = connected
+
+                        override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                            connected = true
+                            val instruction = setup.systemInstruction?.parts.orEmpty()
+                                .mapNotNull { it.text }
+                                .joinToString("\n")
+                            currentRecord = SessionRecord(instruction).also { sessionRecords += it }
+                        }
+
+                        override suspend fun send(message: LiveClientMessage) {
+                            val clientMsg = message as? LiveClientMessage.ClientContentMessage ?: return
+                            val promptText = clientMsg.clientContent.turns.orEmpty()
+                                .flatMap { it.parts }
+                                .mapNotNull { it.text }
+                                .joinToString("\n")
+                            currentRecord?.prompts?.add(promptText)
+                            val verbatim = allTexts.firstOrNull { promptText.contains(it) } ?: promptText
+                            _incoming.emit(
+                                LiveServerMessage.ServerContentMessage(
+                                    ServerContentData(
+                                        modelTurn = ModelTurn(
+                                            parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", pcmBase64)))
+                                        ),
+                                        outputTranscription = TranscriptionData(verbatim),
+                                        turnComplete = true
+                                    )
+                                )
+                            )
+                        }
+
+                        override suspend fun disconnect() {
+                            connected = false
+                        }
+                    }
+                }
+            }
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("live-test-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope,
+                narrationDao = narrationDao
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { RecordingPcmPlayer() }
+            }
+            runCurrent()
+
+            manager.saveBookNarrationContext(
+                bookId = bookId,
+                context = TranslationDiskCache.BookNarrationContext(
+                    storySummary = "Alice escapes the station in Chapter 1.",
+                    chapterSummaries = mapOf(
+                        0 to "Lockdown traps Alice in the lower corridor.",
+                        1 to "Later chapter spoiler."
+                    ),
+                    characterPersonalities = mapOf(
+                        "alice" to "Calm under pressure; clipped, decisive leader.",
+                        "narrator" to "Grave, atmospheric storyteller."
+                    )
+                )
+            )
+
+            val characters = listOf(
+                CharacterEntity("${bookId}_narrator", bookId, "Narrator", "", "neutral", "mature", "atmospheric", "Charon"),
+                CharacterEntity("${bookId}_alice", bookId, "Alice", "", "female", "adult", "steady", "Zephyr")
+            )
+            val paragraphs = allTexts.mapIndexed { idx, text ->
+                ReaderParagraph(idx, "p$idx", text, "epubcfi(/6/2!/4/2/${idx + 1}:0)")
+            }
+
+            manager.startOrResume(
+                bookId = bookId,
+                bookTitle = "Deep Relay",
+                chapters = chapterDao.chapters,
+                currentChapterIndex = 0,
+                paragraphs = paragraphs,
+                characters = characters
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertNull(manager.sessionState.value.errorMessage)
+            assertEquals(3, sessionRecords.size)
+
+            val aliceSession = sessionRecords[0]
+            assertTrue(aliceSession.systemInstruction.contains("Alice"))
+            assertTrue(aliceSession.systemInstruction.contains("Calm under pressure"))
+            assertTrue(aliceSession.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
+            assertFalse(aliceSession.systemInstruction.contains("Later chapter spoiler."))
+            assertTrue(aliceSession.systemInstruction.contains("quiet, urgent command"))
+            assertEquals(1, aliceSession.prompts.size)
+
+            val systemNoticeSession = sessionRecords[1]
+            assertTrue(systemNoticeSession.systemInstruction.contains("crisp, detached system announcement"))
+            assertTrue(systemNoticeSession.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
+            assertEquals(1, systemNoticeSession.prompts.size)
+
+            val narratorSeriesSession = sessionRecords[2]
+            assertTrue(narratorSeriesSession.systemInstruction.contains("Grave, atmospheric storyteller."))
+            assertTrue(narratorSeriesSession.systemInstruction.contains("tense, measured dread"))
+            assertEquals(3, narratorSeriesSession.prompts.size)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

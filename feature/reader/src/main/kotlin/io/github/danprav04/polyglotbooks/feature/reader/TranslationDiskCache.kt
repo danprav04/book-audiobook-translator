@@ -19,7 +19,15 @@ class TranslationDiskCache(
 ) {
     private val translationsDir = File(cacheRootDir, "translations")
     private val audioDir = File(cacheRootDir, "audio")
+    private val contextDir = File(cacheRootDir, "narration_context")
     private val lock = Any()
+
+    data class BookNarrationContext(
+        val storySummary: String = "",
+        val chapterSummaries: Map<Int, String> = emptyMap(),
+        val characterPersonalities: Map<String, String> = emptyMap(),
+        val contextVersion: Int = CURRENT_NARRATION_CONTEXT_VERSION
+    )
 
     data class CachedAudioSegment(
         val sampleRate: Int,
@@ -89,6 +97,24 @@ class TranslationDiskCache(
             if (merged.isEmpty()) return
             writeTranslationEntries(file, merged)
             pruneTranslationFilesLocked()
+        }
+    }
+
+    fun loadNarrationContext(bookId: String): BookNarrationContext {
+        if (bookId.isBlank()) return BookNarrationContext()
+        synchronized(lock) {
+            val file = narrationContextFile(bookId)
+            if (!file.exists() || !file.isFile) return BookNarrationContext()
+            return readNarrationContext(file)
+        }
+    }
+
+    fun saveNarrationContext(bookId: String, context: BookNarrationContext) {
+        if (bookId.isBlank()) return
+        synchronized(lock) {
+            if (!contextDir.exists()) contextDir.mkdirs()
+            val file = narrationContextFile(bookId)
+            writeNarrationContext(file, context)
         }
     }
 
@@ -163,6 +189,10 @@ class TranslationDiskCache(
         return File(translationsDir, "${safeBook}_${chapterIndex}_${safeLang}.json")
     }
 
+    private fun narrationContextFile(bookId: String): File {
+        return File(contextDir, "${sanitizeFilename(bookId)}_context.json")
+    }
+
     private fun audioCacheKey(engineTag: String, voiceId: String, style: String?, text: String): String {
         return sha256("$engineTag|$voiceId|${style.orEmpty()}|$text")
     }
@@ -224,8 +254,77 @@ class TranslationDiskCache(
             sb.append('}')
         }
         sb.append('}')
+        writeAtomicText(file, sb.toString())
+    }
+
+    private fun readNarrationContext(file: File): BookNarrationContext {
+        return try {
+            val parsed = CacheJsonCodec.parseObject(file.readText(Charsets.UTF_8))
+                ?: return BookNarrationContext()
+            val version = (parsed["version"] as? String)?.toIntOrNull() ?: 1
+            val storySummary = (parsed["storySummary"] as? String).orEmpty()
+            val chaptersRaw = parsed["chapterSummaries"] as? Map<*, *>
+            val chapterSummaries = LinkedHashMap<Int, String>()
+            chaptersRaw?.forEach { (k, v) ->
+                val idx = (k as? String)?.toIntOrNull()
+                val text = v as? String
+                if (idx != null && !text.isNullOrBlank()) {
+                    chapterSummaries[idx] = text
+                }
+            }
+            val personalitiesRaw = parsed["characterPersonalities"] as? Map<*, *>
+            val characterPersonalities = LinkedHashMap<String, String>()
+            personalitiesRaw?.forEach { (k, v) ->
+                val cid = (k as? String)?.trim()
+                val desc = (v as? String)?.trim()
+                if (!cid.isNullOrEmpty() && !desc.isNullOrEmpty()) {
+                    characterPersonalities[cid] = desc
+                }
+            }
+            BookNarrationContext(
+                storySummary = storySummary,
+                chapterSummaries = chapterSummaries,
+                characterPersonalities = characterPersonalities,
+                contextVersion = version
+            )
+        } catch (_: Exception) {
+            BookNarrationContext()
+        }
+    }
+
+    private fun writeNarrationContext(file: File, context: BookNarrationContext) {
+        val sb = StringBuilder()
+        sb.append("{\"version\":")
+        sb.append(CacheJsonCodec.quote(context.contextVersion.toString()))
+        sb.append(",\"storySummary\":")
+        sb.append(CacheJsonCodec.quote(context.storySummary))
+        sb.append(",\"chapterSummaries\":{")
+        var firstChap = true
+        for ((idx, summary) in context.chapterSummaries.toSortedMap()) {
+            if (summary.isBlank()) continue
+            if (!firstChap) sb.append(',')
+            firstChap = false
+            sb.append(CacheJsonCodec.quote(idx.toString()))
+            sb.append(':')
+            sb.append(CacheJsonCodec.quote(summary))
+        }
+        sb.append("},\"characterPersonalities\":{")
+        var firstChar = true
+        for ((id, personality) in context.characterPersonalities) {
+            if (id.isBlank() || personality.isBlank()) continue
+            if (!firstChar) sb.append(',')
+            firstChar = false
+            sb.append(CacheJsonCodec.quote(id))
+            sb.append(':')
+            sb.append(CacheJsonCodec.quote(personality))
+        }
+        sb.append("}}")
+        writeAtomicText(file, sb.toString())
+    }
+
+    private fun writeAtomicText(file: File, content: String) {
         val tmpFile = File(file.parentFile, "${file.name}.tmp")
-        tmpFile.writeText(sb.toString(), Charsets.UTF_8)
+        tmpFile.writeText(content, Charsets.UTF_8)
         if (file.exists()) file.delete()
         if (!tmpFile.renameTo(file)) {
             tmpFile.copyTo(file, overwrite = true)
@@ -240,6 +339,7 @@ class TranslationDiskCache(
     companion object {
         const val DEFAULT_MAX_AUDIO_BYTES = 200L * 1024L * 1024L
         const val DEFAULT_MAX_TRANSLATION_FILES = 128
+        const val CURRENT_NARRATION_CONTEXT_VERSION = 2
 
         fun sha256(text: String): String {
             val bytes = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))

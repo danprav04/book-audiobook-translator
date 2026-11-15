@@ -237,6 +237,7 @@ class ReaderNarrationSessionManager @Inject constructor(
     private val playbackGenerationId = AtomicLong(0L)
     private val pendingPersistJobs = ConcurrentHashMap<String, Job>()
     private val chapterNarrationLinesCache = ConcurrentHashMap<String, List<NarrationLineEntity>>()
+    private val bookNarrationContexts = ConcurrentHashMap<String, TranslationDiskCache.BookNarrationContext>()
     private val timelineSpans = CopyOnWriteArrayList<SegmentFrameSpan>()
 
     @Volatile
@@ -273,6 +274,28 @@ class ReaderNarrationSessionManager @Inject constructor(
     }
 
     private fun resolveDiskCache(): TranslationDiskCache? = testDiskCache ?: defaultDiskCache
+
+    internal fun hasDiskCache(): Boolean = resolveDiskCache() != null
+
+    internal fun getBookNarrationContext(bookId: String): TranslationDiskCache.BookNarrationContext {
+        if (bookId.isBlank()) return TranslationDiskCache.BookNarrationContext()
+        bookNarrationContexts[bookId]?.let { return it }
+        val loaded = resolveDiskCache()?.loadNarrationContext(bookId)
+            ?: TranslationDiskCache.BookNarrationContext()
+        if (loaded.storySummary.isNotBlank() || loaded.chapterSummaries.isNotEmpty() || loaded.characterPersonalities.isNotEmpty()) {
+            bookNarrationContexts[bookId] = loaded
+        }
+        return loaded
+    }
+
+    internal fun saveBookNarrationContext(
+        bookId: String,
+        context: TranslationDiskCache.BookNarrationContext
+    ) {
+        if (bookId.isBlank()) return
+        bookNarrationContexts[bookId] = context
+        resolveDiskCache()?.saveNarrationContext(bookId, context)
+    }
 
     suspend fun awaitPendingPersist(targetBookId: String) {
         if (targetBookId.isBlank()) return
@@ -1275,8 +1298,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                 val existing = streamingLiveSession
                 if (existing != null) return existing
                 val created = createGeminiLiveEngine(trackedFallback).openStreamingSession(
-                    maxTurnsPerSession = 2,
-                    maxCharsPerSession = 1_500,
+                    maxTurnsPerSession = 12,
+                    maxCharsPerSession = 6_000,
                     dispatcher = ioDispatcher,
                     bufferAndVerifyTurns = true
                 )
@@ -1389,6 +1412,13 @@ class ReaderNarrationSessionManager @Inject constructor(
                     val engineChoice = _sessionState.value.narrationEngine
                     val spokenLangCode = if (readTranslated) targetLang.code else null
                     val chapterLines = loadNarrationLinesForChapter(cur, chapterIdx)
+                    val bookContext = getBookNarrationContext(cur.bookId)
+                    val chapterStorySummary = bookContext.chapterSummaries[chapterIdx]
+                        ?: bookContext.chapterSummaries.entries
+                            .filter { it.key < chapterIdx }
+                            .maxByOrNull { it.key }
+                            ?.value
+                        ?: bookContext.storySummary.takeIf { it.isNotBlank() }
                     val chunks = buildSpeechChunks(
                         paragraphs = remainingParas,
                         characters = _sessionState.value.characters,
@@ -1396,7 +1426,9 @@ class ReaderNarrationSessionManager @Inject constructor(
                         translatedTextsByCfi = if (readTranslated) translationsForChapter else null,
                         languageCode = spokenLangCode,
                         defaultNarratorVoiceId = _sessionState.value.defaultNarratorVoiceId,
-                        chapterNarrationLines = chapterLines
+                        chapterNarrationLines = chapterLines,
+                        storySummary = chapterStorySummary,
+                        characterPersonalities = bookContext.characterPersonalities
                     )
                     if (chunks.isEmpty()) {
                         val nextReadable = findReadableChapterIndex(chapterIdx + 1, step = 1)
@@ -1718,10 +1750,10 @@ class ReaderNarrationSessionManager @Inject constructor(
                             }
                         }
                     } else {
-                        // Producer-consumer 1-paragraph streaming pipeline (GEMINI_LIVE & SYSTEM_TTS, max 1-turn lookahead).
+                        // Producer-consumer multi-turn streaming pipeline (GEMINI_LIVE & SYSTEM_TTS, up to 4-turn lookahead).
                         kotlinx.coroutines.coroutineScope {
                             val events = Channel<LiveStreamEvent>(Channel.UNLIMITED)
-                            val turnCredits = Semaphore(permits = 2)
+                            val turnCredits = Semaphore(permits = 5)
                             val producerJob = launch(ioDispatcher) {
                                 try {
                                     for (chunkIdx in chunks.indices) {
@@ -1731,14 +1763,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                                         events.send(LiveStreamEvent.BeginTurn(chunkIdx, chunk))
 
                                         val langSuffix = chunk.languageCode?.takeIf { it.isNotBlank() }?.let { "_$it" }.orEmpty()
+                                        val req = toSynthesisRequest(chunk)
                                         if (engineChoice == NarrationEngine.SYSTEM_TTS) {
-                                            val req = SynthesisRequest(
-                                                text = chunk.text,
-                                                voiceId = chunk.voiceId,
-                                                style = chunk.style,
-                                                speed = 1.0f,
-                                                languageCode = chunk.languageCode
-                                            )
                                             systemFallback.synthesize(req).collect { pcm ->
                                                 if (pcm.data.isNotEmpty()) {
                                                     events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
@@ -1756,13 +1782,6 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 )
                                             } else {
                                                 val session = ensureLiveSession(trackedFallback)
-                                                val req = SynthesisRequest(
-                                                    text = chunk.text,
-                                                    voiceId = chunk.voiceId,
-                                                    style = chunk.style,
-                                                    speed = 1.0f,
-                                                    languageCode = chunk.languageCode
-                                                )
                                                 val pcmBuf = ByteArrayOutputStream()
                                                 var sr = 24000
                                                 var ch = 1
@@ -1783,17 +1802,21 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                     }
                                                     if (emitted && !thisTurnFallback.get()) {
                                                         val bytes = pcmBuf.toByteArray()
-                                                        diskCache?.saveAudioSegment(
-                                                            engineTag = liveTag,
-                                                            voiceId = chunk.voiceId,
-                                                            style = chunk.style,
-                                                            text = chunk.text,
-                                                            sampleRate = sr,
-                                                            channels = ch,
-                                                            pcmBytes = bytes,
-                                                            maxBytes = maxCacheBytes
-                                                        )
                                                         recordAudioUsage(isLive = true, byteCount = bytes.size, sampleRate = sr, channels = ch)
+                                                        if (diskCache != null) {
+                                                            this@coroutineScope.launch(ioDispatcher) {
+                                                                diskCache.saveAudioSegment(
+                                                                    engineTag = liveTag,
+                                                                    voiceId = chunk.voiceId,
+                                                                    style = chunk.style,
+                                                                    text = chunk.text,
+                                                                    sampleRate = sr,
+                                                                    channels = ch,
+                                                                    pcmBytes = bytes,
+                                                                    maxBytes = maxCacheBytes
+                                                                )
+                                                            }
+                                                        }
                                                     }
                                                 } finally {
                                                     activeTurnFallbackFlag.compareAndSet(thisTurnFallback, null)
@@ -2203,13 +2226,7 @@ class ReaderNarrationSessionManager @Inject constructor(
             return null
         }
 
-        val request = SynthesisRequest(
-            text = chunk.text,
-            voiceId = chunk.voiceId,
-            style = chunk.style,
-            speed = 1.0f,
-            languageCode = chunk.languageCode
-        )
+        val request = toSynthesisRequest(chunk)
         return try {
             val collected = mutableListOf<PcmChunk>()
             val pcmBuffer = ByteArrayOutputStream()
@@ -2328,6 +2345,18 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
     }
 
+    private fun toSynthesisRequest(chunk: SpeechChunk): SynthesisRequest =
+        SynthesisRequest(
+            text = chunk.text,
+            voiceId = chunk.voiceId,
+            style = chunk.style,
+            speed = 1.0f,
+            languageCode = chunk.languageCode,
+            speakerName = chunk.speakerName,
+            characterPersonality = chunk.characterPersonality,
+            storySummary = chunk.storySummary
+        )
+
     internal fun buildSpeechChunks(
         paragraphs: List<ReaderParagraph>,
         characters: List<CharacterEntity>,
@@ -2335,18 +2364,21 @@ class ReaderNarrationSessionManager @Inject constructor(
         translatedTextsByCfi: Map<String, String>? = null,
         languageCode: String? = null,
         defaultNarratorVoiceId: String = _sessionState.value.defaultNarratorVoiceId,
-        chapterNarrationLines: List<NarrationLineEntity> = emptyList()
+        chapterNarrationLines: List<NarrationLineEntity> = emptyList(),
+        storySummary: String? = null,
+        characterPersonalities: Map<String, String> = emptyMap()
     ): List<SpeechChunk> {
         val nonBlank = paragraphs.filter { it.text.isNotBlank() }
         if (nonBlank.isEmpty()) return emptyList()
 
-        val narratorVoice = characters
-            .firstOrNull { isNarratorCharacter(it) }
+        val narratorEntity = characters.firstOrNull { isNarratorCharacter(it) }
+        val narratorVoice = narratorEntity
             ?.assignedVoiceId
             ?.takeIf { it.isNotBlank() }
             ?: defaultNarratorVoiceId.takeIf { it.isNotBlank() }
             ?: GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
 
+        val cleanStorySummary = storySummary?.trim()?.takeIf { it.isNotEmpty() }
         val linesByPara = if (chapterNarrationLines.isEmpty()) emptyMap() else chapterNarrationLines.groupBy { it.paraIndex }
         val chapterHasAttributedSpeakers = chapterNarrationLines.any { !isNarratorSpeakerId(it.speakerId) }
 
@@ -2360,6 +2392,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         var currentGroup = mutableListOf<Pair<ReaderParagraph, String>>()
         var currentVoice = ""
         var currentStyle: String? = null
+        var currentSpeakerName: String? = null
+        var currentPersonality: String? = null
         var currentChars = 0
 
         fun weightedInt(text: String): Int =
@@ -2378,7 +2412,10 @@ class ReaderNarrationSessionManager @Inject constructor(
                     style = currentStyle,
                     paragraphIndices = currentGroup.map { it.first.index },
                     paragraphCharWeights = currentGroup.map { weightedInt(it.second) },
-                    languageCode = languageCode
+                    languageCode = languageCode,
+                    speakerName = currentSpeakerName,
+                    characterPersonality = currentPersonality,
+                    storySummary = cleanStorySummary
                 )
             )
             currentGroup = mutableListOf()
@@ -2388,13 +2425,17 @@ class ReaderNarrationSessionManager @Inject constructor(
         for (para in nonBlank) {
             val spokenText = translatedTextsByCfi?.get(para.cfi)?.trim()?.takeIf { it.isNotEmpty() } ?: para.text
             val paraLines = linesByPara[para.index].orEmpty()
-            val (voiceId, baseStyle) = resolveSpeakerVoiceAndStyle(
+            val resolvedSpeaker = resolveSpeakerInfo(
                 paragraphText = para.text,
                 characters = characters,
+                narratorEntity = narratorEntity,
                 defaultNarratorVoice = narratorVoice,
                 paraLines = paraLines,
-                trustNarratorOnlySpans = chapterHasAttributedSpeakers
+                trustNarratorOnlySpans = chapterHasAttributedSpeakers,
+                characterPersonalities = characterPersonalities
             )
+            val voiceId = resolvedSpeaker.voiceId
+            val baseStyle = resolvedSpeaker.style ?: inferStructuralStyleFallback(spokenText)
             val resolvedPunct = PunctuationDialogueHelper.resolve(spokenText, baseStyle)
             val style = resolvedPunct.styleCue ?: baseStyle
             val isPunctuationOnlyTurn = resolvedPunct.kind == PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER ||
@@ -2411,21 +2452,30 @@ class ReaderNarrationSessionManager @Inject constructor(
                         style = style,
                         paragraphIndices = listOf(para.index),
                         paragraphCharWeights = listOf(weightedInt(spokenText)),
-                        languageCode = languageCode
+                        languageCode = languageCode,
+                        speakerName = resolvedSpeaker.speakerName,
+                        characterPersonality = resolvedSpeaker.personality,
+                        storySummary = cleanStorySummary
                     )
                 )
                 continue
             }
 
             val separatorLen = if (currentGroup.isEmpty()) 0 else 1
-            val wouldExceed = currentGroup.isNotEmpty() &&
-                (voiceId != currentVoice || style != currentStyle || currentChars + separatorLen + spokenText.length > maxChars)
+            val wouldExceed = currentGroup.isNotEmpty() && (
+                voiceId != currentVoice ||
+                    style != currentStyle ||
+                    resolvedSpeaker.speakerName != currentSpeakerName ||
+                    currentChars + separatorLen + spokenText.length > maxChars
+                )
             if (wouldExceed) {
                 flushGroup()
             }
             if (currentGroup.isEmpty()) {
                 currentVoice = voiceId
                 currentStyle = style
+                currentSpeakerName = resolvedSpeaker.speakerName
+                currentPersonality = resolvedSpeaker.personality
             }
             currentGroup.add(para to spokenText)
             currentChars += separatorLen + spokenText.length
@@ -2446,13 +2496,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         onPcmChunk: suspend (PcmChunk) -> Unit
     ) {
         // Apply playback speed uniformly on PcmPlayer; pass speed = 1.0f to all synthesis engines.
-        val request = SynthesisRequest(
-            text = chunk.text,
-            voiceId = chunk.voiceId,
-            style = chunk.style,
-            speed = 1.0f,
-            languageCode = chunk.languageCode
-        )
+        val request = toSynthesisRequest(chunk)
 
         if (engineChoice == NarrationEngine.SYSTEM_TTS) {
             systemFallback.synthesize(request).collect { onPcmChunk(it) }
@@ -3315,13 +3359,61 @@ class ReaderNarrationSessionManager @Inject constructor(
         return fromDb ?: fromExt ?: "Chapter ${chapterIndex + 1}"
     }
 
-    private fun resolveSpeakerVoiceAndStyle(
+    private data class ResolvedSpeakerInfo(
+        val voiceId: String,
+        val style: String?,
+        val speakerName: String?,
+        val personality: String?
+    )
+
+    private fun lookupPersonality(
+        character: CharacterEntity?,
+        personalities: Map<String, String>
+    ): String? {
+        if (character == null) return null
+        val fromMap = personalities[character.id]?.trim()?.takeIf { it.isNotEmpty() }
+            ?: personalities[character.id.lowercase()]?.trim()?.takeIf { it.isNotEmpty() }
+            ?: personalities[character.name.trim()]?.trim()?.takeIf { it.isNotEmpty() }
+            ?: personalities[character.name.trim().lowercase()]?.trim()?.takeIf { it.isNotEmpty() }
+        return fromMap ?: character.voiceTraits.trim().ifBlank { null }
+    }
+
+    private fun inferStructuralStyleFallback(text: String): String? {
+        val trimmed = text.trim()
+        if (trimmed.length >= 3 && trimmed.startsWith("[") && trimmed.endsWith("]")) {
+            return "crisp, detached system announcement"
+        }
+        return null
+    }
+
+    private fun resolveSpeakerInfo(
         paragraphText: String,
         characters: List<CharacterEntity>,
+        narratorEntity: CharacterEntity?,
         defaultNarratorVoice: String,
         paraLines: List<NarrationLineEntity> = emptyList(),
-        trustNarratorOnlySpans: Boolean = false
-    ): Pair<String, String?> {
+        trustNarratorOnlySpans: Boolean = false,
+        characterPersonalities: Map<String, String> = emptyMap()
+    ): ResolvedSpeakerInfo {
+        fun narratorResult(style: String? = null): ResolvedSpeakerInfo {
+            val narratorPersonality = characterPersonalities["narrator"]?.trim()?.takeIf { it.isNotEmpty() }
+                ?: lookupPersonality(narratorEntity, characterPersonalities)
+            return ResolvedSpeakerInfo(
+                voiceId = defaultNarratorVoice,
+                style = style,
+                speakerName = narratorEntity?.name?.takeIf { it.isNotBlank() } ?: "Narrator",
+                personality = narratorPersonality
+            )
+        }
+
+        fun characterResult(character: CharacterEntity, voiceId: String, style: String?): ResolvedSpeakerInfo =
+            ResolvedSpeakerInfo(
+                voiceId = voiceId,
+                style = style,
+                speakerName = character.name.takeIf { it.isNotBlank() },
+                personality = lookupPersonality(character, characterPersonalities)
+            )
+
         if (paraLines.isNotEmpty()) {
             val nonNarratorSpans = paraLines.filter { !isNarratorSpeakerId(it.speakerId) }
             if (nonNarratorSpans.isNotEmpty()) {
@@ -3345,24 +3437,26 @@ class ReaderNarrationSessionManager @Inject constructor(
                         }
                         .firstOrNull()
                     val resolvedStyle = spanStyle ?: matched?.voiceTraits?.trim()?.ifBlank { null }
-                    if (matchedVoice != null) {
-                        return matchedVoice to resolvedStyle
+                    if (matched != null && matchedVoice != null) {
+                        return characterResult(matched, matchedVoice, resolvedStyle)
                     }
                 }
-            } else if (trustNarratorOnlySpans) {
+            } else {
                 val narratorSpanStyle = paraLines
                     .asSequence()
                     .mapNotNull {
                         it.style?.trim()?.takeIf { s -> s.isNotEmpty() && !s.equals("neutral", ignoreCase = true) }
                     }
                     .firstOrNull()
-                return defaultNarratorVoice to narratorSpanStyle
+                if (trustNarratorOnlySpans || narratorSpanStyle != null) {
+                    return narratorResult(narratorSpanStyle)
+                }
             }
         }
 
-        if (characters.isEmpty()) return defaultNarratorVoice to null
+        if (characters.isEmpty()) return narratorResult()
         val nonNarrators = characters.filterNot { isNarratorCharacter(it) }
-        if (nonNarrators.isEmpty()) return defaultNarratorVoice to null
+        if (nonNarrators.isEmpty()) return narratorResult()
 
         val colonPrefix = COLON_SPEAKER_REGEX.find(paragraphText)?.groupValues?.getOrNull(1)?.trim()
         if (!colonPrefix.isNullOrBlank()) {
@@ -3372,7 +3466,7 @@ class ReaderNarrationSessionManager @Inject constructor(
             }
             val matchVoice = match?.assignedVoiceId?.takeIf { it.isNotBlank() }
             if (match != null && matchVoice != null) {
-                return matchVoice to match.voiceTraits.trim().ifBlank { null }
+                return characterResult(match, matchVoice, match.voiceTraits.trim().ifBlank { null })
             }
         }
 
@@ -3389,7 +3483,7 @@ class ReaderNarrationSessionManager @Inject constructor(
             }?.first
             val reportingVoice = reportingMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
             if (reportingMatch != null && reportingVoice != null) {
-                return reportingVoice to reportingMatch.voiceTraits.trim().ifBlank { null }
+                return characterResult(reportingMatch, reportingVoice, reportingMatch.voiceTraits.trim().ifBlank { null })
             }
 
             val outsideQuotes = stripQuotedSegments(paragraphText)
@@ -3399,7 +3493,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                 }?.first
                 val beatVoice = narrativeBeatMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
                 if (narrativeBeatMatch != null && beatVoice != null) {
-                    return beatVoice to narrativeBeatMatch.voiceTraits.trim().ifBlank { null }
+                    return characterResult(narrativeBeatMatch, beatVoice, narrativeBeatMatch.voiceTraits.trim().ifBlank { null })
                 }
             }
 
@@ -3408,10 +3502,10 @@ class ReaderNarrationSessionManager @Inject constructor(
             }?.first
             val wholeVoice = wholeParaMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
             if (wholeParaMatch != null && wholeVoice != null) {
-                return wholeVoice to wholeParaMatch.voiceTraits.trim().ifBlank { null }
+                return characterResult(wholeParaMatch, wholeVoice, wholeParaMatch.voiceTraits.trim().ifBlank { null })
             }
         }
-        return defaultNarratorVoice to null
+        return narratorResult()
     }
 
     private fun isNarratorSpeakerId(speakerId: String): Boolean {

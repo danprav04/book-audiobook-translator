@@ -76,7 +76,10 @@ data class SpeechChunk(
     val style: String?,
     val paragraphIndices: List<Int> = emptyList(),
     val paragraphCharWeights: List<Int> = emptyList(),
-    val languageCode: String? = null
+    val languageCode: String? = null,
+    val speakerName: String? = null,
+    val characterPersonality: String? = null,
+    val storySummary: String? = null
 )
 
 data class ReaderUiState(
@@ -1211,6 +1214,7 @@ class ReaderViewModel @Inject constructor(
 
             val chapterId = ensureChapterEntityId(targetBookId, state, chapterIndex)
             val scanKey = "$targetBookId::$chapterId"
+            val loadedContext = sessionManager.getBookNarrationContext(targetBookId)
             if (!force) {
                 if (scanKey in aiScannedChapterKeys) return
                 val existingLines = try {
@@ -1218,7 +1222,10 @@ class ReaderViewModel @Inject constructor(
                 } catch (_: Throwable) {
                     emptyList()
                 }
-                if (existingLines.isNotEmpty()) {
+                val needsContextUpgrade = sessionManager.hasDiskCache() &&
+                    chapterIndex !in loadedContext.chapterSummaries &&
+                    existingLines.none { !it.style.isNullOrBlank() }
+                if (existingLines.isNotEmpty() && !needsContextUpgrade) {
                     aiScannedChapterKeys.add(scanKey)
                     return
                 }
@@ -1232,6 +1239,13 @@ class ReaderViewModel @Inject constructor(
 
                 val existingNarrator = existingEntities.firstOrNull { isNarratorEntity(it) }
                 val workingCharacters = existingEntities.map { it.toDomain() }.toMutableList()
+                val workingPersonalities = loadedContext.characterPersonalities.toMutableMap()
+                var rollingSummary = loadedContext.chapterSummaries[chapterIndex - 1]
+                    ?: loadedContext.chapterSummaries.entries
+                        .filter { it.key < chapterIndex }
+                        .maxByOrNull { it.key }
+                        ?.value
+                    ?: loadedContext.storySummary
                 val apiKey = resolveApiKey()
                 val castingService = CastingService()
 
@@ -1257,7 +1271,9 @@ class ReaderViewModel @Inject constructor(
                                 paragraphs = batchTexts,
                                 existingCharacters = workingCharacters,
                                 previousContextParagraphs = rollingContext,
-                                chapterTitle = chapterTitle
+                                chapterTitle = chapterTitle,
+                                previousStorySummary = rollingSummary,
+                                knownPersonalities = workingPersonalities
                             )
                             val responseJson = withContext(ioDispatcher) {
                                 textModelClient.generateContent(
@@ -1273,7 +1289,9 @@ class ReaderViewModel @Inject constructor(
                                 paragraphs = batchTexts,
                                 existingCharacters = workingCharacters,
                                 bookId = targetBookId,
-                                chapterId = chapterId
+                                chapterId = chapterId,
+                                previousStorySummary = rollingSummary,
+                                knownPersonalities = workingPersonalities
                             )
                             val rawIdToSavedId = mutableMapOf<String, String>()
                             val usedIdsLower = workingCharacters.map { it.id.lowercase() }.toMutableSet()
@@ -1367,6 +1385,20 @@ class ReaderViewModel @Inject constructor(
                                         cfi = origPara.cfi
                                     )
                                 )
+                            }
+                            for ((rawCharId, personalityDesc) in result.characterPersonalities) {
+                                val mappedCharId = if (isNarratorSpeakerId(rawCharId)) {
+                                    "narrator"
+                                } else {
+                                    rawIdToSavedId[rawCharId] ?: rawCharId
+                                }
+                                val cleanDesc = personalityDesc.trim()
+                                if (cleanDesc.isNotEmpty()) {
+                                    workingPersonalities[mappedCharId] = cleanDesc
+                                }
+                            }
+                            if (result.storySummary.isNotBlank()) {
+                                rollingSummary = result.storySummary
                             }
                             anyBatchSucceeded = true
                         } catch (e: Exception) {
@@ -1465,6 +1497,20 @@ class ReaderViewModel @Inject constructor(
                 if (finalLines.isNotEmpty() && narrationDao != null && chapterDao.getChapterById(chapterId) != null) {
                     narrationDao.deleteLinesForChapter(chapterId)
                     narrationDao.insertLines(finalLines)
+                }
+                if (anyBatchSucceeded) {
+                    val updatedChapterSummaries = loadedContext.chapterSummaries.toMutableMap()
+                    if (rollingSummary.isNotBlank()) {
+                        updatedChapterSummaries[chapterIndex] = rollingSummary
+                    }
+                    sessionManager.saveBookNarrationContext(
+                        bookId = targetBookId,
+                        context = TranslationDiskCache.BookNarrationContext(
+                            storySummary = rollingSummary.ifBlank { loadedContext.storySummary },
+                            chapterSummaries = updatedChapterSummaries,
+                            characterPersonalities = workingPersonalities.toMap()
+                        )
+                    )
                 }
                 if (anyBatchSucceeded && allBatchesSucceeded) {
                     aiScannedChapterKeys.add(scanKey)
