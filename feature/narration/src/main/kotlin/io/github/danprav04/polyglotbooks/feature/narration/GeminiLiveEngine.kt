@@ -35,6 +35,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.emitAll
@@ -587,81 +589,107 @@ class GeminiLiveEngine(
                     )
                 )
 
-                while (true) {
-                    val stepTimeoutMs = if (!collectedAnyAudio) {
-                        timeoutMs
-                    } else if (sawGenerationComplete) {
-                        minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
-                    } else {
-                        minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
-                    }
-                    val event = withTimeoutOrNull(stepTimeoutMs) {
-                        turnChannel.receive()
-                    }
-                    if (event == null) {
+                coroutineScope {
+                    val firstAudioDeadlineJob = launch {
+                        delay(timeoutMs)
                         if (!collectedAnyAudio) {
-                            timedOut = true
-                            DiagnosticLogBuffer.record(
-                                "GeminiLiveEngine",
-                                "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=false)",
-                                level = "WARN"
-                            )
-                        } else {
-                            idleTimedOutAfterAudio = true
-                            DiagnosticLogBuffer.record(
-                                "GeminiLiveEngine",
-                                "Live turn audio stream went idle after ${stepTimeoutMs}ms without turnComplete (model=$cleanModel, genComplete=$sawGenerationComplete, chars=${request.text.length})",
-                                level = "WARN"
-                            )
+                            turnChannel.trySend(TurnEvent.FirstAudioTimedOut)
                         }
-                        break
                     }
-                    when (event) {
-                        is TurnEvent.AudioChunk -> {
-                            collectedAnyAudio = true
-                            if (bufferedChunks != null) {
-                                bufferedChunks.add(event.chunk)
-                            } else {
-                                emittedAnyAudio = true
-                                emitChunk(event.chunk)
+                    try {
+                        while (true) {
+                            val stepTimeoutMs = when {
+                                sawGenerationComplete -> minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
+                                !collectedAnyAudio -> timeoutMs
+                                else -> minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
                             }
-                        }
-                        is TurnEvent.Transcript -> {
-                            appendTranscriptFragment(transcriptBuilder, event.text)
-                        }
-                        is TurnEvent.GenerationComplete -> {
-                            sawGenerationComplete = true
-                        }
-                        is TurnEvent.TurnComplete -> {
-                            completedTurn = true
-                            break
-                        }
-                        is TurnEvent.TurnInterrupted -> {
-                            interrupted = true
-                            failed = true
-                            break
-                        }
-                        is TurnEvent.ServerError -> {
-                            if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
-                                hardModelError = true
+                            val event = withTimeoutOrNull(stepTimeoutMs) {
+                                turnChannel.receive()
                             }
-                            failed = true
-                            break
-                        }
-                        is TurnEvent.StreamFailed -> {
-                            inferErrorCode(event.error)?.let { code ->
-                                if (code in setOf(400, 401, 403, 404, 429)) {
-                                    hardModelError = true
+                            if (event == null) {
+                                if (!collectedAnyAudio) {
+                                    timedOut = true
+                                    DiagnosticLogBuffer.record(
+                                        "GeminiLiveEngine",
+                                        "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=false, genComplete=$sawGenerationComplete)",
+                                        level = "WARN"
+                                    )
+                                } else {
+                                    idleTimedOutAfterAudio = true
+                                    if (!sawGenerationComplete) {
+                                        DiagnosticLogBuffer.record(
+                                            "GeminiLiveEngine",
+                                            "Live turn audio stream went idle after ${stepTimeoutMs}ms without turnComplete (model=$cleanModel, genComplete=$sawGenerationComplete, chars=${request.text.length})",
+                                            level = "WARN"
+                                        )
+                                    }
                                 }
-                                quotaTracker?.recordHttpError(
-                                    modelId = cleanModel,
-                                    httpCode = code,
-                                    responseBody = event.error.message.orEmpty()
-                                )
+                                break
                             }
-                            failed = true
-                            break
+                            when (event) {
+                                is TurnEvent.AudioChunk -> {
+                                    if (!collectedAnyAudio) {
+                                        collectedAnyAudio = true
+                                        firstAudioDeadlineJob.cancel()
+                                    }
+                                    if (bufferedChunks != null) {
+                                        bufferedChunks.add(event.chunk)
+                                    } else {
+                                        emittedAnyAudio = true
+                                        emitChunk(event.chunk)
+                                    }
+                                }
+                                is TurnEvent.Transcript -> {
+                                    appendTranscriptFragment(transcriptBuilder, event.text)
+                                }
+                                is TurnEvent.GenerationComplete -> {
+                                    sawGenerationComplete = true
+                                }
+                                is TurnEvent.TurnComplete -> {
+                                    completedTurn = true
+                                    break
+                                }
+                                is TurnEvent.FirstAudioTimedOut -> {
+                                    if (!collectedAnyAudio) {
+                                        timedOut = true
+                                        DiagnosticLogBuffer.record(
+                                            "GeminiLiveEngine",
+                                            "Live turn timed out waiting for audio after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, genComplete=$sawGenerationComplete)",
+                                            level = "WARN"
+                                        )
+                                        break
+                                    }
+                                }
+                                is TurnEvent.TurnInterrupted -> {
+                                    interrupted = true
+                                    failed = true
+                                    break
+                                }
+                                is TurnEvent.ServerError -> {
+                                    if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
+                                        hardModelError = true
+                                    }
+                                    failed = true
+                                    break
+                                }
+                                is TurnEvent.StreamFailed -> {
+                                    inferErrorCode(event.error)?.let { code ->
+                                        if (code in setOf(400, 401, 403, 404, 429)) {
+                                            hardModelError = true
+                                        }
+                                        quotaTracker?.recordHttpError(
+                                            modelId = cleanModel,
+                                            httpCode = code,
+                                            responseBody = event.error.message.orEmpty()
+                                        )
+                                    }
+                                    failed = true
+                                    break
+                                }
+                            }
                         }
+                    } finally {
+                        firstAudioDeadlineJob.cancel()
                     }
                 }
             } catch (e: Exception) {
@@ -695,8 +723,15 @@ class GeminiLiveEngine(
 
             val outputTranscript = transcriptBuilder.toString().trim()
             val similarity = if (outputTranscript.isEmpty()) 1.0 else calculateWordOverlapSimilarity(request.text, outputTranscript)
-            val sourceWordCount = countWords(request.text)
-            val outputWordCount = countWords(outputTranscript)
+            val sourceOrderedTokens = tokenizeWordsOrdered(request.text)
+            val outputOrderedTokens = tokenizeWordsOrdered(outputTranscript)
+            val orderedWordCoverage = if (outputTranscript.isEmpty() || sourceOrderedTokens.isEmpty()) {
+                1.0
+            } else {
+                multisetIntersectionSize(sourceOrderedTokens, outputOrderedTokens).toDouble() / sourceOrderedTokens.size.toDouble()
+            }
+            val sourceWordCount = sourceOrderedTokens.size.takeIf { it > 0 } ?: countWords(request.text)
+            val outputWordCount = outputOrderedTokens.size.takeIf { it > 0 } ?: countWords(outputTranscript)
             val excessiveExpansion = !isExpressivePunctuation &&
                 isExcessiveWordExpansion(sourceWordCount, outputWordCount)
             val repeatedPhrase = !isExpressivePunctuation &&
@@ -704,28 +739,32 @@ class GeminiLiveEngine(
                 hasRepeatedSentenceOrPhrase(request.text, outputTranscript)
             val expressiveTranscriptAcceptable = isExpressivePunctuation &&
                 outputWordCount <= 4
-            // The set-based similarity above cannot see a single swallowed/clipped word, so also
-            // require an ordered alignment with no missing source words.
-            val swallowedWords = if (isExpressivePunctuation || outputTranscript.isEmpty()) {
-                0
-            } else {
-                countSwallowedSourceWords(request.text, outputTranscript)
-            }
-            val similarityOk = outputTranscript.isEmpty() ||
-                expressiveTranscriptAcceptable ||
-                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase &&
-                    swallowedWords <= allowedSwallowedWords(sourceWordCount))
+            val audioTruncated = bufferedChunks != null &&
+                isTurnAudioLikelyTruncated(request.text, bufferedChunks, isExpressivePunctuation)
+            val similarityOk = !audioTruncated && (
+                outputTranscript.isEmpty() ||
+                    expressiveTranscriptAcceptable ||
+                    (
+                        similarity >= SIMILARITY_THRESHOLD &&
+                            orderedWordCoverage >= SIMILARITY_THRESHOLD &&
+                            !excessiveExpansion &&
+                            !repeatedPhrase
+                        )
+                )
             if (!similarityOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, swallowed=$swallowedWords) on model=$cleanModel; rotating session",
+                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, coverage=${"%.2f".format(orderedWordCoverage)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, truncated=$audioTruncated) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
             }
 
             if (idleTimedOutAfterAudio && !failed && !interrupted) {
-                if (sawGenerationComplete || outputTranscript.isEmpty() || similarityOk) {
+                // Require either generationComplete or verified non-empty transcript before trusting an idle cutout.
+                if ((sawGenerationComplete || outputTranscript.isNotEmpty()) && similarityOk) {
                     // Server finished streaming audio (and matched transcript/generation) but omitted turnComplete.
+                    // Always rotate after an idle-terminated turn so late trailing frames or turnComplete
+                    // from this turn can never bleed into the next turn on the same WebSocket.
                     completedTurn = true
                     needsRotationFlag.set(true)
                 } else {
@@ -733,17 +772,7 @@ class GeminiLiveEngine(
                 }
             }
 
-            val audioGlitch = bufferedChunks != null && collectedAnyAudio && !isExpressivePunctuation &&
-                completedTurn && !failed &&
-                hasPcmGlitch(bufferedChunks)
-            if (audioGlitch) {
-                DiagnosticLogBuffer.record(
-                    "GeminiLiveEngine",
-                    "Detected mid-speech audio glitch (dropout/click) in Live turn on model=$cleanModel; regenerating",
-                    level = "WARN"
-                )
-            }
-            val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk && !audioGlitch
+            val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk
             if (bufferedChunks != null && turnVerifiedComplete) {
                 val chunksToEmit = if (isExpressivePunctuation) {
                     bufferedChunks
@@ -767,7 +796,7 @@ class GeminiLiveEngine(
                 quotaTracker?.recordSuccess(cleanModel, estimatedTokens)
             }
 
-            val rotateAfterTurn = audioGlitch || failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
+            val rotateAfterTurn = failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
             return TurnOutcome(
                 emittedAnyAudio = emittedAnyAudio,
                 rotateAfterTurn = rotateAfterTurn,
@@ -803,6 +832,7 @@ class GeminiLiveEngine(
         data class Transcript(val text: String) : TurnEvent
         data object GenerationComplete : TurnEvent
         data object TurnComplete : TurnEvent
+        data object FirstAudioTimedOut : TurnEvent
         data object TurnInterrupted : TurnEvent
         data class ServerError(val code: Int, val message: String) : TurnEvent
         data class StreamFailed(val error: Throwable) : TurnEvent
@@ -911,8 +941,9 @@ class GeminiLiveEngine(
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
-        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 1_500L
-        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 1_500L
+        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 750L
+        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_000L
+        private const val MIN_REAL_AUDIO_CHECK_FRAMES = 480L
         private const val MIN_TRIM_DURATION_MS = 300L
         private const val LEAD_SILENCE_THRESHOLD_MS = 180L
         private const val LEAD_KEEP_MS = 60L
@@ -922,8 +953,6 @@ class GeminiLiveEngine(
         private const val EDGE_FADE_OUT_MS = 8L
         private const val SILENCE_AMPLITUDE_THRESHOLD = 300
         private const val LIVE_NARRATION_TEMPERATURE = 0.4f
-        private const val GLITCH_JUMP_THRESHOLD = 16_000
-        private const val GLITCH_EDGE_AMPLITUDE = 1_500
         private val TOKEN_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026]+")
         private val SENTENCE_SPLIT_REGEX = Regex("[.!?\\n]+")
 
@@ -949,137 +978,6 @@ class GeminiLiveEngine(
                     val trimmed = raw.trim { !it.isLetterOrDigit() }
                     trimmed.takeIf { it.isNotEmpty() }
                 }
-        }
-
-        private val WORD_PART_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026\\-/]+")
-
-        /** Number of swallowed source words tolerated for a turn of [sourceWordCount] words. */
-        internal fun allowedSwallowedWords(sourceWordCount: Int): Int =
-            if (sourceWordCount <= 30) 0 else sourceWordCount / 30
-
-        private fun tokenizeForAlignment(text: String): List<String> =
-            tokenizeWordsOrdered(text).flatMap { tok ->
-                tok.split(WORD_PART_SPLIT_REGEX).mapNotNull { part ->
-                    part.trim { !it.isLetterOrDigit() }.takeIf { it.isNotEmpty() }
-                }
-            }
-
-        private fun wordsMatch(a: String, b: String): Boolean {
-            if (a == b) return true
-            val sa = a.replace("'", "")
-            val sb = b.replace("'", "")
-            if (sa == sb) return true
-            val maxLen = maxOf(sa.length, sb.length)
-            if (maxLen < 4) return false
-            if (sa[0] != sb[0]) return false
-            if (kotlin.math.abs(sa.length - sb.length) > 2) return false
-            // Tolerate small ASR spelling differences (names, rare words) but not clipped fragments.
-            return editDistance(sa, sb) <= maxOf(1, maxLen / 4)
-        }
-
-        private fun editDistance(a: String, b: String): Int {
-            var prev = IntArray(b.length + 1) { it }
-            var cur = IntArray(b.length + 1)
-            for (i in 1..a.length) {
-                cur[0] = i
-                for (j in 1..b.length) {
-                    val cost = if (a[i - 1] == b[j - 1]) 0 else 1
-                    cur[j] = minOf(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
-                }
-                val t = prev; prev = cur; cur = t
-            }
-            return prev[b.length]
-        }
-
-        /**
-         * Counts source words that have no in-order counterpart in the spoken [output] transcript
-         * (an ordered alignment, so a single swallowed or clipped word is detected even when the
-         * word appears elsewhere). The last two source words are ignored because the transcript
-         * can still be arriving when the turn completes.
-         */
-        internal fun countSwallowedSourceWords(source: String, output: String): Int {
-            val src = tokenizeForAlignment(source)
-            val out = tokenizeForAlignment(output)
-            if (src.isEmpty()) return 0
-            // Fast path: most turns are an exact in-order subsequence of the transcript.
-            var si = 0
-            for (tok in out) {
-                if (si < src.size && tok == src[si]) si++
-            }
-            if (si == src.size) return 0
-            val n = src.size
-            val m = out.size
-            val dp = Array(n + 1) { IntArray(m + 1) }
-            for (i in 1..n) {
-                for (j in 1..m) {
-                    dp[i][j] = if (wordsMatch(src[i - 1], out[j - 1])) {
-                        dp[i - 1][j - 1] + 1
-                    } else {
-                        maxOf(dp[i - 1][j], dp[i][j - 1])
-                    }
-                }
-            }
-            // Backtrack to find which source words were matched.
-            val matched = BooleanArray(n)
-            var i = n
-            var j = m
-            while (i > 0 && j > 0) {
-                if (wordsMatch(src[i - 1], out[j - 1]) && dp[i][j] == dp[i - 1][j - 1] + 1) {
-                    matched[i - 1] = true
-                    i--; j--
-                } else if (dp[i - 1][j] >= dp[i][j - 1]) {
-                    i--
-                } else {
-                    j--
-                }
-            }
-            val considered = (n - 2).coerceAtLeast(0)
-            var missing = 0
-            for (k in 0 until considered) if (!matched[k]) missing++
-            return missing
-        }
-
-        /**
-         * Detects model-side audio defects inside a buffered 16-bit PCM turn: abrupt waveform
-         * discontinuities (clicks from dropped samples) and short digital-silence dropouts that
-         * begin and end abruptly in loud speech (the "word cut in half / stutter" artifact).
-         * Natural pauses decay smoothly, so they are not flagged.
-         */
-        internal fun hasPcmGlitch(chunks: List<PcmChunk>): Boolean {
-            if (chunks.isEmpty()) return false
-            val channels = chunks.first().channels.coerceAtLeast(1)
-            val sampleRate = chunks.first().sampleRate.takeIf { it > 0 } ?: 24000
-            val bytesPerFrame = channels * 2
-            val total = chunks.sumOf { it.data.size }
-            val frames = total / bytesPerFrame
-            if (frames < 2) return false
-            val pcm = ByteArray(total)
-            var off = 0
-            for (c in chunks) { c.data.copyInto(pcm, off); off += c.data.size }
-            fun at(f: Int): Int {
-                val i = f * bytesPerFrame
-                return (pcm[i + 1].toInt() shl 8) or (pcm[i].toInt() and 0xFF)
-            }
-            val minDropout = (sampleRate * 3 / 1000).coerceAtLeast(2)
-            val maxDropout = sampleRate * 150 / 1000
-            var f = 1
-            while (f < frames) {
-                val prev = at(f - 1)
-                val cur = at(f)
-                if (abs(cur - prev) > GLITCH_JUMP_THRESHOLD) return true
-                if (cur == 0 && abs(prev) > GLITCH_EDGE_AMPLITUDE) {
-                    var end = f
-                    while (end < frames && at(end) == 0) end++
-                    val run = end - f
-                    if (run in minDropout..maxDropout && end < frames && abs(at(end)) > GLITCH_EDGE_AMPLITUDE) {
-                        return true
-                    }
-                    f = end
-                    continue
-                }
-                f++
-            }
-            return false
         }
 
         internal fun isExcessiveWordExpansion(sourceWordCount: Int, outputWordCount: Int): Boolean =
@@ -1293,6 +1191,52 @@ class GeminiLiveEngine(
             } else {
                 request
             }
+        }
+
+        /**
+         * Detects real Live audio buffers that cut off after only a word or two (or emit pure digital
+         * silence) for a multi-word line, even when `outputTranscription` is empty or partial.
+         */
+        internal fun isTurnAudioLikelyTruncated(
+            sourceText: String,
+            chunks: List<PcmChunk>,
+            isExpressivePunctuation: Boolean = false
+        ): Boolean {
+            if (isExpressivePunctuation || chunks.isEmpty()) return false
+            val sampleRate = chunks.first().sampleRate
+            val channels = chunks.first().channels
+            if (sampleRate <= 0 || channels <= 0) return false
+            val bytesPerFrame = channels * 2
+            if (chunks.any {
+                    it.sampleRate != sampleRate ||
+                        it.channels != channels ||
+                        it.data.size % bytesPerFrame != 0
+                }
+            ) {
+                return false
+            }
+
+            val totalFrames = chunks.sumOf { it.data.size.toLong() / bytesPerFrame }
+            if (totalFrames < MIN_REAL_AUDIO_CHECK_FRAMES) {
+                // Keep minimal synthetic test stubs unaffected; real Live audio packets are >= 20 ms.
+                return false
+            }
+
+            val firstActive = findFirstActiveFrame(chunks, channels, bytesPerFrame)
+            if (firstActive < 0L) {
+                return true
+            }
+            val lastActive = findLastActiveFrame(chunks, totalFrames, firstActive, channels, bytesPerFrame)
+            val activeSpanFrames = (lastActive - firstActive + 1L).coerceAtLeast(1L)
+            val activeDurationMs = (activeSpanFrames * 1000L) / sampleRate
+
+            val sourceWordCount = tokenizeWordsOrdered(sourceText).size
+            val cleanLettersDigits = sourceText.count { it.isLetterOrDigit() }
+            if (sourceWordCount < 4 || cleanLettersDigits < 20) {
+                return false
+            }
+            val minExpectedSpeechMs = maxOf(sourceWordCount * 85L, cleanLettersDigits * 18L)
+            return activeDurationMs < minExpectedSpeechMs
         }
 
         /**
