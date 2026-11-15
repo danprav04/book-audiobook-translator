@@ -40,6 +40,7 @@ import io.github.danprav04.polyglotbooks.feature.narration.GeminiLiveEngine
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiLiveEngine.LiveNarrationSession
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiTtsEngine
 import io.github.danprav04.polyglotbooks.feature.narration.SynthesisRequest
+import io.github.danprav04.polyglotbooks.feature.narration.SynthesisSegment
 import io.github.danprav04.polyglotbooks.feature.narration.SystemTtsEngine
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -235,6 +236,9 @@ class ReaderNarrationSessionManager @Inject constructor(
     private var pausedDueToTransientFocusLoss: Boolean = false
 
     private val playbackGenerationId = AtomicLong(0L)
+    private val timelineResetEpoch = AtomicLong(0L)
+    @Volatile
+    private var awaitingNextAudioSinceMs: Long = 0L
     private val pendingPersistJobs = ConcurrentHashMap<String, Job>()
     private val chapterNarrationLinesCache = ConcurrentHashMap<String, List<NarrationLineEntity>>()
     private val bookNarrationContexts = ConcurrentHashMap<String, TranslationDiskCache.BookNarrationContext>()
@@ -817,6 +821,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         val clamped = paragraphIndex.coerceIn(0, state.paragraphs.lastIndex)
         val cfi = state.paragraphs.getOrNull(clamped)?.cfi
         val wasPlaying = state.isPlaying
+        timelineResetEpoch.incrementAndGet()
+        awaitingNextAudioSinceMs = 0L
         _sessionState.update { s ->
             val updated = s.copy(
                 activeParagraphIndex = clamped,
@@ -1245,6 +1251,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
 
         cancelPlaybackJobsOnly()
+        timelineResetEpoch.incrementAndGet()
+        awaitingNextAudioSinceMs = clock()
         val myGeneration = playbackGenerationId.incrementAndGet()
         requestAudioFocusSafely()
         playbackCoordinator?.activateExternalNarration(appContext)
@@ -1520,6 +1528,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                         for (chunkIdx in chunks.indices) {
                             if (!isCurrentGen()) break
                             val chunk = chunks[chunkIdx]
+                            awaitingNextAudioSinceMs = clock()
                             val prefetched = takePrefetchedIfMatches(chunkIdx)
                             if (!isCurrentGen()) break
                             lastWrittenCfiForChapter = chunk.allCfis.lastOrNull() ?: chunk.leadCfi
@@ -1619,6 +1628,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                         }
                                         pushExternalState()
                                     }
+                                    awaitingNextAudioSinceMs = 0L
                                     if (player.supportsFrameTracking) {
                                         activeTracksFrames = true
                                     }
@@ -1653,6 +1663,15 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 }
                                             }
                                         },
+                                        liveSessionProvider = { ensureLiveSession(trackedFallback) },
+                                        onLiveSessionError = {
+                                            val stale = streamingLiveSession
+                                            streamingLiveSession = null
+                                            try {
+                                                withContext(NonCancellable) { stale?.close() }
+                                            } catch (_: Throwable) {
+                                            }
+                                        },
                                         onPcmChunk = { pcm -> writeSingleParaPcm(pcm) }
                                     )
                                 }
@@ -1664,6 +1683,9 @@ class ReaderNarrationSessionManager @Inject constructor(
                                     )
                                     timelineSpans[spanIndex] = closed
                                     applyMeasuredDurationToSpans(chapterIdx, listOf(closed))
+                                }
+                                if (batchTotalBytes > 0 && isCurrentGen()) {
+                                    player.onUtteranceEnd()
                                 }
                             } else {
                                 // Multi-paragraph batch: collect PCM first so boundaries snap cleanly to silence valleys.
@@ -1692,6 +1714,15 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                     if (playbackGenerationId.get() != myGeneration) it
                                                     else it.copy(statusMessage = status)
                                                 }
+                                            }
+                                        },
+                                        liveSessionProvider = { ensureLiveSession(trackedFallback) },
+                                        onLiveSessionError = {
+                                            val stale = streamingLiveSession
+                                            streamingLiveSession = null
+                                            try {
+                                                withContext(NonCancellable) { stale?.close() }
+                                            } catch (_: Throwable) {
                                             }
                                         },
                                         onPcmChunk = { pcm ->
@@ -1731,16 +1762,19 @@ class ReaderNarrationSessionManager @Inject constructor(
                                         }
                                         pushExternalState()
                                     }
+                                    awaitingNextAudioSinceMs = 0L
                                     if (player.supportsFrameTracking && batchSpans.isNotEmpty()) {
                                         activeTracksFrames = true
                                     }
                                     maybeScheduleNextFlashPrefetch()
                                     player.write(PcmChunk(batchBytes, batchSampleRate, batchChannels))
+                                    player.onUtteranceEnd()
                                     if (player.supportsFrameTracking || player.totalFramesWritten > 0L || player.playbackHeadPositionFrames() > 0L) {
                                         activeTracksFrames = true
                                     }
                                 }
                             }
+                            awaitingNextAudioSinceMs = if (chunkIdx < chunks.lastIndex) clock() else 0L
 
                             if (!activeTracksFrames && batchTotalBytes > 0 && batchSampleRate > 0 && batchChannels > 0) {
                                 val measuredMs = (batchTotalBytes * 1000L) / (batchSampleRate * batchChannels * 2L)
@@ -1781,7 +1815,6 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                     )
                                                 )
                                             } else {
-                                                val session = ensureLiveSession(trackedFallback)
                                                 val pcmBuf = ByteArrayOutputStream()
                                                 var sr = 24000
                                                 var ch = 1
@@ -1789,6 +1822,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 val thisTurnFallback = AtomicBoolean(false)
                                                 activeTurnFallbackFlag.set(thisTurnFallback)
                                                 try {
+                                                    val session = ensureLiveSession(trackedFallback)
                                                     session.synthesizeTurnStreaming(req).collect { pcm ->
                                                         if (pcm.data.isNotEmpty()) {
                                                             emitted = true
@@ -1815,6 +1849,29 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                                     pcmBytes = bytes,
                                                                     maxBytes = maxCacheBytes
                                                                 )
+                                                            }
+                                                        }
+                                                    }
+                                                } catch (ce: CancellationException) {
+                                                    throw ce
+                                                } catch (e: Exception) {
+                                                    DiagnosticLogBuffer.record(
+                                                        tag = "ReaderSession",
+                                                        message = "Live streaming turn failed at para=${chunk.leadIndex}; recovering via fallback",
+                                                        level = "WARN",
+                                                        throwable = e
+                                                    )
+                                                    val stale = streamingLiveSession
+                                                    streamingLiveSession = null
+                                                    try {
+                                                        withContext(NonCancellable) { stale?.close() }
+                                                    } catch (_: Throwable) {
+                                                    }
+                                                    if (!emitted) {
+                                                        trackedFallback.synthesize(req).collect { pcm ->
+                                                            if (pcm.data.isNotEmpty()) {
+                                                                emitted = true
+                                                                events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
                                                             }
                                                         }
                                                     }
@@ -1845,6 +1902,9 @@ class ReaderNarrationSessionManager @Inject constructor(
                                             turnTotalBytes = 0
                                             turnSampleRate = configuredSampleRate
                                             turnChannels = configuredChannels
+                                            if (awaitingNextAudioSinceMs == 0L) {
+                                                awaitingNextAudioSinceMs = clock()
+                                            }
                                             val timings = _sessionState.value.paragraphTimings
                                             val timing = timings.firstOrNull { it.paragraphIndex == chunk.leadIndex }
                                             val startChapterMs = timing?.startMs ?: _sessionState.value.chapterPositionMs
@@ -1916,6 +1976,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 }
                                                 pushExternalState()
                                             }
+                                            awaitingNextAudioSinceMs = 0L
                                             if (player.supportsFrameTracking && activeSpanIdx in timelineSpans.indices) {
                                                 activeTracksFrames = true
                                             }
@@ -1936,22 +1997,28 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 timelineSpans[activeSpanIdx] = closed
                                                 applyMeasuredDurationToSpans(chapterIdx, listOf(closed))
                                             }
+                                            if (turnTotalBytes > 0) {
+                                                player.onUtteranceEnd()
+                                            }
                                             if (!activeTracksFrames && turnTotalBytes > 0 && turnSampleRate > 0 && turnChannels > 0) {
                                                 val measuredMs = (turnTotalBytes * 1000L) / (turnSampleRate * turnChannels * 2L)
                                                 if (measuredMs > 0L) {
                                                     applyMeasuredDurationToChunk(ev.chunk, measuredMs)
                                                 }
                                             }
+                                            awaitingNextAudioSinceMs = if (ev.chunkIdx < chunks.lastIndex) clock() else 0L
                                             turnCredits.release()
                                         }
                                     }
                                 }
                             } finally {
+                                awaitingNextAudioSinceMs = 0L
                                 producerJob.cancel()
                             }
                         }
                     }
 
+                    awaitingNextAudioSinceMs = 0L
                     if (!isCurrentGen()) break
 
                     // Drain buffered audio cleanly before transitioning to next chapter or completing book.
@@ -2081,11 +2148,36 @@ class ReaderNarrationSessionManager @Inject constructor(
         tickerJob = applicationScope.launch {
             var lastPersistedPara = -1
             var lastPersistWallMs = clock()
+            var highWaterResetEpoch = timelineResetEpoch.get()
+            var highWaterChapterIdx = _sessionState.value.currentChapterIndex
+            var highWaterChapterPosMs = _sessionState.value.chapterPositionMs
             while (isActive && playbackGenerationId.get() == generation) {
                 delay(60L)
                 if (!isActive || playbackGenerationId.get() != generation) break
                 val state = _sessionState.value
                 if (!state.isPlaying) continue
+
+                val currentResetEpoch = timelineResetEpoch.get()
+                if (currentResetEpoch != highWaterResetEpoch || state.currentChapterIndex != highWaterChapterIdx) {
+                    highWaterResetEpoch = currentResetEpoch
+                    highWaterChapterIdx = state.currentChapterIndex
+                    highWaterChapterPosMs = state.chapterPositionMs
+                }
+
+                // Surface buffering indicator promptly whenever hardware audio drains while awaiting
+                // the next turn (even when Turn N+1's BeginTurn raced ahead of hardware drain).
+                val pendingSince = awaitingNextAudioSinceMs
+                val waitingForNextTurnAudio = player.supportsFrameTracking &&
+                    pendingSince > 0L &&
+                    player.bufferedMs <= 0L &&
+                    (clock() - pendingSince >= 150L)
+                if (waitingForNextTurnAudio && !state.isBuffering) {
+                    _sessionState.update { s ->
+                        if (playbackGenerationId.get() != generation || s.currentChapterIndex != state.currentChapterIndex) s
+                        else s.copy(isBuffering = true)
+                    }
+                    pushExternalState()
+                }
 
                 if (activeTracksFrames) {
                     (player as? AudioTrackPcmPlayer)?.refreshPosition()
@@ -2094,7 +2186,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                     val chapterSpans = timelineSpans.filter { it.chapterIndex == chapterIdx }
                     if (chapterSpans.isEmpty()) continue
 
-                    val activeSpan = chapterSpans.firstOrNull { span ->
+                    val candidateSpan = chapterSpans.firstOrNull { span ->
                         headFrame >= span.startFrame && headFrame < span.endFrame
                     } ?: if (headFrame < chapterSpans.first().startFrame) {
                         chapterSpans.first()
@@ -2102,48 +2194,77 @@ class ReaderNarrationSessionManager @Inject constructor(
                         chapterSpans.last()
                     }
 
+                    val drainedToEnd = !candidateSpan.isOpen &&
+                        player.bufferedMs <= 0L &&
+                        (candidateSpan.endFrame - headFrame) in 1L..256L
+                    val nextSpan = if (drainedToEnd) {
+                        chapterSpans.firstOrNull { it.startFrame >= candidateSpan.endFrame && it !== candidateSpan }
+                    } else {
+                        null
+                    }
+                    val activeSpan = nextSpan ?: candidateSpan
+
                     val inSpanMs = if (!activeSpan.isOpen) {
                         val spanFrames = (activeSpan.endFrame - activeSpan.startFrame).coerceAtLeast(1L)
                         val frac = ((headFrame - activeSpan.startFrame).toDouble() / spanFrames.toDouble()).coerceIn(0.0, 1.0)
                         (frac * activeSpan.measuredDurationMs).toLong()
                     } else {
-                        val streamedMs = if (activeSpan.sampleRate > 0) {
+                        if (activeSpan.sampleRate > 0) {
                             ((headFrame - activeSpan.startFrame).coerceAtLeast(0L) * 1000L) / activeSpan.sampleRate
                         } else {
                             0L
                         }
-                        streamedMs.coerceIn(0L, activeSpan.estimatedDurationMs)
                     }
 
                     val timingStart = state.paragraphTimings
                         .firstOrNull { it.paragraphIndex == activeSpan.paragraphIndex }
                         ?.startMs ?: activeSpan.chapterStartMs
 
+                    val advancePastCompletedPara = drainedToEnd &&
+                        nextSpan == null &&
+                        waitingForNextTurnAudio &&
+                        activeSpan === chapterSpans.last()
+
                     _sessionState.update { s ->
                         if (playbackGenerationId.get() != generation || s.currentChapterIndex != chapterIdx) return@update s
-                        val newChapterPos = (timingStart + inSpanMs).coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        val rawChapterPos = (timingStart + inSpanMs).coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        val isContinuous = currentResetEpoch == highWaterResetEpoch && s.currentChapterIndex == highWaterChapterIdx
+                        val newChapterPos = if (isContinuous) {
+                            maxOf(highWaterChapterPosMs, s.chapterPositionMs, rawChapterPos)
+                                .coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        } else {
+                            rawChapterPos
+                        }
+                        highWaterChapterPosMs = newChapterPos
                         val newBookPos = (computeChapterStartInBookMs(s) + newChapterPos).coerceIn(0L, maxOf(1L, s.bookDurationMs))
+                        val targetPara = if (advancePastCompletedPara) {
+                            (activeSpan.paragraphIndex + 1).coerceIn(0, maxOf(0, s.paragraphs.lastIndex))
+                        } else {
+                            activeSpan.paragraphIndex.coerceIn(0, maxOf(0, s.paragraphs.lastIndex))
+                        }
+                        val targetCfi = s.paragraphs.getOrNull(targetPara)?.cfi ?: activeSpan.cfi
                         s.copy(
-                            activeParagraphIndex = activeSpan.paragraphIndex.coerceIn(0, maxOf(0, s.paragraphs.lastIndex)),
-                            highlightedCfi = activeSpan.cfi,
+                            activeParagraphIndex = targetPara,
+                            highlightedCfi = targetCfi,
                             chapterPositionMs = newChapterPos,
                             bookPositionMs = newBookPos
                         )
                     }
                     pushExternalState()
 
+                    val updatedState = _sessionState.value
                     val now = clock()
-                    if (activeSpan.paragraphIndex != lastPersistedPara || now - lastPersistWallMs >= 2_000L) {
-                        lastPersistedPara = activeSpan.paragraphIndex
+                    if (updatedState.activeParagraphIndex != lastPersistedPara || now - lastPersistWallMs >= 2_000L) {
+                        val persistCfi = updatedState.highlightedCfi ?: activeSpan.cfi
+                        lastPersistedPara = updatedState.activeParagraphIndex
                         lastPersistWallMs = now
-                        persistCurrentProgress(state.bookId, activeSpan.cfi)
+                        persistCurrentProgress(state.bookId, persistCfi)
                     }
                 } else {
                     val ctx = activeChunkContext ?: continue
                     val currentPlayerPosMs = (ctx.player as? AudioTrackPcmPlayer)?.refreshPosition()
                         ?: ctx.player.currentPositionMs.value
-                    val chunkElapsedMs = (currentPlayerPosMs - ctx.playerStartPosMs)
-                        .coerceIn(0L, ctx.chunkEstimatedMs)
+                    val chunkElapsedMs = (currentPlayerPosMs - ctx.playerStartPosMs).coerceAtLeast(0L)
 
                     val subWeights = ctx.chunk.paragraphCharWeights
                     var subIdxOffset = 0
@@ -2166,7 +2287,15 @@ class ReaderNarrationSessionManager @Inject constructor(
 
                     _sessionState.update { s ->
                         if (playbackGenerationId.get() != generation || s.currentChapterIndex != ctx.chapterIndex) return@update s
-                        val newChapterPos = (ctx.chapterStartMs + chunkElapsedMs).coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        val rawChapterPos = (ctx.chapterStartMs + chunkElapsedMs).coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        val isContinuous = currentResetEpoch == highWaterResetEpoch && s.currentChapterIndex == highWaterChapterIdx
+                        val newChapterPos = if (isContinuous) {
+                            maxOf(highWaterChapterPosMs, s.chapterPositionMs, rawChapterPos)
+                                .coerceIn(0L, maxOf(1L, s.chapterDurationMs))
+                        } else {
+                            rawChapterPos
+                        }
+                        highWaterChapterPosMs = newChapterPos
                         val newBookPos = (ctx.chapterStartInBookMs + newChapterPos).coerceIn(0L, maxOf(1L, s.bookDurationMs))
                         s.copy(
                             activeParagraphIndex = resolvedParaIdx.coerceIn(0, maxOf(0, s.paragraphs.lastIndex)),
@@ -2296,8 +2425,8 @@ class ReaderNarrationSessionManager @Inject constructor(
             ?: state.chapters.getOrNull(clampedIndex)?.cfiRange
             ?: defaultChapterCfi(clampedIndex, state.bookFormat.equals("PDF", ignoreCase = true))
 
+        timelineResetEpoch.incrementAndGet()
         _sessionState.update { s ->
-            if (generation != null && playbackGenerationId.get() != generation) return@update s
             val updated = s.copy(
                 extractedBook = extracted ?: s.extractedBook,
                 currentChapterIndex = clampedIndex,
@@ -2354,8 +2483,17 @@ class ReaderNarrationSessionManager @Inject constructor(
             languageCode = chunk.languageCode,
             speakerName = chunk.speakerName,
             characterPersonality = chunk.characterPersonality,
-            storySummary = chunk.storySummary
+            storySummary = chunk.storySummary,
+            segments = chunk.segments
         )
+
+    private data class QueuedSpeechItem(
+        val para: ReaderParagraph,
+        val spokenText: String,
+        val style: String?,
+        val speakerName: String?,
+        val personality: String?
+    )
 
     internal fun buildSpeechChunks(
         paragraphs: List<ReaderParagraph>,
@@ -2389,11 +2527,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
 
         val result = mutableListOf<SpeechChunk>()
-        var currentGroup = mutableListOf<Pair<ReaderParagraph, String>>()
-        var currentVoice = ""
-        var currentStyle: String? = null
-        var currentSpeakerName: String? = null
-        var currentPersonality: String? = null
+        var currentGroup = mutableListOf<QueuedSpeechItem>()
         var currentChars = 0
 
         fun weightedInt(text: String): Int =
@@ -2401,21 +2535,34 @@ class ReaderNarrationSessionManager @Inject constructor(
 
         fun flushGroup() {
             if (currentGroup.isEmpty()) return
-            val lead = currentGroup.first().first
+            val leadItem = currentGroup.first()
+            val segments = if (currentGroup.size > 1) {
+                currentGroup.map { item ->
+                    SynthesisSegment(
+                        text = item.spokenText,
+                        style = item.style,
+                        speakerName = item.speakerName,
+                        characterPersonality = item.personality
+                    )
+                }
+            } else {
+                emptyList()
+            }
             result.add(
                 SpeechChunk(
-                    text = currentGroup.joinToString("\n") { it.second },
-                    leadCfi = lead.cfi,
-                    allCfis = currentGroup.map { it.first.cfi },
-                    leadIndex = lead.index,
-                    voiceId = currentVoice,
-                    style = currentStyle,
-                    paragraphIndices = currentGroup.map { it.first.index },
-                    paragraphCharWeights = currentGroup.map { weightedInt(it.second) },
+                    text = currentGroup.joinToString("\n") { it.spokenText },
+                    leadCfi = leadItem.para.cfi,
+                    allCfis = currentGroup.map { it.para.cfi },
+                    leadIndex = leadItem.para.index,
+                    voiceId = narratorVoice,
+                    style = leadItem.style,
+                    paragraphIndices = currentGroup.map { it.para.index },
+                    paragraphCharWeights = currentGroup.map { weightedInt(it.spokenText) },
                     languageCode = languageCode,
-                    speakerName = currentSpeakerName,
-                    characterPersonality = currentPersonality,
-                    storySummary = cleanStorySummary
+                    speakerName = leadItem.speakerName,
+                    characterPersonality = leadItem.personality,
+                    storySummary = cleanStorySummary,
+                    segments = segments
                 )
             )
             currentGroup = mutableListOf()
@@ -2434,7 +2581,6 @@ class ReaderNarrationSessionManager @Inject constructor(
                 trustNarratorOnlySpans = chapterHasAttributedSpeakers,
                 characterPersonalities = characterPersonalities
             )
-            val voiceId = resolvedSpeaker.voiceId
             val baseStyle = resolvedSpeaker.style ?: inferStructuralStyleFallback(spokenText)
             val resolvedPunct = PunctuationDialogueHelper.resolve(spokenText, baseStyle)
             val style = resolvedPunct.styleCue ?: baseStyle
@@ -2448,7 +2594,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                         leadCfi = para.cfi,
                         allCfis = listOf(para.cfi),
                         leadIndex = para.index,
-                        voiceId = voiceId,
+                        voiceId = narratorVoice,
                         style = style,
                         paragraphIndices = listOf(para.index),
                         paragraphCharWeights = listOf(weightedInt(spokenText)),
@@ -2461,23 +2607,22 @@ class ReaderNarrationSessionManager @Inject constructor(
                 continue
             }
 
+            // Use a smaller initial Flash TTS batch (<= 450 chars) so playback begins rapidly
+            // while subsequent batches prefetch at full 1,000-char single-voice throughput.
+            val batchCapChars = if (result.isEmpty()) minOf(maxChars, 450) else maxChars
             val separatorLen = if (currentGroup.isEmpty()) 0 else 1
-            val wouldExceed = currentGroup.isNotEmpty() && (
-                voiceId != currentVoice ||
-                    style != currentStyle ||
-                    resolvedSpeaker.speakerName != currentSpeakerName ||
-                    currentChars + separatorLen + spokenText.length > maxChars
-                )
-            if (wouldExceed) {
+            if (currentGroup.isNotEmpty() && currentChars + separatorLen + spokenText.length > batchCapChars) {
                 flushGroup()
             }
-            if (currentGroup.isEmpty()) {
-                currentVoice = voiceId
-                currentStyle = style
-                currentSpeakerName = resolvedSpeaker.speakerName
-                currentPersonality = resolvedSpeaker.personality
-            }
-            currentGroup.add(para to spokenText)
+            currentGroup.add(
+                QueuedSpeechItem(
+                    para = para,
+                    spokenText = spokenText,
+                    style = style,
+                    speakerName = resolvedSpeaker.speakerName,
+                    personality = resolvedSpeaker.personality
+                )
+            )
             currentChars += separatorLen + spokenText.length
         }
         flushGroup()
@@ -2493,6 +2638,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         ttsAlreadyFailed: Boolean,
         onTtsFailed: () -> Unit,
         onStatusUpdate: (String) -> Unit,
+        liveSessionProvider: (suspend () -> LiveNarrationSession)? = null,
+        onLiveSessionError: (suspend () -> Unit)? = null,
         onPcmChunk: suspend (PcmChunk) -> Unit
     ) {
         // Apply playback speed uniformly on PcmPlayer; pass speed = 1.0f to all synthesis engines.
@@ -2571,6 +2718,62 @@ class ReaderNarrationSessionManager @Inject constructor(
             if (cachedLive != null) {
                 onPcmChunk(PcmChunk(cachedLive.pcmBytes, cachedLive.sampleRate, cachedLive.channels))
                 return
+            }
+
+            if (liveSessionProvider != null) {
+                val pcmBuf = ByteArrayOutputStream()
+                var sr = 24000
+                var ch = 1
+                var emitted = false
+                var usedSessionFallback = false
+                try {
+                    val session = liveSessionProvider()
+                    session.synthesizeTurnStreaming(request).collect { pcm ->
+                        if (pcm.data.isNotEmpty()) {
+                            emitted = true
+                            sr = pcm.sampleRate
+                            ch = pcm.channels
+                            pcmBuf.write(pcm.data)
+                            onPcmChunk(pcm)
+                        }
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (e: Exception) {
+                    DiagnosticLogBuffer.record(
+                        tag = "ReaderSession",
+                        message = "Persistent Live fallback failed at para=${chunk.leadIndex}; recovering via device TTS",
+                        level = "WARN",
+                        throwable = e
+                    )
+                    onLiveSessionError?.invoke()
+                    if (!emitted) {
+                        usedSessionFallback = true
+                        onStatusUpdate("Using device TTS fallback (Gemini unavailable)")
+                        systemFallback.synthesize(request).collect { pcm ->
+                            if (pcm.data.isNotEmpty()) {
+                                emitted = true
+                                onPcmChunk(pcm)
+                            }
+                        }
+                    }
+                }
+                if (emitted && !usedSessionFallback) {
+                    val bytes = pcmBuf.toByteArray()
+                    diskCache?.saveAudioSegment(
+                        engineTag = liveTag,
+                        voiceId = chunk.voiceId,
+                        style = chunk.style,
+                        text = chunk.text,
+                        sampleRate = sr,
+                        channels = ch,
+                        pcmBytes = bytes,
+                        maxBytes = maxCacheBytes
+                    )
+                    recordAudioUsage(isLive = true, byteCount = bytes.size, sampleRate = sr, channels = ch)
+                    return
+                }
+                if (emitted) return
             }
 
             val playedViaLive = runGeminiLiveWithTracking(
@@ -2688,15 +2891,34 @@ class ReaderNarrationSessionManager @Inject constructor(
         var channels = 1
         var emitted = false
 
-        liveEngine.synthesize(request).collect { pcm ->
-            if (pcm.data.isNotEmpty()) {
-                emitted = true
-                sampleRate = pcm.sampleRate
-                channels = pcm.channels
-                if (!usedFallback) {
-                    pcmBuffer.write(pcm.data)
+        try {
+            liveEngine.synthesize(request).collect { pcm ->
+                if (pcm.data.isNotEmpty()) {
+                    emitted = true
+                    sampleRate = pcm.sampleRate
+                    channels = pcm.channels
+                    if (!usedFallback) {
+                        pcmBuffer.write(pcm.data)
+                    }
+                    onPcmChunk(pcm)
                 }
-                onPcmChunk(pcm)
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            DiagnosticLogBuffer.record(
+                tag = "ReaderSession",
+                message = "Gemini Live synthesis failed at para=${chunk.leadIndex}; recovering via fallback",
+                level = "WARN",
+                throwable = e
+            )
+            if (!emitted) {
+                trackedFallback.synthesize(request).collect { pcm ->
+                    if (pcm.data.isNotEmpty()) {
+                        emitted = true
+                        onPcmChunk(pcm)
+                    }
+                }
             }
         }
 
@@ -3406,9 +3628,9 @@ class ReaderNarrationSessionManager @Inject constructor(
             )
         }
 
-        fun characterResult(character: CharacterEntity, voiceId: String, style: String?): ResolvedSpeakerInfo =
+        fun characterResult(character: CharacterEntity, style: String?): ResolvedSpeakerInfo =
             ResolvedSpeakerInfo(
-                voiceId = voiceId,
+                voiceId = defaultNarratorVoice,
                 style = style,
                 speakerName = character.name.takeIf { it.isNotBlank() },
                 personality = lookupPersonality(character, characterPersonalities)
@@ -3428,7 +3650,6 @@ class ReaderNarrationSessionManager @Inject constructor(
                 val dominantSpeakerId = lengthsBySpeaker.maxByOrNull { it.value }?.key
                 if (dominantSpeakerId != null) {
                     val matched = findCharacterBySpeakerId(dominantSpeakerId, characters)
-                    val matchedVoice = matched?.assignedVoiceId?.takeIf { it.isNotBlank() }
                     val spanStyle = nonNarratorSpans
                         .asSequence()
                         .filter { it.speakerId.trim().equals(dominantSpeakerId, ignoreCase = true) }
@@ -3437,8 +3658,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                         }
                         .firstOrNull()
                     val resolvedStyle = spanStyle ?: matched?.voiceTraits?.trim()?.ifBlank { null }
-                    if (matched != null && matchedVoice != null) {
-                        return characterResult(matched, matchedVoice, resolvedStyle)
+                    if (matched != null) {
+                        return characterResult(matched, resolvedStyle)
                     }
                 }
             } else {
@@ -3464,9 +3685,8 @@ class ReaderNarrationSessionManager @Inject constructor(
                 char.name.trim().equals(colonPrefix, ignoreCase = true) ||
                     parseAliasesString(char.aliases).any { alias -> alias.equals(colonPrefix, ignoreCase = true) }
             }
-            val matchVoice = match?.assignedVoiceId?.takeIf { it.isNotBlank() }
-            if (match != null && matchVoice != null) {
-                return characterResult(match, matchVoice, match.voiceTraits.trim().ifBlank { null })
+            if (match != null) {
+                return characterResult(match, match.voiceTraits.trim().ifBlank { null })
             }
         }
 
@@ -3481,9 +3701,8 @@ class ReaderNarrationSessionManager @Inject constructor(
             val reportingMatch = candidatesWithTerms.firstOrNull { (_, terms) ->
                 terms.any { term -> hasReportingAttribution(paragraphText, term) }
             }?.first
-            val reportingVoice = reportingMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
-            if (reportingMatch != null && reportingVoice != null) {
-                return characterResult(reportingMatch, reportingVoice, reportingMatch.voiceTraits.trim().ifBlank { null })
+            if (reportingMatch != null) {
+                return characterResult(reportingMatch, reportingMatch.voiceTraits.trim().ifBlank { null })
             }
 
             val outsideQuotes = stripQuotedSegments(paragraphText)
@@ -3491,18 +3710,16 @@ class ReaderNarrationSessionManager @Inject constructor(
                 val narrativeBeatMatch = candidatesWithTerms.firstOrNull { (_, terms) ->
                     terms.any { term -> containsWholeTerm(outsideQuotes, term) }
                 }?.first
-                val beatVoice = narrativeBeatMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
-                if (narrativeBeatMatch != null && beatVoice != null) {
-                    return characterResult(narrativeBeatMatch, beatVoice, narrativeBeatMatch.voiceTraits.trim().ifBlank { null })
+                if (narrativeBeatMatch != null) {
+                    return characterResult(narrativeBeatMatch, narrativeBeatMatch.voiceTraits.trim().ifBlank { null })
                 }
             }
 
             val wholeParaMatch = candidatesWithTerms.firstOrNull { (_, terms) ->
                 terms.any { term -> containsWholeTerm(paragraphText, term) }
             }?.first
-            val wholeVoice = wholeParaMatch?.assignedVoiceId?.takeIf { it.isNotBlank() }
-            if (wholeParaMatch != null && wholeVoice != null) {
-                return characterResult(wholeParaMatch, wholeVoice, wholeParaMatch.voiceTraits.trim().ifBlank { null })
+            if (wholeParaMatch != null) {
+                return characterResult(wholeParaMatch, wholeParaMatch.voiceTraits.trim().ifBlank { null })
             }
         }
         return narratorResult()

@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
@@ -1416,7 +1417,7 @@ class ReaderNarrationSessionManagerTest {
     }
 
     @Test
-    fun `buildSpeechChunks isolates silent dividers and expressive punctuation dialogue cleanly from prose batches`() {
+    fun `buildSpeechChunks isolates silent dividers and punctuation-only dialogue cleanly from prose batches`() {
         val manager = ReaderNarrationSessionManager(
             bookDao = FakeBookDao(),
             chapterDao = FakeChapterDao(),
@@ -1435,7 +1436,7 @@ class ReaderNarrationSessionManagerTest {
         assertEquals(null, chunks[0].style)
 
         assertEquals("\"......?\"", chunks[1].text)
-        assertTrue(chunks[1].style.orEmpty().contains("puzzled", ignoreCase = true))
+        assertEquals(null, chunks[1].style)
 
         assertEquals("* * *", chunks[2].text)
         assertEquals(null, chunks[2].style)
@@ -1678,10 +1679,13 @@ class ReaderNarrationSessionManagerTest {
             assertEquals("Sulafat", capturingEngine.requests[0].voiceId)
             assertEquals("calm", capturingEngine.requests[0].style)
 
-            assertEquals("Zephyr", capturingEngine.requests[1].voiceId)
+            // Single-voice mode keeps the narrator voice consistent while still passing character delivery cues.
+            assertEquals("Sulafat", capturingEngine.requests[1].voiceId)
+            assertEquals("Alice", capturingEngine.requests[1].speakerName)
             assertEquals("whispering", capturingEngine.requests[1].style)
 
-            assertEquals("Fenrir", capturingEngine.requests[2].voiceId)
+            assertEquals("Sulafat", capturingEngine.requests[2].voiceId)
+            assertEquals("Bob", capturingEngine.requests[2].speakerName)
             assertEquals("gruff", capturingEngine.requests[2].style)
         } finally {
             tempDir.deleteRecursively()
@@ -1716,10 +1720,14 @@ class ReaderNarrationSessionManagerTest {
         )
 
         assertEquals(4, chunks.size)
-        assertEquals("Sulafat", chunks[0].voiceId)
-        assertEquals("Kore", chunks[1].voiceId)
-        assertEquals("Puck", chunks[2].voiceId)
-        assertEquals("Orus", chunks[3].voiceId)
+        assertTrue(chunks.all { it.voiceId == "Sulafat" })
+        assertEquals("Narrator", chunks[0].speakerName)
+        assertEquals("Elena", chunks[1].speakerName)
+        assertEquals("poised", chunks[1].style)
+        assertEquals("Al", chunks[2].speakerName)
+        assertEquals("brisk", chunks[2].style)
+        assertEquals("太郎", chunks[3].speakerName)
+        assertEquals("bright", chunks[3].style)
     }
 
     @Test
@@ -1902,25 +1910,104 @@ class ReaderNarrationSessionManagerTest {
             advanceUntilIdle()
 
             assertNull(manager.sessionState.value.errorMessage)
-            assertEquals(3, sessionRecords.size)
+            // Single-voice continuity keeps ONE persistent Live WebSocket across all 5 paragraphs
+            // instead of disconnecting/reconnecting whenever character style or speaker changes.
+            assertEquals(1, sessionRecords.size)
 
-            val aliceSession = sessionRecords[0]
-            assertTrue(aliceSession.systemInstruction.contains("Alice"))
-            assertTrue(aliceSession.systemInstruction.contains("Calm under pressure"))
-            assertTrue(aliceSession.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
-            assertFalse(aliceSession.systemInstruction.contains("Later chapter spoiler."))
-            assertTrue(aliceSession.systemInstruction.contains("quiet, urgent command"))
-            assertEquals(1, aliceSession.prompts.size)
+            val session = sessionRecords[0]
+            assertTrue(session.systemInstruction.contains("Alice"))
+            assertTrue(session.systemInstruction.contains("Calm under pressure"))
+            assertTrue(session.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
+            assertFalse(session.systemInstruction.contains("Later chapter spoiler."))
+            assertTrue(session.systemInstruction.contains("quiet, urgent command"))
+            assertEquals(allTexts, session.prompts)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 
-            val systemNoticeSession = sessionRecords[1]
-            assertTrue(systemNoticeSession.systemInstruction.contains("crisp, detached system announcement"))
-            assertTrue(systemNoticeSession.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
-            assertEquals(1, systemNoticeSession.prompts.size)
+    @Test
+    fun `flash tts single-voice batching includes character acting cues via speechMetadata without speaking Say as`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-flash-single-voice").toFile()
+        try {
+            val bookId = "book-flash-single"
+            val capturedRequests = mutableListOf<TtsRequest>()
+            val pcm = ByteArray(2400) { 0x12 }
 
-            val narratorSeriesSession = sessionRecords[2]
-            assertTrue(narratorSeriesSession.systemInstruction.contains("Grave, atmospheric storyteller."))
-            assertTrue(narratorSeriesSession.systemInstruction.contains("tense, measured dread"))
-            assertEquals(3, narratorSeriesSession.prompts.size)
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = pcm
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> {
+                    capturedRequests += request
+                    return flowOf(PcmChunk(pcm, 24000, 1))
+                }
+            }
+            val bookDao = FakeBookDao().apply {
+                insertBook(
+                    BookEntity(bookId, "ORV", "Author", "EPUB", "", null, 100L, 100L, false)
+                )
+            }
+            val chapterDao = FakeChapterDao(
+                listOf(ChapterEntity("c0", bookId, 0, "Ch 1", 0L, 1000L, "epubcfi(/6/2!/4/2/1:0)", 120))
+            )
+            val narrationDao = FakeNarrationDao(chapterDao).apply {
+                insertLines(
+                    listOf(
+                        NarrationLineEntity("l0", "c0", 0, 0, 20, "narrator", "tense storytelling", "epubcfi(/6/2!/4/2/1:0)"),
+                        NarrationLineEntity("l1", "c0", 1, 0, 34, "${bookId}_namwoon", "mocking, aggressive", "epubcfi(/6/2!/4/2/2:0)")
+                    )
+                )
+            }
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_FLASH_TTS.name)
+                setDefaultNarratorVoiceId("Charon")
+            }
+            val manager = ReaderNarrationSessionManager(
+                bookDao = bookDao,
+                chapterDao = chapterDao,
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("flash-test-key"),
+                interactionsTtsClient = ttsClient,
+                applicationScope = backgroundScope,
+                narrationDao = narrationDao
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { RecordingPcmPlayer() }
+            }
+            runCurrent()
+
+            val characters = listOf(
+                CharacterEntity("${bookId}_narrator", bookId, "Narrator", "", "neutral", "mature", "clear", "Charon"),
+                CharacterEntity("${bookId}_namwoon", bookId, "Kim Namwoon", "", "male", "teen", "brash", "Zephyr")
+            )
+            val paragraphs = listOf(
+                ReaderParagraph(0, "p0", "The subway halted abruptly.", "epubcfi(/6/2!/4/2/1:0)"),
+                ReaderParagraph(1, "p1", "\"Hey! Why would you do that?!\"", "epubcfi(/6/2!/4/2/2:0)")
+            )
+
+            manager.startOrResume(
+                bookId = bookId,
+                bookTitle = "ORV",
+                chapters = chapterDao.chapters,
+                currentChapterIndex = 0,
+                paragraphs = paragraphs,
+                characters = characters
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            // Both paragraphs merge into 1 single-narrator Flash request carrying per-segment styles
+            assertEquals(1, capturedRequests.size)
+            val req = capturedRequests.single()
+            assertEquals("Charon", req.voiceName)
+            assertEquals(2, req.segments.size)
+            assertEquals("The subway halted abruptly.", req.segments[0].text)
+            assertEquals("\"Hey! Why would you do that?!\"", req.segments[1].text)
+            assertEquals("Kim Namwoon", req.segments[1].speaker)
+            assertEquals("mocking, aggressive", req.segments[1].style)
+            assertFalse(req.text.contains("Say as "))
+            assertFalse((req.style ?: "").contains("Say as "))
+            assertTrue(req.segments.none { it.text.contains("Say as ") })
         } finally {
             tempDir.deleteRecursively()
         }

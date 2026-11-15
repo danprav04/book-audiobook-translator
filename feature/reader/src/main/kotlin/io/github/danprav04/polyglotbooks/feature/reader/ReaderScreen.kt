@@ -1008,6 +1008,12 @@ private fun CastEditorDialog(
                     }
                 }
 
+                Text(
+                    text = "One expressive narrator voice reads all lines using character traits and scene emotions. Multi-character voices: Coming soon.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
                 if (characters.isEmpty()) {
                     Text(
                         text = "No characters detected yet. Tap Auto-Detect to scan dialogue in this chapter, or tap Add to create a character manually.",
@@ -1303,7 +1309,8 @@ private fun CastCharacterRow(
                 }
             }
             OutlinedButton(
-                onClick = { showVoicePicker = true },
+                onClick = { if (isNarrator) showVoicePicker = true },
+                enabled = isNarrator,
                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -1314,7 +1321,11 @@ private fun CastCharacterRow(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = voiceProfile?.let { "${it.name} (${it.gender})" } ?: selectedVoice,
+                    text = if (isNarrator) {
+                        voiceProfile?.let { "${it.name} (${it.gender})" } ?: selectedVoice
+                    } else {
+                        "Multi-character voices — Coming soon"
+                    },
                     style = MaterialTheme.typography.labelMedium
                 )
             }
@@ -1471,7 +1482,8 @@ private fun CastCharacterEditDialog(
                 )
                 Text("Voice Assignment", style = MaterialTheme.typography.labelLarge)
                 OutlinedButton(
-                    onClick = { showVoicePicker = true },
+                    onClick = { if (isNarrator) showVoicePicker = true },
+                    enabled = isNarrator,
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(
@@ -1481,11 +1493,18 @@ private fun CastCharacterEditDialog(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (selectedVoiceId.isNullOrBlank() && initialCharacter == null) {
-                            "Auto-assign matching voice (tap to choose)"
+                        text = if (!isNarrator) {
+                            "Multi-character voices — Coming soon"
                         } else {
                             voiceProfile?.let { "${it.name} (${it.gender})" } ?: effectiveVoiceId
                         }
+                    )
+                }
+                if (!isNarrator) {
+                    Text(
+                        text = "Character analysis still guides narrator intonation and emotional delivery.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
@@ -2211,7 +2230,7 @@ private fun ExpandedNarrationSheet(
                 showNarratorVoicePicker = false
             },
             title = "Default Narrator Voice",
-            subtitle = "Used for narration unless overridden per character"
+            subtitle = "Used for all book narration with character-aware intonation (multi-character voices coming soon)"
         )
     }
 }

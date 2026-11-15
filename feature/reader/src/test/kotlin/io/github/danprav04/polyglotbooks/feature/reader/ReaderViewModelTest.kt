@@ -949,7 +949,7 @@ class ReaderViewModelTest {
     }
 
     @Test
-    fun `buildSpeechChunks groups same speaker and honors engine limits`() {
+    fun `buildSpeechChunks uses single narrator voice preserves per-segment styles and honors engine limits`() {
         val viewModel = ReaderViewModel(
             bookDao = FakeBookDao(),
             chapterDao = FakeChapterDao(),
@@ -976,14 +976,18 @@ class ReaderViewModelTest {
         )
 
         val ttsChunks = viewModel.buildSpeechChunks(paragraphs, characters, NarrationEngine.GEMINI_FLASH_TTS)
-        assertEquals(3, ttsChunks.size)
-        assertEquals(listOf("cfi-0", "cfi-1"), ttsChunks[0].allCfis)
-        assertEquals(listOf("cfi-2"), ttsChunks[1].allCfis)
-        assertEquals("Kore", ttsChunks[1].voiceId)
-        assertEquals(listOf("cfi-3"), ttsChunks[2].allCfis)
+        assertEquals(2, ttsChunks.size)
+        assertEquals(listOf("cfi-0", "cfi-1", "cfi-2"), ttsChunks[0].allCfis)
+        assertTrue(ttsChunks.all { it.voiceId == GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID })
+        assertEquals(3, ttsChunks[0].segments.size)
+        assertEquals("Alice", ttsChunks[0].segments[2].speakerName)
+        assertEquals("warm", ttsChunks[0].segments[2].style)
+        assertEquals(listOf("cfi-3"), ttsChunks[1].allCfis)
 
         val sysChunks = viewModel.buildSpeechChunks(paragraphs, characters, NarrationEngine.SYSTEM_TTS)
         assertEquals(4, sysChunks.size)
+        assertTrue(sysChunks.all { it.voiceId == GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID })
+        assertEquals("Alice", sysChunks[2].speakerName)
     }
 
     @Test

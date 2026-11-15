@@ -290,7 +290,7 @@ fun SettingsScreen(
                 showVoicePickerDialog = false
             },
             title = "Default Narrator Voice",
-            subtitle = "Used for narrator parts and unassigned reading voices across books."
+            subtitle = "Used for all narration with character-aware intonation (multi-character voices coming soon)."
         )
     }
 }

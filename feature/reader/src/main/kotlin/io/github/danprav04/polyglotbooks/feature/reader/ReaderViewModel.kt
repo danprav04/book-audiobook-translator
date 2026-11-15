@@ -33,6 +33,7 @@ import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
 import io.github.danprav04.polyglotbooks.feature.narration.CastingService
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
+import io.github.danprav04.polyglotbooks.feature.narration.SynthesisSegment
 import io.github.danprav04.polyglotbooks.feature.narration.VoiceCaster
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -79,7 +80,8 @@ data class SpeechChunk(
     val languageCode: String? = null,
     val speakerName: String? = null,
     val characterPersonality: String? = null,
-    val storySummary: String? = null
+    val storySummary: String? = null,
+    val segments: List<SynthesisSegment> = emptyList()
 )
 
 data class ReaderUiState(
