@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import android.util.Log
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.mockkStatic
@@ -441,5 +442,49 @@ class OkHttpLiveSessionTest {
         listeners[1].onMessage(sockets[1], """{"goAway":{"timeLeft":"10s"}}""")
         assertEquals(3, listeners.size)
         autoGoAwaySession.disconnect()
+    }
+
+    @Test
+    fun testEmptyKeepaliveEnvelopesDoNotLogErrorsAndBurstPreservesFifoOrder() = runTest {
+        DiagnosticLogBuffer.clear()
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(okHttpClient = mockClient)
+        val collectedIndices = mutableListOf<Int>()
+        val collectJob = launch {
+            session.incomingMessages.collect { msg ->
+                if (msg is LiveServerMessage.ServerContentMessage) {
+                    val idx = msg.serverContent.outputTranscription?.text?.toIntOrNull()
+                    if (idx != null) collectedIndices.add(idx)
+                }
+            }
+        }
+        runCurrent()
+
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val listener = listenerSlot.captured
+        listener.onOpen(mockWebSocket, mockk(relaxed = true))
+        listener.onMessage(mockWebSocket, "{}")
+        listener.onMessage(mockWebSocket, "{\n}")
+
+        val burstCount = 500
+        for (i in 0 until burstCount) {
+            listener.onMessage(
+                mockWebSocket,
+                """{"serverContent":{"outputTranscription":{"text":"$i"}}}"""
+            )
+        }
+        runCurrent()
+
+        assertEquals((0 until burstCount).toList(), collectedIndices)
+        val errorLogs = DiagnosticLogBuffer.recentEntries().filter { it.level == "ERROR" }
+        assertTrue("Expected zero ERROR logs for empty keepalive envelopes, got $errorLogs", errorLogs.isEmpty())
+
+        collectJob.cancel()
+        session.disconnect()
     }
 }

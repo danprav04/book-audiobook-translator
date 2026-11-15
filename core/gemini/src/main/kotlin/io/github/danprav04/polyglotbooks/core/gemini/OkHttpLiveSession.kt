@@ -46,7 +46,7 @@ class OkHttpLiveSession(
 
     private val TAG = "OkHttpLiveSession"
 
-    private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(replay = 16, extraBufferCapacity = 64)
+    private val _incomingMessages = MutableSharedFlow<LiveServerMessage>(replay = 16, extraBufferCapacity = 4096)
     private val _failures = MutableSharedFlow<Throwable>(replay = 1, extraBufferCapacity = 4)
 
     override val incomingMessages: Flow<LiveServerMessage> = flow {
@@ -101,7 +101,10 @@ class OkHttpLiveSession(
     @Volatile
     private var activeConnectionId = 0L
 
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val scope = CoroutineScope(Dispatchers.IO.limitedParallelism(1) + SupervisorJob())
+    private val emitLock = Any()
+    private val overflowQueue = ArrayDeque<LiveServerMessage>()
+    private var isOverflowDraining = false
 
     private var currentApiKey: String? = null
     private var currentSetup: SetupConfig? = null
@@ -110,6 +113,9 @@ class OkHttpLiveSession(
         private set
 
     override suspend fun connect(apiKey: String, setup: SetupConfig) {
+        synchronized(emitLock) {
+            overflowQueue.clear()
+        }
         _incomingMessages.resetReplayCache()
         _failures.resetReplayCache()
         _lastError = null
@@ -249,9 +255,10 @@ class OkHttpLiveSession(
     }
 
     private fun handleIncomingJson(text: String) {
-        if (text.isBlank()) return
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || trimmed == "{}") return
         try {
-            val serverMsg = json.decodeFromString<LiveServerMessage>(text)
+            val serverMsg = json.decodeFromString<LiveServerMessage>(trimmed)
             when (serverMsg) {
                 is LiveServerMessage.SetupCompleteMessage -> {
                     _isSetupComplete = true
@@ -285,14 +292,47 @@ class OkHttpLiveSession(
                 is LiveServerMessage.UsageMetadataMessage -> {
                     // Metadata frame; forwarded to collectors below.
                 }
-            }
-            if (!_incomingMessages.tryEmit(serverMsg)) {
-                scope.launch {
-                    _incomingMessages.emit(serverMsg)
+                is LiveServerMessage.IgnoredMessage -> {
+                    return
                 }
             }
+            emitIncomingOrdered(serverMsg)
         } catch (e: Exception) {
             logE("Failed to parse incoming server message (${text.length} chars)", e)
+        }
+    }
+
+    /**
+     * Emits incoming server messages strictly in WebSocket arrival order even when
+     * the hot SharedFlow buffer fills during fast multi-hundred-frame bursts.
+     */
+    private fun emitIncomingOrdered(serverMsg: LiveServerMessage) {
+        val shouldStartDrainer: Boolean
+        synchronized(emitLock) {
+            if (overflowQueue.isEmpty() && !isOverflowDraining && _incomingMessages.tryEmit(serverMsg)) {
+                return
+            }
+            overflowQueue.addLast(serverMsg)
+            shouldStartDrainer = !isOverflowDraining
+            if (shouldStartDrainer) {
+                isOverflowDraining = true
+            }
+        }
+        if (shouldStartDrainer) {
+            scope.launch {
+                while (true) {
+                    val next: LiveServerMessage? = synchronized(emitLock) {
+                        if (overflowQueue.isEmpty()) {
+                            isOverflowDraining = false
+                            null
+                        } else {
+                            overflowQueue.removeFirst()
+                        }
+                    }
+                    if (next == null) break
+                    _incomingMessages.emit(next)
+                }
+            }
         }
     }
 

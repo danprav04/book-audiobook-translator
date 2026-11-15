@@ -243,6 +243,12 @@ sealed interface LiveServerMessage {
     data class UsageMetadataMessage(
         val usageMetadata: UsageMetadata? = null
     ) : LiveServerMessage
+
+    /**
+     * Empty heartbeat/acknowledgement frame (e.g. `{}`) safely ignored by callers.
+     */
+    @Serializable
+    data object IgnoredMessage : LiveServerMessage
 }
 
 /**
@@ -259,6 +265,7 @@ object LiveServerMessageSerializer : JsonContentPolymorphicSerializer<LiveServer
             "setupComplete" in jsonObject -> LiveServerMessage.SetupCompleteMessage.serializer()
             "error" in jsonObject -> LiveServerMessage.ErrorMessage.serializer()
             "usageMetadata" in jsonObject -> LiveServerMessage.UsageMetadataMessage.serializer()
+            jsonObject.isEmpty() -> LiveServerMessage.IgnoredMessage.serializer()
             else -> throw SerializationException("Unknown LiveServerMessage envelope: $element")
         }
     }

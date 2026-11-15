@@ -269,4 +269,13 @@ class LiveSessionMessageTest {
         val decodedClientContent = json.decodeFromString<LiveClientMessage>(encodedClientContent)
         assertEquals(clientContent, decodedClientContent)
     }
+
+    @Test
+    fun testEmptyServerEnvelopeDeserializesToIgnoredMessage() {
+        val emptyMsg = json.decodeFromString<LiveServerMessage>("{}")
+        assertTrue(emptyMsg is LiveServerMessage.IgnoredMessage)
+
+        val newlineEmptyMsg = json.decodeFromString<LiveServerMessage>("{\n}")
+        assertTrue(newlineEmptyMsg is LiveServerMessage.IgnoredMessage)
+    }
 }
