@@ -86,9 +86,12 @@ class GeminiTtsEngine(
         val ttsRequest = TtsRequest(
             text = resolved.spokenText,
             voiceName = request.voiceId.takeIf { it.isNotBlank() },
+            speaker = request.speakerName?.trim()?.takeIf { it.isNotEmpty() },
             style = normalizedStyle,
             model = model,
-            languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() }
+            languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() },
+            personality = request.characterPersonality?.trim()?.takeIf { it.isNotEmpty() },
+            storyContext = request.storySummary?.trim()?.takeIf { it.isNotEmpty() }
         )
 
         var emittedCount = 0

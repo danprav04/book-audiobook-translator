@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -540,5 +541,75 @@ class GeminiLiveEngineStreamingTest {
         assertEquals(3, createdSessions.size)
         assertEquals(1, chunks.size)
         assertEquals(55.toByte(), chunks[0].data[0])
+    }
+
+    @Test
+    fun `split BPE transcription fragments assemble cleanly without mid-word spaces and complete after idle audio`() = runTest {
+        lateinit var activeSession: FakeReplayLiveSession
+        var fallbackCalled = false
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.GEMINI_TTS
+            override val capabilities = EngineCapabilities(true, true, true, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackCalled = true
+                return flowOf(PcmChunk(byteArrayOf(99), 24000, 1))
+            }
+        }
+
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { activeSession = it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        val received = mutableListOf<PcmChunk>()
+        val collectJob = launch(dispatcher) {
+            live.synthesizeTurnStreaming(
+                SynthesisRequest(
+                    text = "Three Ways to Survive in a Ruined World",
+                    voiceId = "Charon",
+                    speakerName = "Kim Dokja",
+                    characterPersonality = "dry, analytical",
+                    storySummary = "A lone reader on a subway",
+                    style = "wry reflection"
+                )
+            ).collect { received += it }
+        }
+
+        runCurrent()
+        // Verify tailored narrative/personality context reaches systemInstruction
+        val sysText = activeSession.setups.single().systemInstruction?.parts?.firstOrNull()?.text.orEmpty()
+        assertTrue(sysText.contains("Kim Dokja"))
+        assertTrue(sysText.contains("dry, analytical"))
+        assertTrue(sysText.contains("A lone reader on a subway"))
+        assertTrue(sysText.contains("wry reflection"))
+
+        // Stream BPE split pieces WITHOUT turnComplete (simulating server omitting turnComplete envelope)
+        activeSession.emitServerMessage(audioServerMessage(byteArrayOf(11, 12), transcript = "Three", turnComplete = false))
+        activeSession.emitServerMessage(audioServerMessage(byteArrayOf(13, 14), transcript = " Ways to Sur", turnComplete = false))
+        activeSession.emitServerMessage(audioServerMessage(byteArrayOf(15, 16), transcript = "vival in a", turnComplete = false))
+        activeSession.emitServerMessage(audioServerMessage(byteArrayOf(17, 18), transcript = " Ruined World", turnComplete = false))
+        runCurrent()
+        // Must still wait briefly for trailing turnComplete or post-audio idle timeout
+        assertTrue(received.isEmpty())
+
+        // Advance past 2.5s post-audio idle timeout -> must finalize & emit valid audio instead of waiting 20-90s!
+        advanceTimeBy(2_600L)
+        runCurrent()
+        collectJob.join()
+        live.close()
+
+        assertTrue(!fallbackCalled)
+        assertEquals(4, received.size)
+        assertEquals(11.toByte(), received[0].data[0])
+        assertEquals(17.toByte(), received[3].data[0])
     }
 }

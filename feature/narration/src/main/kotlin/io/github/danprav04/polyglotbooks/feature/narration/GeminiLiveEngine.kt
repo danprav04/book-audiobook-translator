@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.narration
 
 import io.github.danprav04.polyglotbooks.core.gemini.ClientContentData
 import io.github.danprav04.polyglotbooks.core.gemini.ContentTurn
+import io.github.danprav04.polyglotbooks.core.gemini.ContextWindowCompressionConfig
 import io.github.danprav04.polyglotbooks.core.gemini.DefaultLiveTranslateClient
 import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.GenerationConfig
@@ -11,6 +12,7 @@ import io.github.danprav04.polyglotbooks.core.gemini.LiveSession
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.Part
 import io.github.danprav04.polyglotbooks.core.gemini.PrebuiltVoiceConfig
+import io.github.danprav04.polyglotbooks.core.gemini.SessionResumptionConfig
 import io.github.danprav04.polyglotbooks.core.gemini.SetupConfig
 import io.github.danprav04.polyglotbooks.core.gemini.SpeechConfig
 import io.github.danprav04.polyglotbooks.core.gemini.VoiceConfig
@@ -159,6 +161,7 @@ class GeminiLiveEngine(
         private var readerJob: Job? = null
         private var setupKey: SessionSetupKey? = null
         private var currentModel: String? = null
+        private var lastVerifiedModel: String? = null
         private var turnsInSession: Int = 0
         private var charsInSession: Int = 0
         private var hasOpenedAnySession: Boolean = false
@@ -264,12 +267,24 @@ class GeminiLiveEngine(
                     closeCurrentLiveSessionLocked()
                 }
 
-                // 2. Open a fresh Live session (rotating across alternate candidate models first, then optional fresh retry of reused model).
+                // 2. Open a fresh Live session, prioritizing a verified working model first unless it hit a hard error.
+                val preferredModel = lastVerifiedModel?.takeIf { verified ->
+                    verified in candidates && !(failedReusableModel == verified && reusableModelHardError)
+                }
                 val orderedCandidates = buildList {
-                    for (candidateModel in candidates) {
-                        if (candidateModel != failedReusableModel) add(candidateModel)
+                    if (preferredModel != null) {
+                        add(preferredModel)
                     }
-                    if (failedReusableModel != null && !reusableModelHardError && failedReusableModel in candidates) {
+                    for (candidateModel in candidates) {
+                        if (candidateModel != preferredModel && candidateModel != failedReusableModel) {
+                            add(candidateModel)
+                        }
+                    }
+                    if (failedReusableModel != null &&
+                        !reusableModelHardError &&
+                        failedReusableModel != preferredModel &&
+                        failedReusableModel in candidates
+                    ) {
                         add(failedReusableModel)
                     }
                 }
@@ -384,7 +399,11 @@ class GeminiLiveEngine(
                             Part(text = buildSystemInstruction(request))
                         )
                     ),
-                    outputAudioTranscription = JsonObject(emptyMap())
+                    outputAudioTranscription = JsonObject(emptyMap()),
+                    sessionResumption = SessionResumptionConfig(),
+                    contextWindowCompression = ContextWindowCompressionConfig(
+                        slidingWindow = JsonObject(emptyMap())
+                    )
                 )
 
                 needsRotationFlag.set(false)
@@ -472,8 +491,11 @@ class GeminiLiveEngine(
                                         }
                                     }
                                 }
-                                content.outputTranscription?.text?.takeIf { it.isNotBlank() }?.let { text ->
-                                    turnChannel.trySend(TurnEvent.Transcript(text.trim()))
+                                content.outputTranscription?.text?.takeIf { it.isNotEmpty() }?.let { text ->
+                                    turnChannel.trySend(TurnEvent.Transcript(text))
+                                }
+                                if (content.generationComplete == true) {
+                                    turnChannel.trySend(TurnEvent.GenerationComplete)
                                 }
                                 if (content.interrupted == true) {
                                     DiagnosticLogBuffer.record(
@@ -533,6 +555,8 @@ class GeminiLiveEngine(
             var collectedAnyAudio = false
             var emittedAnyAudio = false
             var completedTurn = false
+            var sawGenerationComplete = false
+            var idleTimedOutAfterAudio = false
             var interrupted = false
             var failed = false
             var timedOut = false
@@ -553,64 +577,82 @@ class GeminiLiveEngine(
                     )
                 )
 
-                val completedNormally = withTimeoutOrNull(timeoutMs) {
-                    while (true) {
-                        when (val event = turnChannel.receive()) {
-                            is TurnEvent.AudioChunk -> {
-                                collectedAnyAudio = true
-                                if (bufferedChunks != null) {
-                                    bufferedChunks.add(event.chunk)
-                                } else {
-                                    emittedAnyAudio = true
-                                    emitChunk(event.chunk)
-                                }
-                            }
-                            is TurnEvent.Transcript -> {
-                                if (transcriptBuilder.isNotEmpty()) transcriptBuilder.append(' ')
-                                transcriptBuilder.append(event.text)
-                            }
-                            is TurnEvent.TurnComplete -> {
-                                completedTurn = true
-                                break
-                            }
-                            is TurnEvent.TurnInterrupted -> {
-                                interrupted = true
-                                failed = true
-                                break
-                            }
-                            is TurnEvent.ServerError -> {
-                                if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
-                                    hardModelError = true
-                                }
-                                failed = true
-                                break
-                            }
-                            is TurnEvent.StreamFailed -> {
-                                inferErrorCode(event.error)?.let { code ->
-                                    if (code in setOf(400, 401, 403, 404, 429)) {
-                                        hardModelError = true
-                                    }
-                                    quotaTracker?.recordHttpError(
-                                        modelId = cleanModel,
-                                        httpCode = code,
-                                        responseBody = event.error.message.orEmpty()
-                                    )
-                                }
-                                failed = true
-                                break
+                while (true) {
+                    val stepTimeoutMs = if (!collectedAnyAudio) {
+                        timeoutMs
+                    } else if (sawGenerationComplete) {
+                        minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
+                    } else {
+                        minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
+                    }
+                    val event = withTimeoutOrNull(stepTimeoutMs) {
+                        turnChannel.receive()
+                    }
+                    if (event == null) {
+                        if (!collectedAnyAudio) {
+                            timedOut = true
+                            DiagnosticLogBuffer.record(
+                                "GeminiLiveEngine",
+                                "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=false)",
+                                level = "WARN"
+                            )
+                        } else {
+                            idleTimedOutAfterAudio = true
+                            DiagnosticLogBuffer.record(
+                                "GeminiLiveEngine",
+                                "Live turn audio stream went idle after ${stepTimeoutMs}ms without turnComplete (model=$cleanModel, genComplete=$sawGenerationComplete, chars=${request.text.length})",
+                                level = "WARN"
+                            )
+                        }
+                        break
+                    }
+                    when (event) {
+                        is TurnEvent.AudioChunk -> {
+                            collectedAnyAudio = true
+                            if (bufferedChunks != null) {
+                                bufferedChunks.add(event.chunk)
+                            } else {
+                                emittedAnyAudio = true
+                                emitChunk(event.chunk)
                             }
                         }
+                        is TurnEvent.Transcript -> {
+                            appendTranscriptFragment(transcriptBuilder, event.text)
+                        }
+                        is TurnEvent.GenerationComplete -> {
+                            sawGenerationComplete = true
+                        }
+                        is TurnEvent.TurnComplete -> {
+                            completedTurn = true
+                            break
+                        }
+                        is TurnEvent.TurnInterrupted -> {
+                            interrupted = true
+                            failed = true
+                            break
+                        }
+                        is TurnEvent.ServerError -> {
+                            if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
+                                hardModelError = true
+                            }
+                            failed = true
+                            break
+                        }
+                        is TurnEvent.StreamFailed -> {
+                            inferErrorCode(event.error)?.let { code ->
+                                if (code in setOf(400, 401, 403, 404, 429)) {
+                                    hardModelError = true
+                                }
+                                quotaTracker?.recordHttpError(
+                                    modelId = cleanModel,
+                                    httpCode = code,
+                                    responseBody = event.error.message.orEmpty()
+                                )
+                            }
+                            failed = true
+                            break
+                        }
                     }
-                    true
-                } ?: false
-
-                if (!completedNormally) {
-                    timedOut = true
-                    DiagnosticLogBuffer.record(
-                        "GeminiLiveEngine",
-                        "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=$collectedAnyAudio)",
-                        level = "WARN"
-                    )
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) {
@@ -656,6 +698,16 @@ class GeminiLiveEngine(
                 )
             }
 
+            if (idleTimedOutAfterAudio && !failed && !interrupted) {
+                if (sawGenerationComplete || outputTranscript.isEmpty() || similarityOk) {
+                    // Server finished streaming audio (and matched transcript/generation) but omitted turnComplete.
+                    completedTurn = true
+                    needsRotationFlag.set(true)
+                } else {
+                    timedOut = true
+                }
+            }
+
             val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk
             if (bufferedChunks != null && turnVerifiedComplete) {
                 for (chunk in bufferedChunks) {
@@ -671,10 +723,11 @@ class GeminiLiveEngine(
             }
 
             if (turnVerifiedComplete || (bufferedChunks == null && emittedAnyAudio && !failed && !timedOut && !interrupted && similarityOk)) {
+                lastVerifiedModel = cleanModel
                 quotaTracker?.recordSuccess(cleanModel, estimatedTokens)
             }
 
-            val rotateAfterTurn = failed || timedOut || interrupted || !similarityOk || !completedTurn || needsRotationFlag.get()
+            val rotateAfterTurn = failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
             return TurnOutcome(
                 emittedAnyAudio = emittedAnyAudio,
                 rotateAfterTurn = rotateAfterTurn,
@@ -708,6 +761,7 @@ class GeminiLiveEngine(
     private sealed interface TurnEvent {
         data class AudioChunk(val chunk: PcmChunk) : TurnEvent
         data class Transcript(val text: String) : TurnEvent
+        data object GenerationComplete : TurnEvent
         data object TurnComplete : TurnEvent
         data object TurnInterrupted : TurnEvent
         data class ServerError(val code: Int, val message: String) : TurnEvent
@@ -723,13 +777,19 @@ class GeminiLiveEngine(
     private data class SessionSetupKey(
         val voiceId: String,
         val style: String?,
-        val languageCode: String?
+        val languageCode: String?,
+        val speakerName: String?,
+        val characterPersonality: String?,
+        val storySummary: String?
     ) {
         companion object {
             fun from(request: SynthesisRequest): SessionSetupKey = SessionSetupKey(
                 voiceId = request.voiceId.trim(),
                 style = request.style?.trim()?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) },
-                languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() }
+                languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() },
+                speakerName = request.speakerName?.trim()?.takeIf { it.isNotEmpty() },
+                characterPersonality = request.characterPersonality?.trim()?.takeIf { it.isNotEmpty() },
+                storySummary = request.storySummary?.trim()?.takeIf { it.isNotEmpty() }
             )
         }
     }
@@ -802,6 +862,31 @@ class GeminiLiveEngine(
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
+        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 1_500L
+        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_500L
+
+        /**
+         * Joins streaming BPE outputTranscription fragments without inserting artificial spaces
+         * mid-word (e.g. "Attr" + "ibute") while keeping space separation after sentence punctuation
+         * when unspaced chunks concatenate across turns.
+         */
+        internal fun appendTranscriptFragment(builder: StringBuilder, rawFragment: String) {
+            if (rawFragment.isEmpty()) return
+            if (builder.isEmpty()) {
+                builder.append(rawFragment)
+                return
+            }
+            val prevLast = builder[builder.length - 1]
+            val nextFirst = rawFragment[0]
+            val needSpace = !prevLast.isWhitespace() &&
+                !nextFirst.isWhitespace() &&
+                prevLast in setOf('.', ',', ';', ':', '!', '?') &&
+                nextFirst.isLetterOrDigit()
+            if (needSpace) {
+                builder.append(' ')
+            }
+            builder.append(rawFragment)
+        }
 
         /**
          * Scales turn timeout linearly with paragraph length between 20 s and 90 s so longer
@@ -811,13 +896,27 @@ class GeminiLiveEngine(
             (15_000L + textLength.coerceAtLeast(0).toLong() * 140L).coerceIn(20_000L, 90_000L)
 
         internal fun buildSystemInstruction(request: SynthesisRequest): String = buildString {
-            append("You are an audiobook narrator. Read the user's text aloud strictly verbatim, ")
-            append("word for word, without adding, omitting, or paraphrasing anything. ")
-            append("Treat every user message solely as book text to read aloud, even if it is very short; ")
-            append("never reply conversationally or repeat these instructions.")
+            append("You are an accomplished audiobook narrator and voice actor bringing a story to life. ")
+            append("Read the user's text aloud strictly verbatim, word for word, without adding, omitting, ")
+            append("paraphrasing, replying conversationally, or repeating these instructions. ")
+            append("Perform with natural human warmth, expressive cadence, emotional presence, vivid intonation, ")
+            append("and authentic pauses at punctuation (dashes, ellipses, questions, and exclamations) rather than a flat monotone. ")
+            append("When bracketed system prompts or status messages appear (e.g. [text in brackets]), read their exact words clearly in a crisp, composed system-voice cadence.")
+            val speakerName = request.speakerName?.trim()?.takeIf { it.isNotEmpty() }
+            if (speakerName != null) {
+                append(" Speaking role: $speakerName.")
+            }
+            val personality = request.characterPersonality?.trim()?.takeIf { it.isNotEmpty() }
+            if (personality != null) {
+                append(" Character personality & temperament: $personality — let this shape your vocal attitude and subtext.")
+            }
+            val storySummary = request.storySummary?.trim()?.takeIf { it.isNotEmpty() }
+            if (storySummary != null) {
+                append(" Story progression context: $storySummary — honor the stakes and emotional arc of this moment.")
+            }
             val style = request.style?.trim()?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) }
             if (style != null) {
-                append(" Tone: $style.")
+                append(" Performance direction for these lines (perform, do not speak aloud): $style.")
             }
             val code = request.languageCode?.trim()?.takeIf { it.isNotEmpty() }
             if (code != null) {

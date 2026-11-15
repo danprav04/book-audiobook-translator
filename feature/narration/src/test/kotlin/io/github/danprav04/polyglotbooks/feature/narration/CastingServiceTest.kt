@@ -249,4 +249,69 @@ class CastingServiceTest {
         assertEquals("narrator", p1Spans[1].speakerId)
         assertEquals(p1.length, p1Spans.last().endOffset)
     }
+
+    @Test
+    fun `buildCastingPrompt and parseAndValidateCasting carry storySummary, character personality, and tailored line styles`() {
+        val existingCast = listOf(
+            io.github.danprav04.polyglotbooks.core.model.Character(
+                id = "b1_dokja",
+                bookId = "b1",
+                name = "Kim Dokja",
+                aliases = listOf("Dokja"),
+                gender = "male",
+                age = "young adult",
+                voiceTraits = "dry, quiet baritone"
+            )
+        )
+        val prompt = castingService.buildCastingPrompt(
+            paragraphs = listOf(
+                "A cold message floated in midair.",
+                "[You cannot activate the Attribute Window.]"
+            ),
+            existingCharacters = existingCast,
+            previousStorySummary = "Dokja watched his subway car derail into chaos.",
+            knownPersonalities = mapOf("b1_dokja" to "guarded, analytical survivor")
+        )
+        assertTrue(prompt.contains("Dokja watched his subway car derail into chaos."))
+        assertTrue(prompt.contains("guarded, analytical survivor"))
+        assertTrue(prompt.contains("storySummary"))
+        assertTrue(prompt.contains("personality"))
+
+        val response = """
+            {
+              "storySummary": "Inside the halted subway car, Dokja stays eerily calm as a system prompt blocks his status window.",
+              "characters": [
+                {
+                  "id": "b1_dokja",
+                  "name": "Kim Dokja",
+                  "gender": "male",
+                  "age": "young adult",
+                  "personality": "unsurprised beneath rising dread",
+                  "voiceTraits": "dry, quiet baritone"
+                }
+              ],
+              "lines": [
+                { "para": 0, "start": 0, "end": 33, "speaker": "narrator", "style": "quiet dread beneath outward calm" },
+                { "para": 1, "start": 0, "end": 41, "speaker": "narrator", "style": "crisp, detached system announcement" }
+              ]
+            }
+        """.trimIndent()
+
+        val result = castingService.parseAndValidateCasting(
+            jsonResponse = response,
+            paragraphs = listOf("A cold message floated in midair.", "[You cannot activate the Attribute Window.]"),
+            existingCharacters = existingCast,
+            bookId = "b1",
+            chapterId = "b1_chap_6",
+            previousStorySummary = "Dokja watched his subway car derail into chaos.",
+            knownPersonalities = mapOf("b1_dokja" to "guarded, analytical survivor")
+        )
+
+        assertTrue(result.storySummary.contains("system prompt blocks his status window"))
+        val personality = result.characterPersonalities["b1_dokja"].orEmpty()
+        assertTrue(personality.contains("guarded, analytical survivor"))
+        assertTrue(personality.contains("unsurprised beneath rising dread"))
+        assertEquals("quiet dread beneath outward calm", result.lines[0].style)
+        assertEquals("crisp, detached system announcement", result.lines[1].style)
+    }
 }

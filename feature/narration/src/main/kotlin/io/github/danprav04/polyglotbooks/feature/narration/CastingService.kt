@@ -11,6 +11,7 @@ import java.util.UUID
  */
 @Serializable
 data class RawCastingResponse(
+    val storySummary: String = "",
     val characters: List<RawCharacter> = emptyList(),
     val lines: List<RawLine> = emptyList()
 )
@@ -22,6 +23,7 @@ data class RawCharacter(
     val aliases: List<String> = emptyList(),
     val gender: String = "unknown",
     val age: String = "unknown",
+    val personality: String = "",
     val voiceTraits: String = ""
 )
 
@@ -35,11 +37,13 @@ data class RawLine(
 )
 
 /**
- * Normalized result of casting analysis.
+ * Normalized result of casting analysis including accumulated story progression and character personalities.
  */
 data class CastingResult(
     val characters: List<Character>,
-    val lines: List<NarrationLine>
+    val lines: List<NarrationLine>,
+    val storySummary: String = "",
+    val characterPersonalities: Map<String, String> = emptyMap()
 )
 
 /**
@@ -62,6 +66,7 @@ class CastingService {
         {
           "type": "object",
           "properties": {
+            "storySummary": { "type": "string" },
             "characters": {
               "type": "array",
               "items": {
@@ -72,6 +77,7 @@ class CastingService {
                   "aliases": { "type": "array", "items": { "type": "string" } },
                   "gender": { "type": "string" },
                   "age": { "type": "string" },
+                  "personality": { "type": "string" },
                   "voiceTraits": { "type": "string" }
                 },
                 "required": ["id", "name", "gender", "age", "voiceTraits"]
@@ -98,28 +104,38 @@ class CastingService {
     }
 
     /**
-     * Builds a context-aware casting prompt for a bounded slice of chapter paragraphs,
-     * cross-referencing previously detected book characters & aliases and preceding paragraphs
-     * so implied/conversational speakers beyond explicit "Name: Sentence" lines are resolved.
+     * Builds a context-aware casting and directing prompt for a bounded slice of chapter paragraphs,
+     * carrying forward running story progression, character personalities & aliases, and preceding prose
+     * so every line receives tailored acting directions grounded in the broader narrative context.
      */
     fun buildCastingPrompt(
         paragraphs: List<String>,
         existingCharacters: List<Character> = emptyList(),
         previousContextParagraphs: List<String> = emptyList(),
-        chapterTitle: String? = null
+        chapterTitle: String? = null,
+        previousStorySummary: String? = null,
+        knownPersonalities: Map<String, String> = emptyMap()
     ): String = buildString {
-        append("Analyze the book chapter text below to identify every speaking character, ")
-        append("reconcile them with the existing book cast, and attribute character-offset spans for every paragraph.\n")
+        append("Analyze the book passage below as both casting director and audiobook performance director. ")
+        append("Track the evolving story progression, deepen understanding of each character's personality, ")
+        append("reconcile speakers with the existing cast, and generate tailored line-by-line narration instructions.\n")
         if (!chapterTitle.isNullOrBlank()) {
             append("Chapter title: ").append(chapterTitle.trim()).append('\n')
         }
+        if (!previousStorySummary.isNullOrBlank()) {
+            append("Story progression summary so far:\n")
+            append(previousStorySummary.trim()).append("\n\n")
+        } else {
+            append("Story progression summary so far: (Opening / no prior summary recorded yet — begin summarizing from these paragraphs.)\n\n")
+        }
         append(
             """
-            Attribution rules:
-            1. Always reuse the exact character 'id' from Known Cast when a known character speaks (including via nicknames, titles, honorifics, or aliases). Record any newly discovered names/nicknames in 'aliases'.
-            2. Detect speakers beyond explicit "Name: Sentence" script format: infer speakers from quotation marks ("...", “...”, ‘...’, «...», 「...」, 『...』), dialogue dashes (— / –), surrounding narrative beats ("Alice froze. \"Enough!\""), pronoun/action cues ("he whispered", "she countered"), vocatives, and back-and-forth conversational alternation across paragraphs.
-            3. Use 'speaker': "narrator" for third-person prose, descriptions, and dialogue tags/reporting verbs (e.g. "said Elizabeth", "he muttered"). Use the character's 'id' for their spoken dialogue spans (or their inner/direct monologue if distinct), with an optional concise delivery 'style' (e.g. "whispering", "tense", "warm").
-            4. Emit exact [start, end) character offsets within each target paragraph 0..${paragraphs.lastIndex}. Leave 'lines' only for target paragraphs, NOT for the read-only context paragraphs.
+            Attribution and performance-direction rules:
+            1. Write a concise, insightful 'storySummary' (2-4 sentences) updating the story progression so far through the end of this passage: plot developments, rising stakes, scene tension, character dynamics, and shifting emotional atmosphere.
+            2. Always reuse the exact character 'id' from Known Cast when a known character appears or speaks (including via nicknames, titles, honorifics, or aliases). Record newly discovered nicknames in 'aliases', update 'personality' with their temperament/mindset/motivations (e.g. "guarded, dryly cynical yet deeply observant"), and capture vocal timbre in 'voiceTraits' (e.g. "steady low baritone, unhurried").
+            3. Detect speakers beyond explicit "Name: Sentence" script format: infer speakers from quotation marks ("...", “...”, ‘...’, «...», 「...」, 『...』), dialogue dashes (— / –), surrounding narrative beats ("Alice froze. \"Enough!\""), pronoun/action cues ("he whispered", "she countered"), vocatives, and back-and-forth conversational alternation across paragraphs.
+            4. Direct EVERY part of every target paragraph in 'lines' — both spoken character dialogue AND "speaker": "narrator" prose — with a tailored, concrete 'style' instruction on how to voice that specific line (for example: "quiet dread beneath outward calm", "wry, weary amusement", "sharp panic breaking through composure", or "crisp, detached system announcement" for bracketed status messages like [...]). Ground each 'style' cue in the broader story progression, the character's personality, and the emotional subtext of the actual words rather than generic "neutral".
+            5. Emit exact [start, end) character offsets within each target paragraph 0..${paragraphs.lastIndex}. Leave 'lines' only for target paragraphs, NOT for the read-only context paragraphs.
             """.trimIndent()
         )
         append("\n\n")
@@ -128,7 +144,15 @@ class CastingService {
         val existingNarrator = existingCharacters.firstOrNull { isNarratorDescriptor(it.id, it.name) }
         append("Known Cast:\n")
         if (existingNarrator != null) {
-            append("- id=\"narrator\" (name=\"Narrator\")\n")
+            val narratorPersonality = resolvePersonalityLookup(existingNarrator, knownPersonalities)
+            append("- id=\"narrator\" (name=\"Narrator\")")
+            if (!narratorPersonality.isNullOrBlank()) {
+                append(", personality=\"$narratorPersonality\"")
+            }
+            if (existingNarrator.voiceTraits.isNotBlank()) {
+                append(", voiceTraits=\"${existingNarrator.voiceTraits}\"")
+            }
+            append('\n')
         }
         if (nonNarratorCast.isEmpty()) {
             append("(No characters detected earlier in the book yet.)\n\n")
@@ -143,6 +167,10 @@ class CastingService {
                 }
                 if (c.age.isNotBlank() && !c.age.equals("unknown", ignoreCase = true)) {
                     append(", age=\"${c.age}\"")
+                }
+                val personality = resolvePersonalityLookup(c, knownPersonalities)
+                if (!personality.isNullOrBlank()) {
+                    append(", personality=\"$personality\"")
                 }
                 if (c.voiceTraits.isNotBlank()) {
                     append(", voiceTraits=\"${c.voiceTraits}\"")
@@ -171,14 +199,18 @@ class CastingService {
         paragraphs: List<String>,
         existingCharacters: List<Character> = emptyList(),
         bookId: String = "book-1",
-        chapterId: String = "chap-1"
+        chapterId: String = "chap-1",
+        previousStorySummary: String = "",
+        knownPersonalities: Map<String, String> = emptyMap()
     ): CastingResult {
         return validateAndNormalizeInternal(
             rawJson = jsonResponse,
             paragraphTexts = paragraphs,
             existingCharacters = existingCharacters,
             bookId = bookId,
-            chapterId = chapterId
+            chapterId = chapterId,
+            previousStorySummary = previousStorySummary,
+            knownPersonalities = knownPersonalities
         )
     }
 
@@ -202,7 +234,9 @@ class CastingService {
             paragraphTexts = paragraphTexts,
             existingCharacters = emptyList(),
             bookId = bookId,
-            chapterId = chapterId
+            chapterId = chapterId,
+            previousStorySummary = "",
+            knownPersonalities = emptyMap()
         )
     }
 
@@ -211,11 +245,13 @@ class CastingService {
         paragraphTexts: List<String>,
         existingCharacters: List<Character>,
         bookId: String,
-        chapterId: String
+        chapterId: String,
+        previousStorySummary: String,
+        knownPersonalities: Map<String, String>
     ): CastingResult {
         val cleaned = stripCodeFences(rawJson)
         val parsed = tryDecodeResponse(cleaned)
-            ?: return createFullNarratorFallback(paragraphTexts, bookId, chapterId)
+            ?: return createFullNarratorFallback(paragraphTexts, bookId, chapterId, previousStorySummary, knownPersonalities)
 
         val existingById = existingCharacters.associateBy { it.id.trim().lowercase() }
         val existingNarrator = existingCharacters.firstOrNull { isNarratorDescriptor(it.id, it.name) }
@@ -224,15 +260,23 @@ class CastingService {
         val termToCanonicalId = mutableMapOf<String, String>()
         val usedIds = mutableSetOf<String>()
         val mergedCharacters = linkedMapOf<String, Character>()
+        val mergedPersonalities = linkedMapOf<String, String>()
 
         existingCharacters.forEach { existing ->
             val canonId = existing.id.trim()
             if (canonId.isNotEmpty()) {
                 usedIds.add(canonId.lowercase())
+                val priorPersonality = resolvePersonalityLookup(existing, knownPersonalities)
                 if (isNarratorDescriptor(canonId, existing.name)) {
                     rawIdToCanonicalId[canonId.lowercase()] = "narrator"
+                    if (!priorPersonality.isNullOrBlank()) {
+                        mergedPersonalities["narrator"] = priorPersonality
+                    }
                 } else {
                     rawIdToCanonicalId[canonId.lowercase()] = canonId
+                    if (!priorPersonality.isNullOrBlank()) {
+                        mergedPersonalities[canonId] = priorPersonality
+                    }
                     val normName = normalizeTerm(existing.name)
                     if (normName.isNotEmpty()) {
                         termToCanonicalId.putIfAbsent(normName, canonId)
@@ -251,11 +295,19 @@ class CastingService {
             val rawIdTrimmed = raw.id.trim()
             val rawNameTrimmed = raw.name.trim()
             if (rawIdTrimmed.isEmpty() && rawNameTrimmed.isEmpty()) return@forEachIndexed
+            val rawPersonalityTrimmed = raw.personality.trim()
 
             if (isNarratorDescriptor(rawIdTrimmed, rawNameTrimmed)) {
                 val canonId = existingNarrator?.id ?: rawIdTrimmed.ifBlank { "narrator" }
                 if (rawIdTrimmed.isNotEmpty()) {
                     rawIdToCanonicalId[rawIdTrimmed.lowercase()] = "narrator"
+                }
+                val combinedPersonality = mergePersonalityDescriptions(
+                    mergedPersonalities["narrator"] ?: existingNarrator?.let { resolvePersonalityLookup(it, knownPersonalities) },
+                    rawPersonalityTrimmed
+                )
+                if (combinedPersonality.isNotBlank()) {
+                    mergedPersonalities["narrator"] = combinedPersonality
                 }
                 mergedCharacters[canonId] = Character(
                     id = canonId,
@@ -308,6 +360,13 @@ class CastingService {
                     voiceTraits = matchedExisting.voiceTraits.takeIf { it.isNotBlank() } ?: raw.voiceTraits.trim(),
                     assignedVoiceId = matchedExisting.assignedVoiceId
                 )
+                val combinedPersonality = mergePersonalityDescriptions(
+                    mergedPersonalities[cid] ?: resolvePersonalityLookup(matchedExisting, knownPersonalities),
+                    rawPersonalityTrimmed
+                )
+                if (combinedPersonality.isNotBlank()) {
+                    mergedPersonalities[cid] = combinedPersonality
+                }
                 mergedCharacters[cid] = updated
                 usedIds.add(cid.lowercase())
                 cid to updated
@@ -328,6 +387,13 @@ class CastingService {
                     voiceTraits = raw.voiceTraits.trim(),
                     assignedVoiceId = null
                 )
+                val combinedPersonality = mergePersonalityDescriptions(
+                    knownPersonalities[cid] ?: knownPersonalities[resolvedName.lowercase()],
+                    rawPersonalityTrimmed
+                )
+                if (combinedPersonality.isNotBlank()) {
+                    mergedPersonalities[cid] = combinedPersonality
+                }
                 mergedCharacters[cid] = created
                 cid to created
             }
@@ -456,9 +522,12 @@ class CastingService {
             }
         }
 
+        val resolvedStorySummary = parsed.storySummary.trim().ifBlank { previousStorySummary.trim() }
         return CastingResult(
             characters = mergedCharacters.values.toList(),
-            lines = normalizedLines
+            lines = normalizedLines,
+            storySummary = resolvedStorySummary,
+            characterPersonalities = mergedPersonalities
         )
     }
 
@@ -534,10 +603,36 @@ class CastingService {
         return first.ifEmpty { second.ifEmpty { "unknown" } }
     }
 
+    private fun resolvePersonalityLookup(
+        character: Character,
+        personalities: Map<String, String>
+    ): String? {
+        if (personalities.isEmpty()) return null
+        personalities[character.id]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        personalities[character.id.lowercase()]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        personalities[character.name.trim()]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        personalities[character.name.trim().lowercase()]?.trim()?.takeIf { it.isNotEmpty() }?.let { return it }
+        return null
+    }
+
+    private fun mergePersonalityDescriptions(existing: String?, incoming: String?): String {
+        val prev = existing?.trim().orEmpty()
+        val next = incoming?.trim().orEmpty()
+        if (prev.isEmpty()) return next
+        if (next.isEmpty()) return prev
+        if (prev.equals(next, ignoreCase = true) || prev.contains(next, ignoreCase = true)) return prev
+        if (next.contains(prev, ignoreCase = true)) return next
+        // Keep the cumulative personality insight concise (under 280 chars) so prompts stay focused.
+        val combined = "$prev; $next"
+        return if (combined.length <= 280) combined else next
+    }
+
     private fun createFullNarratorFallback(
         paragraphTexts: List<String>,
         bookId: String,
-        chapterId: String
+        chapterId: String,
+        previousStorySummary: String = "",
+        knownPersonalities: Map<String, String> = emptyMap()
     ): CastingResult {
         val lines = paragraphTexts.mapIndexedNotNull { index, text ->
             if (text.isEmpty()) null
@@ -551,13 +646,20 @@ class CastingService {
                 style = null
             )
         }
-        return CastingResult(characters = emptyList(), lines = lines)
+        return CastingResult(
+            characters = emptyList(),
+            lines = lines,
+            storySummary = previousStorySummary.trim(),
+            characterPersonalities = knownPersonalities
+        )
     }
 
     companion object {
         const val CASTING_SYSTEM_INSTRUCTION: String =
-            "You are a literary dialogue and character attribution assistant for multi-voice audiobooks. " +
-                "Reuse known character IDs, detect implied speakers and conversational alternation beyond explicit 'Name: Sentence' lines, " +
+            "You are a master audiobook casting and performance director. " +
+                "Reuse known character IDs, collect an evolving understanding of each character's personality and vocal traits, " +
+                "maintain an updated summary of the story progression, detect implied speakers beyond explicit 'Name: Sentence' lines, " +
+                "direct every line of dialogue and narration with tailored delivery instructions rooted in the broader context, " +
                 "and output strictly valid JSON matching the schema."
     }
 }
