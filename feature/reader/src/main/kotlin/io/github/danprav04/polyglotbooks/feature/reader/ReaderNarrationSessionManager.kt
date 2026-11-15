@@ -1805,7 +1805,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 }
                                             }
                                         } else {
-                                            val liveTag = "GEMINI_LIVE$langSuffix"
+                                            val liveTag = "$GEMINI_LIVE_CACHE_TAG_PREFIX$langSuffix"
                                             val cached = diskCache?.loadAudioSegment(liveTag, chunk.voiceId, chunk.style, chunk.text)
                                             if (cached != null) {
                                                 events.send(
@@ -2653,7 +2653,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         val langTagSuffix = chunk.languageCode?.takeIf { it.isNotBlank() }?.let { "_$it" }.orEmpty()
         val primaryTag = when (engineChoice) {
             NarrationEngine.GEMINI_FLASH_TTS -> "$GEMINI_TTS_CACHE_TAG_PREFIX$langTagSuffix"
-            NarrationEngine.GEMINI_LIVE -> "GEMINI_LIVE$langTagSuffix"
+            NarrationEngine.GEMINI_LIVE -> "$GEMINI_LIVE_CACHE_TAG_PREFIX$langTagSuffix"
             NarrationEngine.SYSTEM_TTS -> "SYSTEM_TTS$langTagSuffix"
         }
 
@@ -2713,7 +2713,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                 level = "WARN"
             )
             onStatusUpdate("Free-tier TTS quota limit reached — switched to Gemini Live")
-            val liveTag = "GEMINI_LIVE$langTagSuffix"
+            val liveTag = "$GEMINI_LIVE_CACHE_TAG_PREFIX$langTagSuffix"
             val cachedLive = diskCache?.loadAudioSegment(liveTag, chunk.voiceId, chunk.style, chunk.text)
             if (cachedLive != null) {
                 onPcmChunk(PcmChunk(cachedLive.pcmBytes, cachedLive.sampleRate, cachedLive.channels))
@@ -3847,6 +3847,7 @@ class ReaderNarrationSessionManager @Inject constructor(
 
     companion object {
         internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V2"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V2"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =

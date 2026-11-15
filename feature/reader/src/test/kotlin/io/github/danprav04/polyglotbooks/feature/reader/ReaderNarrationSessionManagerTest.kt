@@ -1562,7 +1562,7 @@ class ReaderNarrationSessionManagerTest {
             assertTrue("Only complete verified Live audio must play (no partial chunk before retry)", writtenChunks[0].contentEquals(goodBytes))
 
             val cached = TranslationDiskCache(tempDir).loadAudioSegment(
-                engineTag = "GEMINI_LIVE",
+                engineTag = ReaderNarrationSessionManager.GEMINI_LIVE_CACHE_TAG_PREFIX,
                 voiceId = "Charon",
                 style = null,
                 text = p0Text
