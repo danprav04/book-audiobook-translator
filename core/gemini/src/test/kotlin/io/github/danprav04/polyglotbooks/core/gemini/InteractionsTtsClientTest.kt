@@ -59,10 +59,24 @@ class InteractionsTtsClientTest {
             client.buildPromptText(TtsRequest(text = "Quite so.", speaker = "Darcy", style = "calm, wry"))
         )
 
-        // Punctuation-only input never receives a Say prefix even when style/speaker is set
+        // Structural dividers never receive a Say prefix even when style/speaker is set
         assertEquals(
             "* * *",
             client.buildPromptText(TtsRequest(text = "* * *", speaker = "Narrator", style = "dramatic"))
+        )
+        assertEquals(
+            "---",
+            client.buildPromptText(TtsRequest(text = "---", speaker = "Narrator", style = "dramatic"))
+        )
+
+        // Expressive punctuation-only dialogue resolves into spoken non-verbal interjection + style cue
+        assertEquals(
+            "Say as Alice in a hesitant, puzzled questioning murmur tone: Hmm...?",
+            client.buildPromptText(TtsRequest(text = "\"......?\"", speaker = "Alice", style = null))
+        )
+        assertEquals(
+            "Say in a startled, incredulous gasp tone: Huh?!",
+            client.buildPromptText(TtsRequest(text = "\"?!\""))
         )
 
         // Meta-instruction phrases in style/speaker must never leak into TTS prompt text

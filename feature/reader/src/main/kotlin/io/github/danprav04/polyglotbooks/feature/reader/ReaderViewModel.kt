@@ -14,6 +14,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.ChapterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterDao
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.NarrationDao
+import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -24,14 +25,17 @@ import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalogService
 import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.model.Character
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
+import io.github.danprav04.polyglotbooks.core.model.NarrationLine
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
 import io.github.danprav04.polyglotbooks.feature.narration.CastingService
 import io.github.danprav04.polyglotbooks.feature.narration.GeminiStudioVoices
 import io.github.danprav04.polyglotbooks.feature.narration.VoiceCaster
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -44,6 +48,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.UUID
 import javax.inject.Inject
 import io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine as FeatureNarrationEngine
 
@@ -156,9 +161,15 @@ class ReaderViewModel @Inject constructor(
     private var settingsJob: Job? = null
     private var sessionObserverJob: Job? = null
     private var castJob: Job? = null
+    private var backgroundCastJob: Job? = null
+    private var lastAutoScanTarget: Pair<String, Int>? = null
     private val saveMutex = Mutex()
+    private val castScanMutex = Mutex()
+    private val aiScannedChapterKeys = mutableSetOf<String>()
     private var lastSessionError: String? = null
     private var lastSessionStatus: String? = null
+    internal var ioDispatcher: CoroutineDispatcher = Dispatchers.IO
+    internal var bookExtractor: ((String, String) -> EbookContentExtractor.ExtractedBook?)? = null
 
     private val localFallbackSessionManager: ReaderNarrationSessionManager by lazy {
         ReaderNarrationSessionManager(
@@ -174,7 +185,8 @@ class ReaderViewModel @Inject constructor(
             quotaTracker = quotaTracker,
             modelCatalogService = modelCatalogService,
             playbackCoordinator = playbackCoordinator,
-            applicationScope = viewModelScope
+            applicationScope = viewModelScope,
+            narrationDao = narrationDao
         )
     }
 
@@ -277,7 +289,9 @@ class ReaderViewModel @Inject constructor(
                 lastSessionError = sessionErr
                 lastSessionStatus = sessionStat
 
+                var chapterAdvanceForScan: Pair<String, Int>? = null
                 _uiState.update { state ->
+                    chapterAdvanceForScan = null
                     val base = state.copy(
                         narrationEngine = session.narrationEngine,
                         defaultNarratorVoiceId = session.defaultNarratorVoiceId,
@@ -297,6 +311,9 @@ class ReaderViewModel @Inject constructor(
                             session.currentChapterIndex.coerceIn(0, totalChapters - 1)
                         } else {
                             base.currentChapterIndex
+                        }
+                        if (session.isActiveSession && updatedChapterIndex != state.currentChapterIndex) {
+                            chapterAdvanceForScan = bookId to updatedChapterIndex
                         }
                         val chapterChangedFromSession = session.isActiveSession &&
                             updatedChapterIndex != base.currentChapterIndex &&
@@ -379,6 +396,13 @@ class ReaderViewModel @Inject constructor(
                         )
                     }
                 }
+                chapterAdvanceForScan?.let { (targetId, nextChapterIndex) ->
+                    scheduleAutoCastScan(
+                        targetBookId = targetId,
+                        chapterIndex = nextChapterIndex,
+                        includeLookahead = true
+                    )
+                }
             }
         }
     }
@@ -391,6 +415,9 @@ class ReaderViewModel @Inject constructor(
         charactersJob?.cancel()
         if (switchingBook) {
             castJob?.cancel()
+            backgroundCastJob?.cancel()
+            lastAutoScanTarget = null
+            aiScannedChapterKeys.clear()
             lastSessionError = null
             lastSessionStatus = null
         }
@@ -459,21 +486,41 @@ class ReaderViewModel @Inject constructor(
                     val rawSavedCfi = savedState?.lastCfi.orEmpty()
                     val rawSavedProgress = (savedState?.readingProgress ?: 0f).coerceIn(0f, 1f)
 
-                    val extracted = if (appContext != null && book.filePath.isNotBlank()) {
-                        if (isReattaching && liveSessionSnapshot.extractedBook != null) {
-                            liveSessionSnapshot.extractedBook
-                        } else {
-                            try {
-                                withContext(Dispatchers.IO) {
-                                    EbookContentExtractor.extractBook(appContext, book.filePath, book.format)
-                                }
-                            } catch (e: Exception) {
-                                if (e is CancellationException) throw e
-                                null
+                    val customExtractor = bookExtractor
+                    val extracted = if (isReattaching && liveSessionSnapshot.extractedBook != null) {
+                        liveSessionSnapshot.extractedBook
+                    } else if (customExtractor != null) {
+                        try {
+                            withContext(ioDispatcher) {
+                                customExtractor(book.filePath, book.format)
                             }
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            DiagnosticLogBuffer.record(
+                                tag = "ReaderVM",
+                                message = "Ebook extraction failed format=${book.format}",
+                                level = "WARN",
+                                throwable = e
+                            )
+                            null
+                        }
+                    } else if (appContext != null && book.filePath.isNotBlank()) {
+                        try {
+                            withContext(ioDispatcher) {
+                                EbookContentExtractor.extractBook(appContext, book.filePath, book.format)
+                            }
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            DiagnosticLogBuffer.record(
+                                tag = "ReaderVM",
+                                message = "Ebook extraction failed format=${book.format}",
+                                level = "WARN",
+                                throwable = e
+                            )
+                            null
                         }
                     } else {
-                        if (isReattaching) liveSessionSnapshot.extractedBook else null
+                        null
                     }
 
                     var dbChapters = chapterDao.getChaptersForBook(targetBookId).firstOrNull().orEmpty()
@@ -598,7 +645,19 @@ class ReaderViewModel @Inject constructor(
                         bookDao.updateLastReadDate(targetBookId, System.currentTimeMillis())
                     }
                     syncContextToSession(forceWhenDifferentBook = false)
+                    if (initialParagraphs.isNotEmpty() || extracted?.chapters?.any { it.paragraphs.isNotEmpty() } == true) {
+                        scheduleAutoCastScan(
+                            targetBookId = targetBookId,
+                            chapterIndex = clampedChapterIndex,
+                            includeLookahead = true
+                        )
+                    }
                 } else {
+                    DiagnosticLogBuffer.record(
+                        tag = "ReaderVM",
+                        message = "Book not found id=$targetBookId",
+                        level = "ERROR"
+                    )
                     _uiState.update {
                         it.copy(
                             bookId = targetBookId,
@@ -642,6 +701,12 @@ class ReaderViewModel @Inject constructor(
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
+                DiagnosticLogBuffer.record(
+                    tag = "ReaderVM",
+                    message = "Failed to load book id=$targetBookId",
+                    level = "ERROR",
+                    throwable = e
+                )
                 _uiState.update {
                     it.copy(
                         isStateRestored = true,
@@ -818,6 +883,13 @@ class ReaderViewModel @Inject constructor(
                 sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = true)
             }
         }
+        if (bookId.isNotBlank()) {
+            scheduleAutoCastScan(
+                targetBookId = bookId,
+                chapterIndex = clampedIndex,
+                includeLookahead = true
+            )
+        }
     }
 
     fun selectDefaultNarratorVoice(voiceId: String) {
@@ -874,6 +946,11 @@ class ReaderViewModel @Inject constructor(
             characters = state.characters,
             isBilingualEnabled = state.isBilingualEnabled,
             bilingualTranslations = state.bilingualTranslations
+        )
+        scheduleAutoCastScan(
+            targetBookId = state.bookId,
+            chapterIndex = state.currentChapterIndex,
+            includeLookahead = true
         )
     }
 
@@ -995,105 +1072,379 @@ class ReaderViewModel @Inject constructor(
 
     fun analyzeCastForCurrentChapter() {
         castJob?.cancel()
+        backgroundCastJob?.cancel()
         castJob = viewModelScope.launch {
             _uiState.update { it.copy(isCastAnalyzing = true) }
             try {
-                val state = _uiState.value
-                val chapterParagraphs = state.paragraphs.ifEmpty {
-                    state.extractedBook?.let {
-                        sessionManager.buildParagraphsForChapter(it, state.currentChapterIndex, state.bookFormat)
-                    }.orEmpty()
+                val snapshot = _uiState.value
+                analyzeChapterCastInternal(
+                    targetBookId = snapshot.bookId.ifBlank { bookId },
+                    chapterIndex = snapshot.currentChapterIndex,
+                    force = true,
+                    updateUiSpinner = true,
+                    reportErrors = true
+                )
+            } finally {
+                _uiState.update { it.copy(isCastAnalyzing = false) }
+            }
+        }
+    }
+
+    fun reanalyzeCastForCurrentChapter() {
+        analyzeCastForCurrentChapter()
+    }
+
+    private fun scheduleAutoCastScan(
+        targetBookId: String = bookId,
+        chapterIndex: Int = _uiState.value.currentChapterIndex,
+        includeLookahead: Boolean = true
+    ) {
+        if (narrationDao == null || textModelClient == null || targetBookId.isBlank() || chapterIndex < 0) return
+        val target = targetBookId to chapterIndex
+        if (backgroundCastJob?.isActive == true && lastAutoScanTarget == target) return
+        if (lastAutoScanTarget != target) {
+            backgroundCastJob?.cancel()
+        }
+        lastAutoScanTarget = target
+        backgroundCastJob = viewModelScope.launch {
+            try {
+                val apiKey = resolveApiKey()
+                if (apiKey.isNullOrBlank()) return@launch
+                analyzeChapterCastInternal(
+                    targetBookId = targetBookId,
+                    chapterIndex = chapterIndex,
+                    force = false,
+                    updateUiSpinner = false,
+                    reportErrors = false
+                )
+                if (includeLookahead) {
+                    val state = _uiState.value
+                    if (state.bookId != targetBookId) return@launch
+                    val totalChapters = maxOf(state.chapters.size, state.extractedBook?.chapters?.size ?: 0)
+                    val nextIndex = chapterIndex + 1
+                    if (totalChapters > 0 && nextIndex < totalChapters) {
+                        analyzeChapterCastInternal(
+                            targetBookId = targetBookId,
+                            chapterIndex = nextIndex,
+                            force = false,
+                            updateUiSpinner = false,
+                            reportErrors = false
+                        )
+                    }
                 }
-                val paragraphTexts = chapterParagraphs.map { it.text }.filter { it.isNotBlank() }
-                val existing = state.characters
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                DiagnosticLogBuffer.record(
+                    tag = "ReaderVM",
+                    message = "Background cast scan failed",
+                    level = "WARN",
+                    throwable = t
+                )
+            }
+        }
+    }
+
+    private fun resolveChapterParagraphs(
+        state: ReaderUiState,
+        chapterIndex: Int
+    ): List<ReaderParagraph> {
+        if (chapterIndex == state.currentChapterIndex && state.paragraphs.isNotEmpty()) {
+            return state.paragraphs.filter { it.text.isNotBlank() }
+        }
+        val extracted = state.extractedBook
+        if (extracted != null) {
+            return sessionManager.buildParagraphsForChapter(extracted, chapterIndex, state.bookFormat)
+        }
+        return emptyList()
+    }
+
+    private suspend fun ensureChapterEntityId(
+        targetBookId: String,
+        state: ReaderUiState,
+        chapterIndex: Int
+    ): String {
+        state.chapters.getOrNull(chapterIndex)?.id?.takeIf { it.isNotBlank() }?.let { cid ->
+            if (chapterDao.getChapterById(cid) != null) return cid
+        }
+        chapterDao.getChapterByIndex(targetBookId, chapterIndex)?.id?.takeIf { it.isNotBlank() }?.let { return it }
+        val extractedChapter = state.extractedBook?.chapters?.getOrNull(chapterIndex)
+        val isPdf = state.bookFormat.equals("PDF", ignoreCase = true) ||
+            state.extractedBook?.format.equals("PDF", ignoreCase = true)
+        val fallbackId = state.chapters.getOrNull(chapterIndex)?.id?.takeIf { it.isNotBlank() }
+            ?: "${targetBookId}_chap_$chapterIndex"
+        val bookExists = bookDao.getBookById(targetBookId) != null
+        if (bookExists && extractedChapter != null) {
+            val entity = ChapterEntity(
+                id = fallbackId,
+                bookId = targetBookId,
+                index = chapterIndex,
+                title = extractedChapter.title.ifBlank {
+                    if (isPdf) "Page ${chapterIndex + 1}" else "Chapter ${chapterIndex + 1}"
+                },
+                startMs = chapterIndex * 1000L,
+                endMs = (chapterIndex + 1) * 1000L,
+                cfiRange = sessionManager.defaultChapterCfi(chapterIndex, isPdf),
+                textLength = extractedChapter.paragraphs.sumOf { it.length }
+            )
+            chapterDao.insertChapter(entity)
+            return entity.id
+        }
+        return fallbackId
+    }
+
+    private suspend fun analyzeChapterCastInternal(
+        targetBookId: String,
+        chapterIndex: Int,
+        force: Boolean,
+        updateUiSpinner: Boolean,
+        reportErrors: Boolean
+    ) {
+        if (targetBookId.isBlank() || chapterIndex < 0) return
+        castScanMutex.withLock {
+            if (targetBookId != bookId) return
+            val state = _uiState.value
+            val chapterParagraphs = resolveChapterParagraphs(state, chapterIndex)
+            if (chapterParagraphs.isEmpty() && !force) {
+                return
+            }
+
+            val chapterId = ensureChapterEntityId(targetBookId, state, chapterIndex)
+            val scanKey = "$targetBookId::$chapterId"
+            if (!force) {
+                if (scanKey in aiScannedChapterKeys) return
+                val existingLines = try {
+                    narrationDao?.getLinesForChapterOnce(chapterId).orEmpty()
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+                if (existingLines.isNotEmpty()) {
+                    aiScannedChapterKeys.add(scanKey)
+                    return
+                }
+            }
+
+            try {
+                val existingEntities = (characterDao?.getCharactersForBook(targetBookId)?.firstOrNull()
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: state.characters)
+                    .filter { it.bookId == targetBookId || it.bookId.isBlank() }
+
+                val existingNarrator = existingEntities.firstOrNull { isNarratorEntity(it) }
+                val workingCharacters = existingEntities.map { it.toDomain() }.toMutableList()
                 val apiKey = resolveApiKey()
                 val castingService = CastingService()
 
-                var detectedDomainChars: List<Character> = emptyList()
-                if (textModelClient != null && !apiKey.isNullOrBlank() && paragraphTexts.isNotEmpty()) {
-                    try {
-                        val prompt = buildString {
-                            append("Identify all speaking characters and the narrator in these book paragraphs. ")
-                            append("Return JSON matching the schema.\n\n")
-                            paragraphTexts.take(35).forEachIndexed { idx, text ->
-                                append("[$idx] $text\n")
+                val aiLines = mutableListOf<NarrationLineEntity>()
+                var anyBatchSucceeded = false
+                var allBatchesSucceeded = false
+                val chapterTitle = state.chapters.getOrNull(chapterIndex)?.title
+                    ?: state.extractedBook?.chapters?.getOrNull(chapterIndex)?.title
+
+                if (textModelClient != null && !apiKey.isNullOrBlank() && chapterParagraphs.isNotEmpty()) {
+                    val batches = partitionIntoCastingBatches(chapterParagraphs)
+                    val model = resolveModel(ModelRole.TEXT_ANALYSIS)
+                    var rollingContext = if (chapterIndex > 0) {
+                        resolveChapterParagraphs(state, chapterIndex - 1).takeLast(2).map { it.text }
+                    } else {
+                        emptyList()
+                    }
+                    allBatchesSucceeded = true
+                    for (batch in batches) {
+                        val batchTexts = batch.map { it.text }
+                        try {
+                            val prompt = castingService.buildCastingPrompt(
+                                paragraphs = batchTexts,
+                                existingCharacters = workingCharacters,
+                                previousContextParagraphs = rollingContext,
+                                chapterTitle = chapterTitle
+                            )
+                            val responseJson = withContext(ioDispatcher) {
+                                textModelClient.generateContent(
+                                    apiKey = apiKey,
+                                    prompt = prompt,
+                                    systemInstruction = CastingService.CASTING_SYSTEM_INSTRUCTION,
+                                    responseJsonSchema = castingService.getPromptJsonSchema(),
+                                    model = model
+                                )
                             }
-                        }
-                        val model = resolveModel(ModelRole.TEXT_ANALYSIS)
-                        val responseJson = withContext(Dispatchers.IO) {
-                            textModelClient.generateContent(
-                                apiKey = apiKey,
-                                prompt = prompt,
-                                systemInstruction = "Extract characters and dialogue attribution accurately in JSON.",
-                                responseJsonSchema = castingService.getPromptJsonSchema(),
-                                model = model
+                            val result = castingService.parseAndValidateCasting(
+                                jsonResponse = responseJson,
+                                paragraphs = batchTexts,
+                                existingCharacters = workingCharacters,
+                                bookId = targetBookId,
+                                chapterId = chapterId
+                            )
+                            val rawIdToSavedId = mutableMapOf<String, String>()
+                            val usedIdsLower = workingCharacters.map { it.id.lowercase() }.toMutableSet()
+
+                            for (candidate in result.characters) {
+                                if (isNarratorDescriptor(candidate.id, candidate.name)) {
+                                    val canonNarratorId = existingNarrator?.id ?: "${targetBookId}_narrator"
+                                    rawIdToSavedId[candidate.id] = "narrator"
+                                    val idx = workingCharacters.indexOfFirst { isNarratorDescriptor(it.id, it.name) }
+                                    if (idx >= 0) {
+                                        val prev = workingCharacters[idx]
+                                        workingCharacters[idx] = prev.copy(
+                                            bookId = targetBookId,
+                                            gender = pickNonUnknownField(prev.gender, candidate.gender),
+                                            age = pickNonUnknownField(prev.age, candidate.age),
+                                            voiceTraits = prev.voiceTraits.ifBlank { candidate.voiceTraits }
+                                        )
+                                    } else {
+                                        workingCharacters.add(0, candidate.copy(id = canonNarratorId, bookId = targetBookId))
+                                        usedIdsLower.add(canonNarratorId.lowercase())
+                                    }
+                                    continue
+                                }
+
+                                val existingIdx = workingCharacters.indexOfFirst {
+                                    it.id.equals(candidate.id, ignoreCase = true) ||
+                                        it.name.equals(candidate.name, ignoreCase = true) ||
+                                        it.aliases.any { a -> a.equals(candidate.name, ignoreCase = true) } ||
+                                        candidate.aliases.any { ca ->
+                                            ca.equals(it.name, ignoreCase = true) ||
+                                                it.aliases.any { ia -> ia.equals(ca, ignoreCase = true) }
+                                        }
+                                }
+                                if (existingIdx >= 0) {
+                                    val prev = workingCharacters[existingIdx]
+                                    val extraAlias = if (!candidate.name.equals(prev.name, ignoreCase = true)) {
+                                        listOf(candidate.name)
+                                    } else {
+                                        emptyList()
+                                    }
+                                    val updated = prev.copy(
+                                        bookId = targetBookId,
+                                        aliases = mergeAliasLists(prev.name, prev.aliases, extraAlias + candidate.aliases),
+                                        gender = pickNonUnknownField(prev.gender, candidate.gender),
+                                        age = pickNonUnknownField(prev.age, candidate.age),
+                                        voiceTraits = prev.voiceTraits.ifBlank { candidate.voiceTraits },
+                                        assignedVoiceId = prev.assignedVoiceId ?: candidate.assignedVoiceId
+                                    )
+                                    workingCharacters[existingIdx] = updated
+                                    rawIdToSavedId[candidate.id] = prev.id
+                                    usedIdsLower.add(prev.id.lowercase())
+                                } else {
+                                    val baseId = if (candidate.id.startsWith("${targetBookId}_")) {
+                                        candidate.id
+                                    } else {
+                                        "${targetBookId}_${candidate.id}"
+                                    }
+                                    var savedId = baseId
+                                    var suffix = 2
+                                    while (savedId.lowercase() in usedIdsLower) {
+                                        savedId = "${baseId}_$suffix"
+                                        suffix++
+                                    }
+                                    usedIdsLower.add(savedId.lowercase())
+                                    rawIdToSavedId[candidate.id] = savedId
+                                    workingCharacters.add(
+                                        candidate.copy(
+                                            id = savedId,
+                                            bookId = targetBookId
+                                        )
+                                    )
+                                }
+                            }
+
+                            for (line in result.lines) {
+                                val origPara = batch.getOrNull(line.paraIndex) ?: continue
+                                val mappedSpeaker = if (isNarratorSpeakerId(line.speakerId)) {
+                                    "narrator"
+                                } else {
+                                    rawIdToSavedId[line.speakerId] ?: line.speakerId
+                                }
+                                aiLines.add(
+                                    NarrationLineEntity(
+                                        id = line.id.ifBlank { UUID.randomUUID().toString() },
+                                        chapterId = chapterId,
+                                        paraIndex = origPara.index,
+                                        startOffset = line.startOffset,
+                                        endOffset = line.endOffset,
+                                        speakerId = mappedSpeaker,
+                                        style = line.style,
+                                        cfi = origPara.cfi
+                                    )
+                                )
+                            }
+                            anyBatchSucceeded = true
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            allBatchesSucceeded = false
+                            DiagnosticLogBuffer.record(
+                                tag = "ReaderVM",
+                                message = "AI cast analysis failed for ch=$chapterIndex; falling back cleanly",
+                                level = "WARN",
+                                throwable = e
                             )
                         }
-                        val chapterId = state.chapters.getOrNull(state.currentChapterIndex)?.id
-                            ?: "${bookId}_chap_${state.currentChapterIndex}"
-                        val result = castingService.parseAndValidateCasting(
-                            jsonResponse = responseJson,
-                            paragraphs = paragraphTexts,
-                            existingCharacters = existing.map { it.toDomain() },
-                            bookId = bookId,
-                            chapterId = chapterId
-                        )
-                        detectedDomainChars = result.characters
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
+                        rollingContext = batch.takeLast(3).map { it.text }
                     }
                 }
 
-                if (detectedDomainChars.isEmpty()) {
-                    detectedDomainChars = detectSpeakersHeuristically(paragraphTexts, bookId)
+                if (!anyBatchSucceeded && !force) {
+                    return
                 }
 
-                val hasNarrator = detectedDomainChars.any {
-                    it.id == "narrator" || it.name.equals("Narrator", ignoreCase = true)
+                var finalLines = aiLines.toList()
+                if (!anyBatchSucceeded && chapterParagraphs.isNotEmpty()) {
+                    val (heuristicChars, heuristicLines) = detectSpeakersHeuristicallyWithLines(
+                        paragraphs = chapterParagraphs,
+                        targetBookId = targetBookId,
+                        chapterId = chapterId,
+                        existingCharacters = workingCharacters
+                    )
+                    val existingIds = workingCharacters.map { it.id.lowercase() }.toMutableSet()
+                    for (candidate in heuristicChars) {
+                        val existingIdx = workingCharacters.indexOfFirst {
+                            it.id.equals(candidate.id, ignoreCase = true) ||
+                                it.name.equals(candidate.name, ignoreCase = true) ||
+                                it.aliases.any { a -> a.equals(candidate.name, ignoreCase = true) }
+                        }
+                        if (existingIdx < 0) {
+                            val prefixedId = if (candidate.id.startsWith("${targetBookId}_")) {
+                                candidate.id
+                            } else {
+                                "${targetBookId}_${candidate.id}"
+                            }
+                            if (existingIds.add(prefixedId.lowercase())) {
+                                workingCharacters.add(candidate.copy(id = prefixedId, bookId = targetBookId))
+                            }
+                        }
+                    }
+                    finalLines = heuristicLines
                 }
+
+                val hasNarrator = workingCharacters.any { isNarratorDescriptor(it.id, it.name) }
                 if (!hasNarrator) {
-                    detectedDomainChars = listOf(
+                    workingCharacters.add(
+                        0,
                         Character(
-                            id = "${bookId}_narrator",
-                            bookId = bookId,
+                            id = "${targetBookId}_narrator",
+                            bookId = targetBookId,
                             name = "Narrator",
                             gender = "neutral",
                             age = "mature",
                             voiceTraits = "clear, storytelling"
                         )
-                    ) + detectedDomainChars
-                }
-
-                val existingByName = existing.associateBy { it.name.lowercase() }
-                val mergedDomain = mutableListOf<Character>()
-                for (existingChar in existing) {
-                    mergedDomain.add(existingChar.toDomain())
-                }
-                for (candidate in detectedDomainChars) {
-                    val key = candidate.name.lowercase()
-                    if (!existingByName.containsKey(key)) {
-                        mergedDomain.add(
-                            candidate.copy(
-                                id = if (candidate.id.startsWith("${bookId}_")) candidate.id else "${bookId}_${candidate.id}"
-                            )
-                        )
-                    }
+                    )
                 }
 
                 val narratorVoice = _uiState.value.defaultNarratorVoiceId.ifBlank {
                     GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
                 }
                 val caster = VoiceCaster(defaultNarratorVoiceId = narratorVoice)
-                val usedVoices = mergedDomain.mapNotNull { it.assignedVoiceId }.toMutableSet()
-                val autoAssigned = caster.autoAssignVoices(mergedDomain)
+                val usedVoices = workingCharacters.mapNotNull { it.assignedVoiceId?.takeIf { v -> v.isNotBlank() } }.toMutableSet()
+                val autoAssigned = caster.autoAssignVoices(workingCharacters)
                 val availablePool = GeminiStudioVoices.catalog.map { it.id }.toMutableList()
                 availablePool.removeAll(usedVoices)
 
-                val finalEntities = mergedDomain.map { ch ->
+                val finalEntities = workingCharacters.map { ch ->
                     val existingVoice = ch.assignedVoiceId?.takeIf { it.isNotBlank() }
                     val voice = if (existingVoice != null) {
                         existingVoice
-                    } else if (ch.name.equals("Narrator", ignoreCase = true)) {
+                    } else if (isNarratorDescriptor(ch.id, ch.name)) {
                         narratorVoice
                     } else {
                         val preferred = autoAssigned[ch.id]
@@ -1107,20 +1458,154 @@ class ReaderViewModel @Inject constructor(
                             nextUnused
                         }
                     }
-                    CharacterEntity.fromDomain(ch.copy(bookId = bookId, assignedVoiceId = voice))
+                    CharacterEntity.fromDomain(ch.copy(bookId = targetBookId, assignedVoiceId = voice))
                 }
 
                 characterDao?.insertCharacters(finalEntities)
-                _uiState.update { it.copy(characters = finalEntities, isCastAnalyzing = false) }
-                syncContextToSession(forceWhenDifferentBook = false)
+                if (finalLines.isNotEmpty() && narrationDao != null && chapterDao.getChapterById(chapterId) != null) {
+                    narrationDao.deleteLinesForChapter(chapterId)
+                    narrationDao.insertLines(finalLines)
+                }
+                if (anyBatchSucceeded && allBatchesSucceeded) {
+                    aiScannedChapterKeys.add(scanKey)
+                }
+                sessionManager.invalidateNarrationLines(targetBookId, chapterId)
+
+                if (targetBookId == bookId) {
+                    _uiState.update { cur ->
+                        cur.copy(
+                            characters = finalEntities,
+                            isCastAnalyzing = if (updateUiSpinner) false else cur.isCastAnalyzing
+                        )
+                    }
+                    syncContextToSession(forceWhenDifferentBook = false)
+                }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
-                _uiState.update {
-                    it.copy(
-                        isCastAnalyzing = false,
-                        errorMessage = sessionManager.formatConciseError(e, "Failed to analyze character cast")
-                    )
+                DiagnosticLogBuffer.record(
+                    tag = "ReaderVM",
+                    message = "Cast analysis pipeline failed",
+                    level = "ERROR",
+                    throwable = e
+                )
+                if (reportErrors && targetBookId == bookId) {
+                    _uiState.update {
+                        it.copy(
+                            isCastAnalyzing = false,
+                            errorMessage = sessionManager.formatConciseError(e, "Failed to analyze character cast")
+                        )
+                    }
                 }
+            }
+        }
+    }
+
+    fun addCharacter(
+        name: String,
+        aliases: String = "",
+        gender: String = "unknown",
+        age: String = "unknown",
+        voiceTraits: String = "",
+        assignedVoiceId: String? = null
+    ) {
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) return
+        val currentBookId = bookId.ifBlank { return }
+        val currentChars = _uiState.value.characters
+        if (cleanName.equals("Narrator", ignoreCase = true)) {
+            val existingNarrator = currentChars.firstOrNull { isNarratorEntity(it) }
+            if (existingNarrator != null) {
+                updateCharacterDetails(
+                    character = existingNarrator,
+                    name = "Narrator",
+                    aliases = "",
+                    gender = gender,
+                    age = age,
+                    voiceTraits = voiceTraits,
+                    assignedVoiceId = assignedVoiceId
+                )
+                return
+            }
+        }
+
+        val existingIds = currentChars.map { it.id.lowercase() }.toSet()
+        val baseSlug = cleanName.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_').ifBlank { "char" }
+        var candidateId = "${currentBookId}_$baseSlug"
+        var suffix = 2
+        while (candidateId.lowercase() in existingIds) {
+            candidateId = "${currentBookId}_${baseSlug}_$suffix"
+            suffix++
+        }
+
+        val normalizedGender = gender.trim().ifBlank { "unknown" }
+        val normalizedAge = age.trim().ifBlank { "unknown" }
+        val usedVoices = currentChars.mapNotNull { it.assignedVoiceId?.takeIf { v -> v.isNotBlank() } }.toSet()
+        val resolvedVoice = assignedVoiceId?.trim()?.takeIf { it.isNotBlank() }?.let {
+            GeminiStudioVoices.getVoice(it)?.id ?: it
+        } ?: GeminiStudioVoices.catalog.firstOrNull { voice ->
+            voice.id !in usedVoices &&
+                (normalizedGender.equals("unknown", true) || voice.gender.equals(normalizedGender, true)) &&
+                (normalizedAge.equals("unknown", true) || voice.age.equals(normalizedAge, true))
+        }?.id ?: GeminiStudioVoices.catalog.firstOrNull { voice ->
+            voice.id !in usedVoices &&
+                (normalizedGender.equals("unknown", true) || voice.gender.equals(normalizedGender, true))
+        }?.id ?: GeminiStudioVoices.catalog.firstOrNull { it.id !in usedVoices }?.id
+            ?: GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+
+        val created = CharacterEntity(
+            id = candidateId,
+            bookId = currentBookId,
+            name = cleanName,
+            aliases = normalizeAliasesString(aliases, cleanName),
+            gender = normalizedGender,
+            age = normalizedAge,
+            voiceTraits = voiceTraits.trim(),
+            assignedVoiceId = resolvedVoice
+        )
+        _uiState.update { state ->
+            state.copy(characters = state.characters + created)
+        }
+        syncContextToSession(forceWhenDifferentBook = false)
+        viewModelScope.launch(NonCancellable) {
+            try {
+                characterDao?.insertCharacter(created)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun updateCharacterDetails(
+        character: CharacterEntity,
+        name: String,
+        aliases: String,
+        gender: String,
+        age: String,
+        voiceTraits: String,
+        assignedVoiceId: String?
+    ) {
+        val isNarrator = isNarratorEntity(character)
+        val cleanName = if (isNarrator) "Narrator" else name.trim().ifBlank { character.name }
+        val resolvedVoice = assignedVoiceId?.trim()?.takeIf { it.isNotBlank() }?.let {
+            GeminiStudioVoices.getVoice(it)?.id ?: it
+        } ?: character.assignedVoiceId
+        val updated = character.copy(
+            name = cleanName,
+            aliases = if (isNarrator) "" else normalizeAliasesString(aliases, cleanName),
+            gender = gender.trim().ifBlank { "unknown" },
+            age = age.trim().ifBlank { "unknown" },
+            voiceTraits = voiceTraits.trim(),
+            assignedVoiceId = resolvedVoice
+        )
+        _uiState.update { state ->
+            state.copy(
+                characters = state.characters.map { if (it.id == updated.id) updated else it }
+            )
+        }
+        syncContextToSession(forceWhenDifferentBook = false)
+        viewModelScope.launch(NonCancellable) {
+            try {
+                characterDao?.updateCharacter(updated)
+            } catch (_: Throwable) {
             }
         }
     }
@@ -1136,8 +1621,110 @@ class ReaderViewModel @Inject constructor(
             )
         }
         syncContextToSession(forceWhenDifferentBook = false)
-        viewModelScope.launch {
-            characterDao?.updateCharacter(updated)
+        viewModelScope.launch(NonCancellable) {
+            try {
+                characterDao?.updateCharacter(updated)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun deleteCharacter(character: CharacterEntity) {
+        if (isNarratorEntity(character)) return
+        val targetBookId = character.bookId.ifBlank { bookId }
+        val remainingIds = _uiState.value.characters
+            .filterNot { it.id == character.id }
+            .map { it.id.lowercase() }
+            .toSet()
+
+        _uiState.update { state ->
+            state.copy(characters = state.characters.filterNot { it.id == character.id })
+        }
+        sessionManager.invalidateNarrationLines(targetBookId)
+        syncContextToSession(forceWhenDifferentBook = false)
+        viewModelScope.launch(NonCancellable) {
+            try {
+                if (targetBookId.isNotBlank()) {
+                    narrationDao?.reassignSpeakerForBook(
+                        bookId = targetBookId,
+                        oldSpeakerId = character.id,
+                        newSpeakerId = "narrator"
+                    )
+                    val unprefixed = character.id.removePrefix("${targetBookId}_")
+                    if (unprefixed != character.id && unprefixed.isNotBlank() && unprefixed.lowercase() !in remainingIds) {
+                        narrationDao?.reassignSpeakerForBook(
+                            bookId = targetBookId,
+                            oldSpeakerId = unprefixed,
+                            newSpeakerId = "narrator"
+                        )
+                    }
+                }
+                characterDao?.deleteCharacter(character)
+                sessionManager.invalidateNarrationLines(targetBookId)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun mergeCharacters(source: CharacterEntity, target: CharacterEntity) {
+        if (source.id == target.id || isNarratorEntity(source)) return
+        val targetBookId = target.bookId.ifBlank { source.bookId }.ifBlank { bookId }
+        val mergingIntoNarrator = isNarratorEntity(target)
+        val mergedTarget = if (mergingIntoNarrator) {
+            target
+        } else {
+            val combinedAliases = mergeAliasLists(
+                canonicalName = target.name,
+                first = parseAliasesList(target.aliases),
+                second = listOf(source.name) + parseAliasesList(source.aliases)
+            )
+            target.copy(
+                aliases = combinedAliases.joinToString(", "),
+                gender = pickNonUnknownField(target.gender, source.gender),
+                age = pickNonUnknownField(target.age, source.age),
+                voiceTraits = target.voiceTraits.ifBlank { source.voiceTraits },
+                assignedVoiceId = target.assignedVoiceId?.takeIf { it.isNotBlank() } ?: source.assignedVoiceId
+            )
+        }
+        val remainingIds = _uiState.value.characters
+            .filterNot { it.id == source.id }
+            .map { it.id.lowercase() }
+            .toSet()
+
+        _uiState.update { state ->
+            state.copy(
+                characters = state.characters
+                    .filterNot { it.id == source.id }
+                    .map { if (it.id == mergedTarget.id) mergedTarget else it }
+            )
+        }
+        sessionManager.invalidateNarrationLines(targetBookId)
+        syncContextToSession(forceWhenDifferentBook = false)
+        val newSpeakerId = if (mergingIntoNarrator) "narrator" else mergedTarget.id
+        viewModelScope.launch(NonCancellable) {
+            try {
+                if (!mergingIntoNarrator) {
+                    characterDao?.updateCharacter(mergedTarget)
+                }
+                if (targetBookId.isNotBlank()) {
+                    narrationDao?.reassignSpeakerForBook(
+                        bookId = targetBookId,
+                        oldSpeakerId = source.id,
+                        newSpeakerId = newSpeakerId
+                    )
+                    val unprefixed = source.id.removePrefix("${targetBookId}_")
+                    if (unprefixed != source.id && unprefixed.isNotBlank() && unprefixed.lowercase() !in remainingIds) {
+                        narrationDao?.reassignSpeakerForBook(
+                            bookId = targetBookId,
+                            oldSpeakerId = unprefixed,
+                            newSpeakerId = newSpeakerId
+                        )
+                    }
+                }
+                characterDao?.deleteCharacter(source)
+                sessionManager.invalidateNarrationLines(targetBookId)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -1228,8 +1815,10 @@ class ReaderViewModel @Inject constructor(
         val clampedProgress = progress.coerceIn(0f, 1f)
         val targetBookId = bookId
         var resolvedChapter = 0
+        var chapterDidChange = false
         var chapterChangedWhileNotPlaying = false
         _uiState.update { state ->
+            chapterDidChange = false
             val chapterIndex = resolveChapterIndex(
                 chapters = state.chapters,
                 cfi = cfi,
@@ -1239,6 +1828,7 @@ class ReaderViewModel @Inject constructor(
             )
             resolvedChapter = chapterIndex
             val chapterChanged = chapterIndex != state.currentChapterIndex
+            chapterDidChange = chapterChanged
             chapterChangedWhileNotPlaying = !state.isNarrationPlaying && (
                 chapterChanged || (
                     sessionManager.isSessionActiveFor(targetBookId) &&
@@ -1283,6 +1873,13 @@ class ReaderViewModel @Inject constructor(
                 !sessionManager.sessionState.value.isPlaying
             ) {
                 syncContextToSession(forceWhenDifferentBook = false)
+            }
+            if (chapterDidChange) {
+                scheduleAutoCastScan(
+                    targetBookId = targetBookId,
+                    chapterIndex = resolvedChapter,
+                    includeLookahead = true
+                )
             }
         }
     }
@@ -1460,6 +2057,7 @@ class ReaderViewModel @Inject constructor(
             state.extractedBook?.format.equals("PDF", ignoreCase = true)
         val parsed = parseParagraphsJson(paragraphsJson, resolvedChapter, isPdf)
         if (parsed.isNotEmpty()) {
+            val wasEmpty = state.paragraphs.isEmpty()
             val changed = parsed != state.paragraphs
             val derivedPara = deriveParagraphIndexFromCfi(state.currentCfi, parsed)
             _uiState.update {
@@ -1469,6 +2067,14 @@ class ReaderViewModel @Inject constructor(
                 )
             }
             syncContextToSession(forceWhenDifferentBook = false)
+            if (wasEmpty && backgroundCastJob?.isActive == true && lastAutoScanTarget == (state.bookId to resolvedChapter)) {
+                backgroundCastJob?.cancel()
+            }
+            scheduleAutoCastScan(
+                targetBookId = state.bookId,
+                chapterIndex = resolvedChapter,
+                includeLookahead = true
+            )
             if (_uiState.value.isBilingualEnabled && (changed || state.bilingualTranslations.isEmpty())) {
                 sessionManager.translateCurrentChapterPublic(fallbackDemoIfEmpty = false)
             }
@@ -1536,6 +2142,11 @@ class ReaderViewModel @Inject constructor(
 
     override fun onReaderError(message: String) {
         if (message.isNotBlank()) {
+            DiagnosticLogBuffer.record(
+                tag = "ReaderWebView",
+                message = message,
+                level = "ERROR"
+            )
             _uiState.update { it.copy(errorMessage = message) }
         }
     }
@@ -1644,51 +2255,192 @@ class ReaderViewModel @Inject constructor(
         }
     }
 
-    private fun detectSpeakersHeuristically(paragraphs: List<String>, targetBookId: String): List<Character> {
-        val discovered = linkedMapOf<String, Character>()
-        for (para in paragraphs) {
-            val colonName = COLON_SPEAKER_REGEX.find(para)?.groupValues?.get(1)?.trim()
-            if (!colonName.isNullOrBlank() && colonName !in STOPWORD_SPEAKERS) {
-                discovered.putIfAbsent(
-                    colonName.lowercase(),
-                    Character(
-                        id = "${targetBookId}_${colonName.lowercase().replace(Regex("[^a-z0-9]"), "_")}",
-                        bookId = targetBookId,
-                        name = colonName,
-                        voiceTraits = "conversational"
-                    )
-                )
-            }
-            for (match in AFTER_QUOTE_SPEAKER_REGEX.findAll(para)) {
-                val name = match.groupValues[1].trim()
-                if (name.isNotBlank() && name !in STOPWORD_SPEAKERS) {
-                    discovered.putIfAbsent(
-                        name.lowercase(),
-                        Character(
-                            id = "${targetBookId}_${name.lowercase().replace(Regex("[^a-z0-9]"), "_")}",
-                            bookId = targetBookId,
-                            name = name,
-                            voiceTraits = "expressive"
-                        )
-                    )
+    private fun detectSpeakersHeuristicallyWithLines(
+        paragraphs: List<ReaderParagraph>,
+        targetBookId: String,
+        chapterId: String,
+        existingCharacters: List<Character>
+    ): Pair<List<Character>, List<NarrationLineEntity>> {
+        val discoveredByKey = linkedMapOf<String, Character>()
+        val existingTermMap = mutableMapOf<String, Character>()
+        existingCharacters
+            .filterNot { isNarratorDescriptor(it.id, it.name) }
+            .forEach { existing ->
+                val cleanName = existing.name.trim()
+                if (cleanName.isNotEmpty()) {
+                    existingTermMap.putIfAbsent(cleanName.lowercase(), existing)
+                }
+                existing.aliases.forEach { alias ->
+                    val cleanAlias = alias.trim()
+                    if (cleanAlias.isNotEmpty()) {
+                        existingTermMap.putIfAbsent(cleanAlias.lowercase(), existing)
+                    }
                 }
             }
-            for (match in BEFORE_QUOTE_SPEAKER_REGEX.findAll(para)) {
-                val name = match.groupValues[1].trim()
-                if (name.isNotBlank() && name !in STOPWORD_SPEAKERS) {
-                    discovered.putIfAbsent(
-                        name.lowercase(),
-                        Character(
-                            id = "${targetBookId}_${name.lowercase().replace(Regex("[^a-z0-9]"), "_")}",
-                            bookId = targetBookId,
-                            name = name,
-                            voiceTraits = "expressive"
-                        )
-                    )
-                }
+
+        fun resolveOrCreateSpeaker(rawName: String, traits: String): Character? {
+            val cleanName = rawName.trim()
+            if (cleanName.isEmpty() || cleanName in STOPWORD_SPEAKERS) return null
+            val key = cleanName.lowercase()
+            existingTermMap[key]?.let { existing ->
+                discoveredByKey.putIfAbsent(existing.id.lowercase(), existing)
+                return existing
             }
+            discoveredByKey[key]?.let { return it }
+            val slug = cleanName.lowercase().replace(Regex("[^a-z0-9]+"), "_").trim('_').ifBlank { "char" }
+            val candidateId = "${targetBookId}_$slug"
+            val created = Character(
+                id = candidateId,
+                bookId = targetBookId,
+                name = cleanName,
+                voiceTraits = traits
+            )
+            discoveredByKey[key] = created
+            discoveredByKey.putIfAbsent(candidateId.lowercase(), created)
+            return created
         }
-        return discovered.values.toList()
+
+        val lines = mutableListOf<NarrationLineEntity>()
+        for (para in paragraphs) {
+            val text = para.text
+            if (text.isBlank()) continue
+            var detectedSpeaker: Character? = null
+            var detectedStyle: String? = null
+
+            val colonName = COLON_SPEAKER_REGEX.find(text)?.groupValues?.getOrNull(1)?.trim()
+            if (!colonName.isNullOrBlank()) {
+                detectedSpeaker = resolveOrCreateSpeaker(colonName, "conversational")
+            }
+
+            AFTER_QUOTE_SPEAKER_REGEX.find(text)?.let { match ->
+                val name = match.groupValues.getOrNull(2)?.trim().orEmpty()
+                val verb = match.groupValues.getOrNull(1)?.trim().orEmpty()
+                val char = resolveOrCreateSpeaker(name, "expressive")
+                if (char != null && detectedSpeaker == null) {
+                    detectedSpeaker = char
+                    detectedStyle = verbToDeliveryStyle(verb)
+                }
+            }
+
+            BEFORE_QUOTE_SPEAKER_REGEX.find(text)?.let { match ->
+                val name = match.groupValues.getOrNull(1)?.trim().orEmpty()
+                val verb = match.groupValues.getOrNull(2)?.trim().orEmpty()
+                val char = resolveOrCreateSpeaker(name, "expressive")
+                if (char != null && detectedSpeaker == null) {
+                    detectedSpeaker = char
+                    detectedStyle = verbToDeliveryStyle(verb)
+                }
+            }
+
+            if (detectedSpeaker == null) {
+                ACTION_BEAT_BEFORE_QUOTE_REGEX.find(text)?.let { match ->
+                    val name = match.groupValues.getOrNull(1)?.trim().orEmpty()
+                    detectedSpeaker = resolveOrCreateSpeaker(name, "expressive")
+                }
+            }
+
+            lines.add(
+                NarrationLineEntity(
+                    id = UUID.randomUUID().toString(),
+                    chapterId = chapterId,
+                    paraIndex = para.index,
+                    startOffset = 0,
+                    endOffset = text.length,
+                    speakerId = detectedSpeaker?.id ?: "narrator",
+                    style = detectedStyle,
+                    cfi = para.cfi
+                )
+            )
+        }
+
+        val uniqueCharacters = discoveredByKey.values.distinctBy { it.id }
+        return uniqueCharacters to lines
+    }
+
+    private fun verbToDeliveryStyle(verb: String): String? = when (verb.lowercase()) {
+        "whispered" -> "whispering"
+        "murmured", "muttered" -> "quiet, intense"
+        "shouted", "yelled", "screamed", "cried" -> "urgent, raised voice"
+        "sighed" -> "sighing"
+        "gasped" -> "breathless"
+        "laughed" -> "amused"
+        "hissed", "snapped", "growled" -> "sharp, tense"
+        else -> null
+    }
+
+    private fun partitionIntoCastingBatches(
+        paragraphs: List<ReaderParagraph>,
+        maxParagraphs: Int = 35,
+        maxChars: Int = 12_000
+    ): List<List<ReaderParagraph>> {
+        if (paragraphs.isEmpty()) return emptyList()
+        val batches = mutableListOf<List<ReaderParagraph>>()
+        var current = mutableListOf<ReaderParagraph>()
+        var currentChars = 0
+        for (para in paragraphs) {
+            val len = para.text.length
+            if (current.isNotEmpty() && (current.size >= maxParagraphs || currentChars + len > maxChars)) {
+                batches.add(current)
+                current = mutableListOf()
+                currentChars = 0
+            }
+            current.add(para)
+            currentChars += len
+        }
+        if (current.isNotEmpty()) {
+            batches.add(current)
+        }
+        return batches
+    }
+
+    private fun isNarratorDescriptor(id: String, name: String): Boolean {
+        val cleanId = id.trim()
+        val cleanName = name.trim()
+        return cleanId.equals("narrator", ignoreCase = true) ||
+            cleanId.endsWith("_narrator", ignoreCase = true) ||
+            cleanName.equals("Narrator", ignoreCase = true)
+    }
+
+    private fun isNarratorEntity(character: CharacterEntity): Boolean =
+        isNarratorDescriptor(character.id, character.name)
+
+    private fun isNarratorSpeakerId(speakerId: String): Boolean {
+        val clean = speakerId.trim()
+        return clean.equals("narrator", ignoreCase = true) ||
+            clean.endsWith("_narrator", ignoreCase = true)
+    }
+
+    private fun parseAliasesList(aliases: String): List<String> {
+        if (aliases.isBlank()) return emptyList()
+        return aliases.split(',', '\n')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinctBy { it.lowercase() }
+    }
+
+    private fun normalizeAliasesString(raw: String, excludeName: String): String {
+        return parseAliasesList(raw)
+            .filterNot { it.equals(excludeName.trim(), ignoreCase = true) }
+            .joinToString(", ")
+    }
+
+    private fun mergeAliasLists(
+        canonicalName: String,
+        first: List<String>,
+        second: List<String>
+    ): List<String> {
+        return (first + second)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.equals(canonicalName.trim(), ignoreCase = true) }
+            .distinctBy { it.lowercase() }
+    }
+
+    private fun pickNonUnknownField(primary: String?, secondary: String?): String {
+        val first = primary?.trim().orEmpty()
+        if (first.isNotEmpty() && !first.equals("unknown", ignoreCase = true)) return first
+        val second = secondary?.trim().orEmpty()
+        if (second.isNotEmpty() && !second.equals("unknown", ignoreCase = true)) return second
+        return first.ifEmpty { second.ifEmpty { "unknown" } }
     }
 
     companion object {
@@ -1697,14 +2449,23 @@ class ReaderViewModel @Inject constructor(
         private val PDF_PAGE_CFI_REGEX = Regex("""pdf:page:(\d+)""")
         private val PDF_PARA_CFI_REGEX = Regex("""pdf:page:(\d+):p:(\d+)""")
         private val COLON_SPEAKER_REGEX = Regex("""^([A-Z][a-zA-Z]{1,24}(?:\s+[A-Z][a-zA-Z]{1,20})?):\s+\S""")
+        private const val REPORTING_VERBS =
+            "said|asked|replied|whispered|shouted|murmured|exclaimed|answered|cried|added|noted|observed|muttered|called|sighed|gasped|laughed|hissed|snapped|growled|warned|begged|pleaded|countered|responded|yelled|screamed"
         private val AFTER_QUOTE_SPEAKER_REGEX = Regex(
-            """["“”][^"“”]{2,}["””]\s*,?\s*(?:said|asked|replied|whispered|shouted|murmured|exclaimed|answered|cried|added|noted|observed|muttered|called)\s+([A-Z][a-zA-Z]{1,24})\b"""
+            """["“”«»「」『』][^"“”«»「」『』]{2,}["“”«»「」『』]\s*,?\s*($REPORTING_VERBS)\s+([A-Z][a-zA-Z]{1,24})\b"""
         )
         private val BEFORE_QUOTE_SPEAKER_REGEX = Regex(
-            """\b([A-Z][a-zA-Z]{1,24})\s+(?:said|asked|replied|whispered|shouted|murmured|exclaimed|answered|cried|added|noted|observed|muttered|called)\s*[,:]\s*["“]"""
+            """\b([A-Z][a-zA-Z]{1,24})\s+($REPORTING_VERBS)\s*[,:]\s*["“«「『]"""
+        )
+        private val ACTION_BEAT_BEFORE_QUOTE_REGEX = Regex(
+            """^([A-Z][a-zA-Z]{1,24})\s+[^"“”«»「」『』]{2,40}[.!]\s+["“«「『]"""
         )
         private val STOPWORD_SPEAKERS = setOf(
-            "The", "And", "But", "She", "He", "They", "It", "We", "You", "Chapter", "Page", "Narrator", "This", "That"
+            "The", "And", "But", "She", "He", "They", "It", "We", "You", "Chapter", "Page",
+            "Narrator", "This", "That", "There", "Then", "Now", "Later", "Meanwhile",
+            "Suddenly", "Finally", "When", "While", "What", "Why", "How", "Where", "Who",
+            "Look", "Wait", "Please", "Everyone", "Someone", "Nobody", "After", "Before",
+            "Yes", "No", "Well", "Oh", "Ah", "However", "Instead", "Still", "Perhaps"
         )
     }
 }

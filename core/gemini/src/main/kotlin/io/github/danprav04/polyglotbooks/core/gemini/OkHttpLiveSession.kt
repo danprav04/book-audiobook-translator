@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import android.util.Log
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,7 +36,9 @@ class OkHttpLiveSession(
         explicitNulls = false
     },
     private val connectTimeoutMs: Long = 10_000L,
-    private val maxReconnectAttempts: Int = 2
+    private val maxReconnectAttempts: Int = 2,
+    private val awaitSetupCompleteBeforeSend: Boolean = false,
+    private val reconnectOnGoAway: Boolean = true
 ) : LiveSession {
 
     internal val client: OkHttpClient
@@ -84,6 +87,9 @@ class OkHttpLiveSession(
     private var openDeferred: CompletableDeferred<Unit>? = null
 
     @Volatile
+    private var setupCompleteDeferred: CompletableDeferred<Unit>? = null
+
+    @Volatile
     private var isManualDisconnect = false
 
     @Volatile
@@ -110,6 +116,7 @@ class OkHttpLiveSession(
         isManualDisconnect = false
         hasEverOpened = false
         reconnectAttempts = 0
+        DiagnosticLogBuffer.record(TAG, "Connecting Live session (model=${setup.model})")
 
         val signal = startWebSocketInternal(apiKey, setup)
         if (signal.isCompleted) {
@@ -144,7 +151,9 @@ class OkHttpLiveSession(
 
         val connectionId = ++activeConnectionId
         val signal = CompletableDeferred<Unit>()
+        val setupSignal = CompletableDeferred<Unit>()
         openDeferred = signal
+        setupCompleteDeferred = setupSignal
 
         webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -184,11 +193,16 @@ class OkHttpLiveSession(
                     if (!signal.isCompleted) {
                         signal.completeExceptionally(err)
                     }
+                    if (!setupSignal.isCompleted) {
+                        setupSignal.completeExceptionally(err)
+                    }
                     handleUnexpectedDisconnect(
                         cause = err,
                         setupWasComplete = setupWasComplete,
                         closeCode = code
                     )
+                } else if (!setupSignal.isCompleted) {
+                    setupSignal.completeExceptionally(IOException("WebSocket closed: code=$code, reason=$reason"))
                 }
             }
 
@@ -218,6 +232,9 @@ class OkHttpLiveSession(
                 if (!signal.isCompleted) {
                     signal.completeExceptionally(failure)
                 }
+                if (!setupSignal.isCompleted) {
+                    setupSignal.completeExceptionally(failure)
+                }
                 if (!isManualDisconnect) {
                     handleUnexpectedDisconnect(
                         cause = failure,
@@ -239,25 +256,31 @@ class OkHttpLiveSession(
                 is LiveServerMessage.SetupCompleteMessage -> {
                     _isSetupComplete = true
                     reconnectAttempts = 0
+                    setupCompleteDeferred?.complete(Unit)
+                    DiagnosticLogBuffer.record(TAG, "SetupComplete received")
                 }
                 is LiveServerMessage.SessionResumptionUpdateMessage -> {
                     val handle = serverMsg.sessionResumptionUpdate.newHandle
                     if (!handle.isNullOrBlank()) {
                         currentResumptionHandle = handle
-                        logD("Tracked new session resumption handle: $handle")
+                        logD("Tracked new session resumption handle (len=${handle.length})")
                     }
                 }
                 is LiveServerMessage.ServerContentMessage -> {
                     reconnectAttempts = 0
                 }
                 is LiveServerMessage.GoAwayMessage -> {
-                    logW("Received GoAway message. Reconnecting with session resumption...")
-                    reconnectAttempts = 0
-                    reconnectWithResumption()
+                    if (reconnectOnGoAway) {
+                        logW("Received GoAway message (timeLeft=${serverMsg.goAway.timeLeft ?: "none"}). Reconnecting with session resumption...")
+                        reconnectAttempts = 0
+                        reconnectWithResumption()
+                    } else {
+                        logW("Received GoAway message (timeLeft=${serverMsg.goAway.timeLeft ?: "none"}). Deferring rotation to session owner.")
+                    }
                 }
                 is LiveServerMessage.ErrorMessage -> {
                     _lastError = serverMsg.error
-                    logW("Received server ErrorMessage: ${serverMsg.error}")
+                    logW("Received server ErrorMessage: code=${serverMsg.error.code} status=${serverMsg.error.status} msg=${serverMsg.error.message}")
                 }
                 is LiveServerMessage.UsageMetadataMessage -> {
                     // Metadata frame; forwarded to collectors below.
@@ -269,7 +292,7 @@ class OkHttpLiveSession(
                 }
             }
         } catch (e: Exception) {
-            logE("Failed to parse incoming server message: $text", e)
+            logE("Failed to parse incoming server message (${text.length} chars)", e)
         }
     }
 
@@ -322,8 +345,57 @@ class OkHttpLiveSession(
                 }
             }
         }
+
+        if (awaitSetupCompleteBeforeSend && message !is LiveClientMessage.SetupMessage) {
+            var setupWaitAttempts = 0
+            while (!_isSetupComplete && !isManualDisconnect && setupWaitAttempts < maxReconnectAttempts + 2) {
+                setupWaitAttempts++
+                val pendingSetup = setupCompleteDeferred ?: break
+                val completedInTime = if (connectTimeoutMs > 0) {
+                    withTimeoutOrNull(connectTimeoutMs) {
+                        try {
+                            pendingSetup.await()
+                            true
+                        } catch (t: Throwable) {
+                            if (setupCompleteDeferred === pendingSetup || isManualDisconnect) {
+                                throw t
+                            }
+                            false
+                        }
+                    }
+                } else {
+                    try {
+                        pendingSetup.await()
+                        true
+                    } catch (t: Throwable) {
+                        if (setupCompleteDeferred === pendingSetup || isManualDisconnect) {
+                            throw t
+                        }
+                        false
+                    }
+                }
+                if (completedInTime == null) {
+                    throw IOException("Timed out waiting for Gemini Live setupComplete")
+                }
+            }
+            if (!_isSetupComplete || !_isConnected || webSocket == null) {
+                throw IOException("Cannot send Live message before session setup completes")
+            }
+        }
+
         val jsonStr = json.encodeToString(message)
-        webSocket?.send(jsonStr) ?: logW("Attempted to send message while WebSocket is null")
+        val socket = webSocket
+        if (socket == null) {
+            logW("Attempted to send message while WebSocket is null")
+            if (awaitSetupCompleteBeforeSend) {
+                throw IOException("Attempted to send message while WebSocket is null")
+            }
+            return
+        }
+        val enqueued = socket.send(jsonStr)
+        if (!enqueued && awaitSetupCompleteBeforeSend) {
+            throw IOException("Failed to enqueue message on Live WebSocket")
+        }
     }
 
     override suspend fun disconnect() {
@@ -331,6 +403,9 @@ class OkHttpLiveSession(
         val pendingOpen = openDeferred
         openDeferred = null
         pendingOpen?.cancel()
+        val pendingSetup = setupCompleteDeferred
+        setupCompleteDeferred = null
+        pendingSetup?.cancel()
         closeCurrentSocketQuietly()
     }
 
@@ -373,6 +448,7 @@ class OkHttpLiveSession(
     }
 
     private fun logW(msg: String) {
+        DiagnosticLogBuffer.record(TAG, msg, level = "WARN")
         try {
             Log.w(TAG, msg)
         } catch (_: Throwable) {
@@ -380,6 +456,7 @@ class OkHttpLiveSession(
     }
 
     private fun logE(msg: String, t: Throwable) {
+        DiagnosticLogBuffer.record(TAG, msg, level = "ERROR", throwable = t)
         try {
             Log.e(TAG, msg, t)
         } catch (_: Throwable) {
@@ -406,6 +483,7 @@ class OkHttpLiveSession(
 
 interface LiveSessionFactory {
     fun create(): LiveSession
+    fun create(reconnectOnGoAway: Boolean): LiveSession = create()
 }
 
 class DefaultLiveSessionFactory(
@@ -432,5 +510,11 @@ class DefaultLiveSessionFactory(
         }
     }
 
-    override fun create(): LiveSession = OkHttpLiveSession(okHttpClient = configuredClient)
+    override fun create(): LiveSession = create(reconnectOnGoAway = true)
+
+    override fun create(reconnectOnGoAway: Boolean): LiveSession = OkHttpLiveSession(
+        okHttpClient = configuredClient,
+        awaitSetupCompleteBeforeSend = true,
+        reconnectOnGoAway = reconnectOnGoAway
+    )
 }

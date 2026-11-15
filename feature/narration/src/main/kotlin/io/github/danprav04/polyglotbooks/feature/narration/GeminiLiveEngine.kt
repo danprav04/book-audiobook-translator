@@ -15,9 +15,11 @@ import io.github.danprav04.polyglotbooks.core.gemini.SetupConfig
 import io.github.danprav04.polyglotbooks.core.gemini.SpeechConfig
 import io.github.danprav04.polyglotbooks.core.gemini.VoiceConfig
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
+import io.github.danprav04.polyglotbooks.core.model.PunctuationDialogueHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -82,18 +84,35 @@ class GeminiLiveEngine(
     fun openStreamingSession(
         maxTurnsPerSession: Int = DEFAULT_MAX_TURNS_PER_SESSION,
         maxCharsPerSession: Int = DEFAULT_MAX_CHARS_PER_SESSION,
-        dispatcher: CoroutineDispatcher = Dispatchers.Unconfined
+        dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
+        bufferAndVerifyTurns: Boolean = false
     ): LiveNarrationSession = LiveNarrationSession(
         maxTurnsPerSession = maxTurnsPerSession.coerceAtLeast(1),
         maxCharsPerSession = maxCharsPerSession.coerceAtLeast(1),
-        dispatcher = dispatcher
+        dispatcher = dispatcher,
+        bufferAndVerifyTurns = bufferAndVerifyTurns
     )
 
     override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+        val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+        when (resolved.kind) {
+            PunctuationDialogueHelper.PunctuationKind.EMPTY -> return@flow
+            PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER -> {
+                emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
+                return@flow
+            }
+            else -> Unit
+        }
+        val effectiveRequest = if (resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE) {
+            request.copy(text = resolved.spokenText, style = resolved.styleCue)
+        } else {
+            request
+        }
+
         if (liveSessionFactory == null) {
             try {
-                val outputText = transcriptProvider(request)
-                val similarity = calculateWordOverlapSimilarity(request.text, outputText)
+                val outputText = transcriptProvider(effectiveRequest)
+                val similarity = calculateWordOverlapSimilarity(effectiveRequest.text, outputText)
 
                 if (similarity >= SIMILARITY_THRESHOLD) {
                     val dummyData = ByteArray(4800) { 0 }
@@ -108,7 +127,10 @@ class GeminiLiveEngine(
             return@flow
         }
 
-        val session = openStreamingSession(maxTurnsPerSession = 1)
+        val session = openStreamingSession(
+            maxTurnsPerSession = 1,
+            bufferAndVerifyTurns = true
+        )
         try {
             emitAll(session.synthesizeTurnStreaming(request))
         } finally {
@@ -120,12 +142,13 @@ class GeminiLiveEngine(
 
     /**
      * Long-lived Live narration session managing one active [LiveSession] across consecutive
-     * 1-paragraph turns with automatic session rotation and immediate PCM chunk streaming.
+     * 1-paragraph turns with automatic session rotation and immediate or verified-turn PCM emission.
      */
     inner class LiveNarrationSession internal constructor(
         private val maxTurnsPerSession: Int,
         private val maxCharsPerSession: Int,
-        dispatcher: CoroutineDispatcher
+        dispatcher: CoroutineDispatcher,
+        private val bufferAndVerifyTurns: Boolean = false
     ) {
         private val sessionScope = CoroutineScope(SupervisorJob() + dispatcher)
         private val turnMutex = Mutex()
@@ -159,21 +182,34 @@ class GeminiLiveEngine(
 
         /**
          * Synthesizes one paragraph [request] over the reusable Live connection, emitting decoded
-         * [PcmChunk]s immediately as server audio frames arrive.
+         * [PcmChunk]s either immediately as frames arrive or once a full complete turn is verified
+         * when `bufferAndVerifyTurns` is enabled.
          *
          * Rotates to a fresh Live connection beforehand if the active session is disconnected,
-         * encountered an error/GoAway, changed voice/style/language setup, or reached
+         * encountered an error/interruption/GoAway, changed voice/style/language setup, or reached
          * [maxTurnsPerSession] / [maxCharsPerSession]. Falls back to [fallbackEngine] if no Live
-         * candidate produces audio.
+         * candidate produces a valid turn.
          */
         fun synthesizeTurnStreaming(request: SynthesisRequest): Flow<PcmChunk> = flow {
-            if (request.text.isBlank()) {
-                return@flow
+            val resolved = PunctuationDialogueHelper.resolve(request.text, request.style)
+            when (resolved.kind) {
+                PunctuationDialogueHelper.PunctuationKind.EMPTY -> return@flow
+                PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER -> {
+                    emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
+                    return@flow
+                }
+                else -> Unit
             }
-            if (request.text.none { it.isLetterOrDigit() }) {
-                emit(PcmChunk(data = ByteArray(4800) { 0 }, sampleRate = 24000, channels = 1))
-                return@flow
+            val isExpressivePunctuation = resolved.kind == PunctuationDialogueHelper.PunctuationKind.EXPRESSIVE_DIALOGUE
+            val effectiveRequest = if (isExpressivePunctuation) {
+                request.copy(
+                    text = resolved.spokenText,
+                    style = resolved.styleCue
+                )
+            } else {
+                request
             }
+
             val factory = liveSessionFactory
             val apiKey = try {
                 apiKeyProvider?.invoke()?.trim()
@@ -189,47 +225,57 @@ class GeminiLiveEngine(
             ensureCatalogLoaded(apiKey)
 
             turnMutex.withLock {
-                val requestKey = SessionSetupKey.from(request)
+                val requestKey = SessionSetupKey.from(effectiveRequest)
                 val primaryModel = resolvePrimaryModel()
                 val candidates = candidateModelsFor(primaryModel)
-                val estimatedTokens = estimateTokens(request.text)
-                val timeoutMs = turnTimeoutMsProvider(request.text).coerceAtLeast(1_000L)
+                val estimatedTokens = estimateTokens(effectiveRequest.text)
+                val timeoutMs = turnTimeoutMsProvider(effectiveRequest.text).coerceAtLeast(1_000L)
 
                 var audioProduced = false
-                var failedCandidateModel: String? = null
+                var failedReusableModel: String? = null
+                var reusableModelHardError = false
 
                 // 1. Try reusing the currently open session if compatible and within rotation limits.
                 val reusableSession = liveSession
                 val reusableModel = currentModel
-                if (reusableSession != null && reusableModel != null && canReuseCurrentSession(reusableSession, requestKey, request.text.length)) {
+                if (reusableSession != null && reusableModel != null && canReuseCurrentSession(reusableSession, requestKey, effectiveRequest.text.length)) {
                     val outcome = executeTurnOnCurrentSession(
                         session = reusableSession,
                         cleanModel = reusableModel,
-                        request = request,
+                        request = effectiveRequest,
                         estimatedTokens = estimatedTokens,
                         timeoutMs = timeoutMs,
+                        isExpressivePunctuation = isExpressivePunctuation,
                         emitChunk = { chunk -> emit(chunk) }
                     )
                     audioProduced = outcome.emittedAnyAudio
                     if (audioProduced) {
                         turnsInSession++
-                        charsInSession += request.text.length
+                        charsInSession += effectiveRequest.text.length
                         if (outcome.rotateAfterTurn) {
                             needsRotationFlag.set(true)
                         }
                         return@withLock
                     }
-                    failedCandidateModel = reusableModel
+                    failedReusableModel = reusableModel
+                    reusableModelHardError = outcome.hardModelError
                     closeCurrentLiveSessionLocked()
                 } else if (reusableSession != null || setupKey != null) {
                     closeCurrentLiveSessionLocked()
                 }
 
-                // 2. Open a fresh Live session (rotating across available candidate models).
+                // 2. Open a fresh Live session (rotating across alternate candidate models first, then optional fresh retry of reused model).
+                val orderedCandidates = buildList {
+                    for (candidateModel in candidates) {
+                        if (candidateModel != failedReusableModel) add(candidateModel)
+                    }
+                    if (failedReusableModel != null && !reusableModelHardError && failedReusableModel in candidates) {
+                        add(failedReusableModel)
+                    }
+                }
                 val countingRotation = hasOpenedAnySession
                 var rotatedThisTurn = false
-                for (candidateModel in candidates) {
-                    if (candidateModel == failedCandidateModel) continue
+                for (candidateModel in orderedCandidates) {
                     if (quotaTracker != null && !quotaTracker.isModelAvailable(candidateModel)) {
                         continue
                     }
@@ -238,7 +284,7 @@ class GeminiLiveEngine(
                         liveSessionFactory = factory,
                         apiKey = apiKey,
                         candidateModel = candidateModel,
-                        request = request,
+                        request = effectiveRequest,
                         requestKey = requestKey,
                         estimatedTokens = estimatedTokens
                     )
@@ -254,14 +300,15 @@ class GeminiLiveEngine(
                     val outcome = executeTurnOnCurrentSession(
                         session = active,
                         cleanModel = candidateModel,
-                        request = request,
+                        request = effectiveRequest,
                         estimatedTokens = estimatedTokens,
                         timeoutMs = timeoutMs,
+                        isExpressivePunctuation = isExpressivePunctuation,
                         emitChunk = { chunk -> emit(chunk) }
                     )
                     if (outcome.emittedAnyAudio) {
                         turnsInSession++
-                        charsInSession += request.text.length
+                        charsInSession += effectiveRequest.text.length
                         if (outcome.rotateAfterTurn) {
                             needsRotationFlag.set(true)
                         }
@@ -271,8 +318,13 @@ class GeminiLiveEngine(
                     closeCurrentLiveSessionLocked()
                 }
 
-                // 3. No Live candidate emitted audio before failing -> fall back cleanly to TTS engine.
+                // 3. No Live candidate emitted usable audio -> fall back cleanly to TTS engine.
                 if (!audioProduced) {
+                    DiagnosticLogBuffer.record(
+                        "GeminiLiveEngine",
+                        "No Live audio emitted (${request.text.length} chars, voice=${request.voiceId}); falling back to TTS",
+                        level = "WARN"
+                    )
                     emitAll(fallbackEngine.synthesize(request))
                 }
             }
@@ -339,6 +391,10 @@ class GeminiLiveEngine(
                 candidateReader = launchSessionReader(session, cleanModel)
                 session.connect(apiKey, setup)
 
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Opened Live narration session (model=$cleanModel, voice=${request.voiceId})"
+                )
                 liveSession = session
                 readerJob = candidateReader
                 setupKey = requestKey
@@ -356,6 +412,12 @@ class GeminiLiveEngine(
                     }
                 }
                 if (e is CancellationException) throw e
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Failed to open Live narration session (model=$cleanModel)",
+                    level = "WARN",
+                    throwable = e
+                )
                 inferErrorCode(e)?.let { code ->
                     quotaTracker?.recordHttpError(
                         modelId = cleanModel,
@@ -371,6 +433,12 @@ class GeminiLiveEngine(
             sessionScope.launch(start = CoroutineStart.UNDISPATCHED) {
                 session.incomingMessages
                     .catch { error ->
+                        DiagnosticLogBuffer.record(
+                            "GeminiLiveEngine",
+                            "Live narration incoming stream failed (model=$cleanModel)",
+                            level = "ERROR",
+                            throwable = error
+                        )
                         needsRotationFlag.set(true)
                         activeChannelRef.get()?.trySend(TurnEvent.StreamFailed(error))
                     }
@@ -407,13 +475,26 @@ class GeminiLiveEngine(
                                 content.outputTranscription?.text?.takeIf { it.isNotBlank() }?.let { text ->
                                     turnChannel.trySend(TurnEvent.Transcript(text.trim()))
                                 }
-                                if (content.turnComplete == true || content.generationComplete == true) {
+                                if (content.interrupted == true) {
+                                    DiagnosticLogBuffer.record(
+                                        "GeminiLiveEngine",
+                                        "Live turn interrupted by server on model=$cleanModel; rotating session",
+                                        level = "WARN"
+                                    )
+                                    needsRotationFlag.set(true)
+                                    turnChannel.trySend(TurnEvent.TurnInterrupted)
+                                } else if (content.turnComplete == true) {
                                     turnChannel.trySend(TurnEvent.TurnComplete)
                                 }
                             }
                             is LiveServerMessage.ErrorMessage -> {
                                 val errCode = msg.error.code ?: 500
                                 val errMsg = msg.error.message ?: "Gemini Live server error"
+                                DiagnosticLogBuffer.record(
+                                    "GeminiLiveEngine",
+                                    "Live narration server error code=$errCode model=$cleanModel: $errMsg",
+                                    level = "ERROR"
+                                )
                                 quotaTracker?.recordHttpError(
                                     modelId = cleanModel,
                                     httpCode = errCode,
@@ -424,6 +505,11 @@ class GeminiLiveEngine(
                             }
                             is LiveServerMessage.GoAwayMessage -> {
                                 // Server announced imminent closure; finish the active turn then rotate cleanly.
+                                DiagnosticLogBuffer.record(
+                                    "GeminiLiveEngine",
+                                    "GoAway received on model=$cleanModel (timeLeft=${msg.goAway.timeLeft ?: "none"}); rotating after turn",
+                                    level = "WARN"
+                                )
                                 needsRotationFlag.set(true)
                             }
                             else -> Unit
@@ -437,14 +523,20 @@ class GeminiLiveEngine(
             request: SynthesisRequest,
             estimatedTokens: Int,
             timeoutMs: Long,
+            isExpressivePunctuation: Boolean = false,
             emitChunk: suspend (PcmChunk) -> Unit
         ): TurnOutcome {
             val turnChannel = Channel<TurnEvent>(Channel.UNLIMITED)
             activeChannelRef.set(turnChannel)
             val transcriptBuilder = StringBuilder()
+            val bufferedChunks = if (bufferAndVerifyTurns) mutableListOf<PcmChunk>() else null
+            var collectedAnyAudio = false
             var emittedAnyAudio = false
+            var completedTurn = false
+            var interrupted = false
             var failed = false
             var timedOut = false
+            var hardModelError = false
 
             try {
                 session.send(
@@ -465,20 +557,39 @@ class GeminiLiveEngine(
                     while (true) {
                         when (val event = turnChannel.receive()) {
                             is TurnEvent.AudioChunk -> {
-                                emittedAnyAudio = true
-                                emitChunk(event.chunk)
+                                collectedAnyAudio = true
+                                if (bufferedChunks != null) {
+                                    bufferedChunks.add(event.chunk)
+                                } else {
+                                    emittedAnyAudio = true
+                                    emitChunk(event.chunk)
+                                }
                             }
                             is TurnEvent.Transcript -> {
                                 if (transcriptBuilder.isNotEmpty()) transcriptBuilder.append(' ')
                                 transcriptBuilder.append(event.text)
                             }
-                            is TurnEvent.TurnComplete -> break
+                            is TurnEvent.TurnComplete -> {
+                                completedTurn = true
+                                break
+                            }
+                            is TurnEvent.TurnInterrupted -> {
+                                interrupted = true
+                                failed = true
+                                break
+                            }
                             is TurnEvent.ServerError -> {
+                                if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
+                                    hardModelError = true
+                                }
                                 failed = true
                                 break
                             }
                             is TurnEvent.StreamFailed -> {
                                 inferErrorCode(event.error)?.let { code ->
+                                    if (code in setOf(400, 401, 403, 404, 429)) {
+                                        hardModelError = true
+                                    }
                                     quotaTracker?.recordHttpError(
                                         modelId = cleanModel,
                                         httpCode = code,
@@ -495,6 +606,11 @@ class GeminiLiveEngine(
 
                 if (!completedNormally) {
                     timedOut = true
+                    DiagnosticLogBuffer.record(
+                        "GeminiLiveEngine",
+                        "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=$collectedAnyAudio)",
+                        level = "WARN"
+                    )
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) {
@@ -503,7 +619,16 @@ class GeminiLiveEngine(
                     }
                     throw e
                 }
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Live turn threw exception (model=$cleanModel)",
+                    level = "ERROR",
+                    throwable = e
+                )
                 inferErrorCode(e)?.let { code ->
+                    if (code in setOf(400, 401, 403, 404, 429)) {
+                        hardModelError = true
+                    }
                     quotaTracker?.recordHttpError(
                         modelId = cleanModel,
                         httpCode = code,
@@ -517,17 +642,43 @@ class GeminiLiveEngine(
             }
 
             val outputTranscript = transcriptBuilder.toString().trim()
+            val similarity = if (outputTranscript.isEmpty()) 1.0 else calculateWordOverlapSimilarity(request.text, outputTranscript)
+            val expressiveTranscriptAcceptable = isExpressivePunctuation &&
+                outputTranscript.split(Regex("\\s+")).count { it.isNotBlank() } <= 4
             val similarityOk = outputTranscript.isEmpty() ||
-                calculateWordOverlapSimilarity(request.text, outputTranscript) >= SIMILARITY_THRESHOLD
+                expressiveTranscriptAcceptable ||
+                similarity >= SIMILARITY_THRESHOLD
+            if (!similarityOk) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Transcript similarity low (${"%.2f".format(similarity)} < $SIMILARITY_THRESHOLD) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+            }
 
-            if (emittedAnyAudio && !failed && !timedOut && similarityOk) {
+            val turnVerifiedComplete = collectedAnyAudio && completedTurn && !failed && !timedOut && !interrupted && similarityOk
+            if (bufferedChunks != null && turnVerifiedComplete) {
+                for (chunk in bufferedChunks) {
+                    emitChunk(chunk)
+                }
+                emittedAnyAudio = true
+            } else if (bufferedChunks != null && collectedAnyAudio && !turnVerifiedComplete) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Discarding unverified partial Live turn on model=$cleanModel (completed=$completedTurn, failed=$failed, timedOut=$timedOut, interrupted=$interrupted, similarityOk=$similarityOk)",
+                    level = "WARN"
+                )
+            }
+
+            if (turnVerifiedComplete || (bufferedChunks == null && emittedAnyAudio && !failed && !timedOut && !interrupted && similarityOk)) {
                 quotaTracker?.recordSuccess(cleanModel, estimatedTokens)
             }
 
-            val rotateAfterTurn = failed || timedOut || !similarityOk || needsRotationFlag.get()
+            val rotateAfterTurn = failed || timedOut || interrupted || !similarityOk || !completedTurn || needsRotationFlag.get()
             return TurnOutcome(
                 emittedAnyAudio = emittedAnyAudio,
-                rotateAfterTurn = rotateAfterTurn
+                rotateAfterTurn = rotateAfterTurn,
+                hardModelError = hardModelError
             )
         }
 
@@ -558,13 +709,15 @@ class GeminiLiveEngine(
         data class AudioChunk(val chunk: PcmChunk) : TurnEvent
         data class Transcript(val text: String) : TurnEvent
         data object TurnComplete : TurnEvent
+        data object TurnInterrupted : TurnEvent
         data class ServerError(val code: Int, val message: String) : TurnEvent
         data class StreamFailed(val error: Throwable) : TurnEvent
     }
 
     private data class TurnOutcome(
         val emittedAnyAudio: Boolean,
-        val rotateAfterTurn: Boolean
+        val rotateAfterTurn: Boolean,
+        val hardModelError: Boolean = false
     )
 
     private data class SessionSetupKey(

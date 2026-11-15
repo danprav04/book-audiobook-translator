@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
@@ -378,13 +379,14 @@ class TranslationPipelineTest {
         }
         // The mutex is released by the real Dispatchers.IO cleanup thread, which re-queues the
         // follow-up start("de") continuation onto this test scheduler. A single blocking
-        // secondStartDone.await(...) would starve the scheduler (the queued continuation can
-        // never run while the test thread blocks), so poll in short wall-clock slices and pump
-        // the scheduler between them.
+        // secondStartDone.await(...) would starve the scheduler, and advanceUntilIdle() alone ignores
+        // backgroundScope tasks when no foreground task is pending, so pump runCurrent() +
+        // advanceUntilIdle() between short waits.
         val deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
         var secondSessionStarted = false
         while (!secondSessionStarted && System.nanoTime() < deadlineNs) {
             secondSessionStarted = secondStartDone.await(10, TimeUnit.MILLISECONDS)
+            runCurrent()
             advanceUntilIdle()
         }
         assertTrue(
@@ -546,5 +548,79 @@ class TranslationPipelineTest {
 
         assertFalse(pipeline.state.value.isRunning)
         assertNull(pipeline.state.value.errorMessage)
+    }
+
+    @Test
+    fun testPlaybackSpeedAppliedBeforeInitAndUnityBypassedOnFormatSwitch() = runTest {
+        val fakeDecoder = object : SourceDecoder {
+            override fun decode(filePath: String, startPositionMs: Long, durationMs: Long): Flow<PcmChunk> = flow {}
+            override fun release() {}
+        }
+        val outputFlow = MutableSharedFlow<TranslationOutput>(extraBufferCapacity = 16)
+        val fakeClient = object : LiveTranslateClient {
+            override val translationStream: Flow<TranslationOutput> = outputFlow.asSharedFlow()
+            override suspend fun start(apiKey: String, targetLanguageCode: String, echoTargetLanguage: Boolean, model: String) {}
+            override suspend fun sendAudio(chunk: PcmChunk) {}
+            override suspend fun stop() {}
+        }
+        val events = mutableListOf<String>()
+        val recordingPlayer = object : PcmPlayer {
+            override val currentPositionMs = kotlinx.coroutines.flow.MutableStateFlow(0L)
+            override fun init(sampleRate: Int, channels: Int) {
+                events.add("init:$sampleRate:$channels")
+            }
+
+            override fun write(chunk: PcmChunk): Int = chunk.data.size
+
+            override fun setPlaybackSpeed(speed: Float) {
+                events.add("speed:$speed")
+            }
+
+            override fun setOriginalAudioVolume(volume: Float) {}
+            override fun play() {
+                events.add("play")
+            }
+
+            override fun pause() {}
+            override fun stop() {}
+            override fun flush() {}
+            override fun release() {}
+        }
+
+        val pipeline = TranslationPipeline(
+            sourceDecoder = fakeDecoder,
+            resampler = StreamingLinearResampler(),
+            chunker = Chunker(3200),
+            pacer = Pacer(),
+            liveTranslateClient = fakeClient,
+            pcmPlayer = recordingPlayer,
+            enablePacingDelay = false
+        )
+
+        pipeline.start(
+            scope = backgroundScope,
+            bookId = "b-speed",
+            filePath = "/tmp/book.m4b",
+            targetLanguage = LanguageCode.SPANISH,
+            apiKey = "valid-key",
+            playbackSpeed = 1.0f
+        )
+        runCurrent()
+        assertEquals(listOf("speed:1.0", "init:24000:1", "play"), events)
+
+        // Format switch at 1.0x should re-init without re-calling setPlaybackSpeed(1.0f)
+        events.clear()
+        outputFlow.emit(TranslationOutput(audioChunk = PcmChunk(ByteArray(480) { 1 }, sampleRate = 16000, channels = 1)))
+        runCurrent()
+        assertEquals(listOf("init:16000:1", "play"), events)
+
+        // Format switch at 1.5x MUST re-apply non-unity speed after init(...)
+        events.clear()
+        pipeline.setPlaybackSpeed(1.5f)
+        outputFlow.emit(TranslationOutput(audioChunk = PcmChunk(ByteArray(480) { 1 }, sampleRate = 48000, channels = 1)))
+        runCurrent()
+        assertEquals(listOf("speed:1.5", "init:48000:1", "speed:1.5", "play"), events)
+
+        pipeline.stop()
     }
 }

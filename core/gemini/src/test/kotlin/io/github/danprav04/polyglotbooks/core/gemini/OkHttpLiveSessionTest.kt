@@ -7,7 +7,10 @@ import io.mockk.mockkStatic
 import io.mockk.slot
 import io.mockk.unmockkStatic
 import io.mockk.verify
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -24,6 +27,7 @@ import org.junit.Test
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class OkHttpLiveSessionTest {
 
     @Before
@@ -350,5 +354,92 @@ class OkHttpLiveSessionTest {
         assertTrue(session2.isSetupComplete)
         listeners[1].onClosing(sockets[1], 4401, "Unauthorized")
         assertEquals(2, listeners.size)
+    }
+
+    @Test
+    fun testAwaitSetupCompleteBeforeSendGatesClientContentUntilSetupComplete() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+        val sentPayloads = mutableListOf<String>()
+
+        every { mockWebSocket.send(any<String>()) } answers {
+            sentPayloads.add(firstArg())
+            true
+        }
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(
+            okHttpClient = mockClient,
+            awaitSetupCompleteBeforeSend = true
+        )
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val listener = listenerSlot.captured
+        listener.onOpen(mockWebSocket, mockk(relaxed = true))
+        assertEquals(1, sentPayloads.size) // Only SetupMessage sent so far
+
+        val sendJob = launch {
+            session.send(
+                LiveClientMessage.ClientContentMessage(
+                    ClientContentData(
+                        turns = listOf(ContentTurn(role = "user", parts = listOf(Part(text = "Hello world")))),
+                        turnComplete = true
+                    )
+                )
+            )
+        }
+        runCurrent()
+        assertFalse("send() must suspend until setupComplete arrives", sendJob.isCompleted)
+        assertEquals(1, sentPayloads.size)
+
+        listener.onMessage(mockWebSocket, """{"setupComplete":{}}""")
+        runCurrent()
+        assertTrue("send() must resume once setupComplete arrives", sendJob.isCompleted)
+        assertEquals(2, sentPayloads.size)
+        assertTrue(sentPayloads[1].contains("Hello world"))
+        session.disconnect()
+    }
+
+    @Test
+    fun testDefaultLiveSessionFactoryDeferGoAwayDoesNotAutoReconnectMidTurn() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        val factory = DefaultLiveSessionFactory(mockClient)
+        val deferredGoAwaySession = factory.create(reconnectOnGoAway = false) as OkHttpLiveSession
+        deferredGoAwaySession.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.8-live", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onMessage(sockets[0], """{"setupComplete":{}}""")
+        listeners[0].onMessage(sockets[0], """{"goAway":{"timeLeft":"30s"}}""")
+
+        // Deferring GoAway keeps current socket alive for in-flight turn without reconnecting eagerly.
+        assertEquals(1, listeners.size)
+        assertTrue(deferredGoAwaySession.isConnected)
+        val msg = deferredGoAwaySession.incomingMessages.first { it is LiveServerMessage.GoAwayMessage }
+        assertEquals("30s", (msg as LiveServerMessage.GoAwayMessage).goAway.timeLeft)
+        deferredGoAwaySession.disconnect()
+
+        // Default factory session still auto-reconnects on GoAway for continuous live translation.
+        val autoGoAwaySession = factory.create() as OkHttpLiveSession
+        autoGoAwaySession.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.5-live-translate-preview", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[1].onOpen(sockets[1], mockk(relaxed = true))
+        listeners[1].onMessage(sockets[1], """{"setupComplete":{}}""")
+        listeners[1].onMessage(sockets[1], """{"goAway":{"timeLeft":"10s"}}""")
+        assertEquals(3, listeners.size)
+        autoGoAwaySession.disconnect()
     }
 }

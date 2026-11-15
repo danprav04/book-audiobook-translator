@@ -1,6 +1,7 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -101,11 +102,21 @@ class OkHttpTextModelClient(
                 val shortestCooldown = quotaTracker.shortestCooldownMs(candidates)
                 if (!didCooldownWait && shortestCooldown != null && shortestCooldown <= maxCooldownWaitMs) {
                     didCooldownWait = true
+                    DiagnosticLogBuffer.record(
+                        "TextModelClient",
+                        "Waiting ${shortestCooldown + 100L}ms for text model quota cooldown",
+                        level = "WARN"
+                    )
                     delay(shortestCooldown + 100L)
                     triedThisPass.clear()
                     continue
                 }
                 val failed = if (attemptedModels.isNotEmpty()) attemptedModels else candidates
+                DiagnosticLogBuffer.record(
+                    "TextModelClient",
+                    "Text model quota exhausted across ${failed.distinct().joinToString()}",
+                    level = "ERROR"
+                )
                 throw QuotaExhaustedException(
                     message = quotaTracker.formatConciseError(failed, shortestCooldown, lastErrorBody),
                     retryAfterMs = shortestCooldown,
@@ -139,12 +150,22 @@ class OkHttpTextModelClient(
                 }
 
                 if (response.code == 401 || response.code == 403) {
+                    DiagnosticLogBuffer.record(
+                        "TextModelClient",
+                        "Text API authentication failed HTTP ${response.code} (model=$modelId)",
+                        level = "ERROR"
+                    )
                     throw IOException(
                         "Gemini API authentication error (HTTP ${response.code}). Check your API key in Settings."
                     )
                 }
 
                 lastErrorBody = responseBody
+                DiagnosticLogBuffer.record(
+                    "TextModelClient",
+                    "Text request failed HTTP ${response.code} (model=$modelId)",
+                    level = "WARN"
+                )
                 quotaTracker.recordHttpError(
                     modelId = modelId,
                     httpCode = response.code,

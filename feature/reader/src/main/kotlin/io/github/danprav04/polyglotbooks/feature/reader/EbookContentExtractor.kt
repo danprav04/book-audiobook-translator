@@ -1598,10 +1598,10 @@ object EbookContentExtractor {
     }
 
     private val BLOCK_TAG_TOKEN_REGEX = Regex(
-        """<(/?)(p|h[1-6]|li|blockquote)\b([^>]*)>""",
+        """<(/?)(p|h[1-6]|li|blockquote|div)\b([^>]*)>""",
         RegexOption.IGNORE_CASE
     )
-    private val NESTED_BLOCK_CHECK = Regex("""<(?:p|h[1-6]|li|blockquote)\b""", RegexOption.IGNORE_CASE)
+    private val NESTED_BLOCK_CHECK = Regex("""<(?:p|h[1-6]|li|blockquote|div)\b""", RegexOption.IGNORE_CASE)
 
     private fun collectParagraphBlocks(fragment: String, out: MutableList<String>) {
         val tokens = BLOCK_TAG_TOKEN_REGEX.findAll(fragment).toList()
@@ -1630,8 +1630,10 @@ object EbookContentExtractor {
                 val tAttrs = t.groupValues[3]
                 if (!tClose) {
                     if (!tAttrs.trimEnd().endsWith("/")) {
-                        // In HTML5, an unclosed <p> implicitly closes at a sibling <p>.
-                        if (tTag == "p" && stack.size == 1 && stack.last() == "p") {
+                        // In HTML5, an unclosed <p> implicitly closes at a sibling block element.
+                        if (stack.size == 1 && stack.last() == "p" &&
+                            (tTag == "p" || tTag == "div" || tTag == "blockquote" || tTag.startsWith("h"))
+                        ) {
                             contentEnd = t.range.first
                             endIdx = j - 1
                             stack.removeLast()

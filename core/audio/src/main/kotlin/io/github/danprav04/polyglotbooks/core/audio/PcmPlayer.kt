@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.PlaybackParams
+import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -51,6 +52,13 @@ interface PcmPlayer {
      * calls, paired with [totalFramesWritten] for producer-consumer frame-span timelines.
      */
     fun playbackHeadPositionFrames(): Long = 0L
+
+    /**
+     * True when this player reports monotonic [totalFramesWritten] and [playbackHeadPositionFrames]
+     * progression suitable for real-time frame-span highlighting and timeline sync.
+     */
+    val supportsFrameTracking: Boolean
+        get() = false
 }
 
 /**
@@ -85,7 +93,13 @@ fun interface AudioTrackAdapterFactory {
         val Default: AudioTrackAdapterFactory = AudioTrackAdapterFactory { sampleRate, channels ->
             try {
                 AndroidAudioTrackAdapter(sampleRate, channels)
-            } catch (_: Throwable) {
+            } catch (t: Throwable) {
+                DiagnosticLogBuffer.record(
+                    "AudioTrackPcmPlayer",
+                    "AudioTrack init unavailable (rate=$sampleRate ch=$channels)",
+                    level = "WARN",
+                    throwable = t
+                )
                 null
             }
         }
@@ -97,6 +111,9 @@ fun interface AudioTrackAdapterFactory {
  */
 class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapter {
     private val track: AudioTrack
+
+    @Volatile
+    private var hasCustomPlaybackParams = false
 
     init {
         val channelMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
@@ -146,9 +163,16 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     override fun release() = track.release()
 
     override fun setSpeed(speed: Float): Boolean = try {
-        // Time-stretch (pitch preserved) via PlaybackParams.
-        track.playbackParams = PlaybackParams().setSpeed(speed).setPitch(1.0f)
-        true
+        val isUnity = kotlin.math.abs(speed - 1.0f) <= 0.001f
+        if (isUnity && !hasCustomPlaybackParams) {
+            // Keep the native 1.0x AudioTrack path untouched so Sonic WSOLA stays bypassed.
+            true
+        } else {
+            // Time-stretch (pitch preserved) via PlaybackParams.
+            track.playbackParams = PlaybackParams().setSpeed(if (isUnity) 1.0f else speed).setPitch(1.0f)
+            hasCustomPlaybackParams = !isUnity
+            true
+        }
     } catch (_: Throwable) {
         false
     }
@@ -230,6 +254,9 @@ class AudioTrackPcmPlayer private constructor(
     private var trackFramesWritten = 0L
     private var maxObservedTrackHeadFrames = 0L
     private var sessionMsOffset = 0L
+    private var appliedAdapterSpeed = 1.0f
+    private var pendingTailBytes = ByteArray(4)
+    private var pendingTailCount = 0
 
     // Fallback wall-clock pacing state used when no AudioTrackAdapter is available (e.g. JVM tests).
     private var fallbackTrackPlayedFrames = 0.0
@@ -247,6 +274,9 @@ class AudioTrackPcmPlayer private constructor(
 
     val volumeLevel: Float
         get() = volume
+
+    override val supportsFrameTracking: Boolean
+        get() = true
 
     override val totalFramesWritten: Long
         get() = synchronized(lock) { monotonicFramesWritten }
@@ -277,6 +307,7 @@ class AudioTrackPcmPlayer private constructor(
                 trackFramesWritten = 0L
                 maxObservedTrackHeadFrames = 0L
                 sessionMsOffset = 0L
+                pendingTailCount = 0
                 fallbackTrackPlayedFrames = 0.0
                 fallbackLastTickNs = nanoTimeProvider()
                 _currentPositionMs.value = 0L
@@ -321,10 +352,15 @@ class AudioTrackPcmPlayer private constructor(
             headFrameOffset = monotonicFramesWritten
             trackFramesWritten = 0L
             maxObservedTrackHeadFrames = 0L
+            pendingTailCount = 0
             fallbackTrackPlayedFrames = 0.0
             fallbackLastTickNs = nowNs
             _currentPositionMs.value = sessionMsOffset
 
+            DiagnosticLogBuffer.record(
+                "AudioTrackPcmPlayer",
+                "Switching AudioTrack format from ${this.sampleRate}Hz/${this.channels}ch to ${normRate}Hz/${normChannels}ch"
+            )
             formatEpoch++
             releaseAdapterLocked()
             this.sampleRate = normRate
@@ -336,47 +372,164 @@ class AudioTrackPcmPlayer private constructor(
     override fun write(chunk: PcmChunk): Int {
         if (chunk.data.isEmpty()) return 0
 
-        val (track, frameBytes, epochAtStart) = synchronized(lock) {
-            val fb = channels * 2
+        var prefixFrame: ByteArray? = null
+        var chunkStartOffset = 0
+        var chunkAlignedEnd = 0
+        var trailingByteCount = 0
+        var trailingStartOffset = 0
+        var track: AudioTrackAdapter? = null
+        var frameBytes = 2
+        var epochAtStart = 0L
+
+        synchronized(lock) {
+            frameBytes = channels * 2
+            if (pendingTailBytes.size < frameBytes) {
+                val expanded = ByteArray(frameBytes)
+                if (pendingTailCount > 0) {
+                    pendingTailBytes.copyInto(expanded, endIndex = pendingTailCount)
+                }
+                pendingTailBytes = expanded
+            }
+
             val currentTrack = adapter
+            val tailCount = pendingTailCount
+            val totalAvailable = tailCount + chunk.data.size
+            val alignedTotal = totalAvailable - (totalAvailable % frameBytes)
+
+            if (totalAvailable < frameBytes) {
+                chunk.data.copyInto(pendingTailBytes, destinationOffset = tailCount)
+                pendingTailCount = totalAvailable
+                refreshPositionLocked(nanoTimeProvider())
+                return chunk.data.size
+            }
+
+            if (tailCount > 0) {
+                val neededFromChunk = frameBytes - tailCount
+                val completedFrame = ByteArray(frameBytes)
+                pendingTailBytes.copyInto(completedFrame, destinationOffset = 0, startIndex = 0, endIndex = tailCount)
+                chunk.data.copyInto(completedFrame, destinationOffset = tailCount, startIndex = 0, endIndex = neededFromChunk)
+                prefixFrame = completedFrame
+                chunkStartOffset = neededFromChunk
+                pendingTailCount = 0
+            }
+
+            val remainingInChunk = chunk.data.size - chunkStartOffset
+            trailingByteCount = remainingInChunk % frameBytes
+            chunkAlignedEnd = chunk.data.size - trailingByteCount
+            trailingStartOffset = chunkAlignedEnd
+
             if (currentTrack == null) {
                 // Tick fallback clock against prior buffered frames before queueing new ones so idle time
                 // before write() never consumes the newly written chunk.
                 val nowNs = nanoTimeProvider()
                 advanceFallbackLocked(nowNs)
-                val alignedSize = chunk.data.size - (chunk.data.size % fb)
-                val framesAdded = (alignedSize / fb).toLong()
+                val framesAdded = (alignedTotal / frameBytes).toLong()
                 if (framesAdded > 0L) {
                     trackFramesWritten += framesAdded
                     monotonicFramesWritten += framesAdded
                 }
+                if (trailingByteCount > 0) {
+                    chunk.data.copyInto(
+                        pendingTailBytes,
+                        destinationOffset = 0,
+                        startIndex = trailingStartOffset,
+                        endIndex = chunk.data.size
+                    )
+                    pendingTailCount = trailingByteCount
+                }
                 refreshPositionLocked(nowNs)
-                return alignedSize
+                return chunk.data.size
             }
-            Triple(currentTrack, fb, formatEpoch)
+
+            track = currentTrack
+            epochAtStart = formatEpoch
         }
 
-        var offset = 0
-        val size = chunk.data.size - (chunk.data.size % frameBytes)
-        while (offset < size) {
-            val result = try {
-                track.write(chunk.data, offset, size - offset)
-            } catch (_: Throwable) {
-                -1
+        val activeTrack = track ?: return 0
+        val maxSubChunkBytes = frameBytes * WRITE_SUBCHUNK_FRAMES
+        var totalBytesWritten = 0
+        var uncreditedBytes = 0
+        var abortedOrFailed = false
+
+        fun writeSpan(data: ByteArray, start: Int, end: Int) {
+            var offset = start
+            while (offset < end) {
+                val stillValid = synchronized(lock) {
+                    formatEpoch == epochAtStart && adapter === activeTrack
+                }
+                if (!stillValid) {
+                    abortedOrFailed = true
+                    break
+                }
+                val stepSize = minOf(maxSubChunkBytes, end - offset)
+                val result = try {
+                    activeTrack.write(data, offset, stepSize)
+                } catch (t: Throwable) {
+                    DiagnosticLogBuffer.record(
+                        "AudioTrackPcmPlayer",
+                        "AudioTrack write threw exception (rate=$sampleRate ch=$channels offset=$offset/${chunk.data.size})",
+                        level = "ERROR",
+                        throwable = t
+                    )
+                    -1
+                }
+                if (result <= 0) {
+                    if (result != 0) {
+                        DiagnosticLogBuffer.record(
+                            "AudioTrackPcmPlayer",
+                            "AudioTrack write stopped early code=$result (rate=$sampleRate ch=$channels offset=$offset/${chunk.data.size})",
+                            level = "WARN"
+                        )
+                    }
+                    abortedOrFailed = true
+                    break // stopped/flushed/released or error
+                }
+                offset += result
+                totalBytesWritten += result
+                uncreditedBytes += result
+                val newFrames = (uncreditedBytes / frameBytes).toLong()
+                uncreditedBytes %= frameBytes
+                val continueWriting = synchronized(lock) {
+                    if (formatEpoch == epochAtStart && adapter === activeTrack) {
+                        if (newFrames > 0L) {
+                            trackFramesWritten += newFrames
+                            monotonicFramesWritten += newFrames
+                        }
+                        refreshPositionLocked(nanoTimeProvider())
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!continueWriting) {
+                    abortedOrFailed = true
+                    break
+                }
             }
-            if (result <= 0) break // stopped/flushed/released or error
-            offset += result
+        }
+
+        prefixFrame?.let { frame ->
+            writeSpan(frame, 0, frame.size)
+        }
+        if (!abortedOrFailed && chunkStartOffset < chunkAlignedEnd) {
+            writeSpan(chunk.data, chunkStartOffset, chunkAlignedEnd)
         }
 
         synchronized(lock) {
-            if (formatEpoch == epochAtStart && offset > 0) {
-                val framesAdded = (offset / frameBytes).toLong()
-                trackFramesWritten += framesAdded
-                monotonicFramesWritten += framesAdded
+            if (!abortedOrFailed && trailingByteCount > 0 && formatEpoch == epochAtStart && adapter === activeTrack) {
+                chunk.data.copyInto(
+                    pendingTailBytes,
+                    destinationOffset = 0,
+                    startIndex = trailingStartOffset,
+                    endIndex = chunk.data.size
+                )
+                pendingTailCount = trailingByteCount
             }
-            refreshPositionLocked(nanoTimeProvider())
+            if (formatEpoch == epochAtStart) {
+                refreshPositionLocked(nanoTimeProvider())
+            }
         }
-        return offset
+        return totalBytesWritten + if (!abortedOrFailed) trailingByteCount else 0
     }
 
     override fun play() {
@@ -402,6 +555,7 @@ class AudioTrackPcmPlayer private constructor(
     override fun flush() {
         synchronized(lock) {
             formatEpoch++
+            pendingTailCount = 0
             adapter?.let { track ->
                 // AudioTrack.flush() only works while paused/stopped.
                 safely { track.pause() }
@@ -423,6 +577,7 @@ class AudioTrackPcmPlayer private constructor(
             isPlayingState = false
             initialized = false
             formatEpoch++
+            pendingTailCount = 0
             adapter?.let { track ->
                 safely { track.pause() }
                 safely { track.flush() }
@@ -450,6 +605,7 @@ class AudioTrackPcmPlayer private constructor(
             sessionMsOffset += played * 1000L / sampleRate
             trackFramesWritten = 0L
             maxObservedTrackHeadFrames = 0L
+            pendingTailCount = 0
             fallbackTrackPlayedFrames = 0.0
             fallbackLastTickNs = nowNs
 
@@ -461,14 +617,22 @@ class AudioTrackPcmPlayer private constructor(
     }
 
     override fun setPlaybackSpeed(speed: Float) {
-        val clamped = speed.coerceIn(0.5f, 3.0f)
+        val clamped = normalizeSpeed(speed.coerceIn(0.5f, 3.0f))
         synchronized(lock) {
             val nowNs = nanoTimeProvider()
             if (adapter == null) {
                 advanceFallbackLocked(nowNs)
             }
             this.speed = clamped
-            adapter?.let { safely { it.setSpeed(clamped) } }
+            adapter?.let { track ->
+                if (kotlin.math.abs(clamped - appliedAdapterSpeed) > UNITY_SPEED_EPSILON) {
+                    var applied = false
+                    safely { applied = track.setSpeed(clamped) }
+                    if (applied) {
+                        appliedAdapterSpeed = clamped
+                    }
+                }
+            }
         }
     }
 
@@ -599,6 +763,11 @@ class AudioTrackPcmPlayer private constructor(
             } else if (expectedAdapter != null || nowNs <= prevNowNs) {
                 stalledMs += DRAIN_POLL_INTERVAL_MS
                 if (stalledMs >= maxStallMs) {
+                    DiagnosticLogBuffer.record(
+                        "AudioTrackPcmPlayer",
+                        "AudioTrack drain stalled during format switch ($currentHead/$targetFrames frames)",
+                        level = "WARN"
+                    )
                     break
                 }
             }
@@ -610,7 +779,20 @@ class AudioTrackPcmPlayer private constructor(
     private fun createConfiguredAdapter(sampleRate: Int, channels: Int): AudioTrackAdapter? =
         adapterFactory.create(sampleRate, channels)?.also { track ->
             safely { track.setVolume(volume) }
-            if (speed != 1.0f) safely { track.setSpeed(speed) }
+            if (kotlin.math.abs(speed - 1.0f) > UNITY_SPEED_EPSILON) {
+                var applied = false
+                safely { applied = track.setSpeed(speed) }
+                appliedAdapterSpeed = if (applied) speed else 1.0f
+                if (!applied) {
+                    DiagnosticLogBuffer.record(
+                        "AudioTrackPcmPlayer",
+                        "AudioTrack rejected playback speed $speed",
+                        level = "WARN"
+                    )
+                }
+            } else {
+                appliedAdapterSpeed = 1.0f
+            }
             if (isPlayingState) safely { track.play() }
         }
 
@@ -620,7 +802,11 @@ class AudioTrackPcmPlayer private constructor(
             safely { track.release() }
         }
         adapter = null
+        appliedAdapterSpeed = 1.0f
     }
+
+    private fun normalizeSpeed(value: Float): Float =
+        if (kotlin.math.abs(value - 1.0f) <= UNITY_SPEED_EPSILON) 1.0f else value
 
     private inline fun safely(block: () -> Unit) {
         try {
@@ -632,5 +818,7 @@ class AudioTrackPcmPlayer private constructor(
     private companion object {
         const val DRAIN_POLL_INTERVAL_MS = 10L
         const val MAX_DRAIN_POLL_ITERATIONS = 400
+        const val WRITE_SUBCHUNK_FRAMES = 1024
+        const val UNITY_SPEED_EPSILON = 0.001f
     }
 }

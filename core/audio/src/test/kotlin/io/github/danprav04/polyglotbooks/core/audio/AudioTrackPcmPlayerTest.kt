@@ -252,4 +252,128 @@ class AudioTrackPcmPlayerTest {
         assertEquals(0L, player.playbackHeadPositionFrames())
         assertEquals(0L, player.currentPositionMs.value)
     }
+
+    @Test
+    fun `large chunk write sub-chunks incrementally updates frames and aborts promptly on flush`() {
+        val observedFramesDuringWrite = mutableListOf<Long>()
+        val writtenSliceSizes = mutableListOf<Int>()
+        lateinit var player: AudioTrackPcmPlayer
+
+        val adapter = object : AudioTrackAdapter {
+            var head = 0L
+            override fun write(data: ByteArray, offset: Int, size: Int): Int {
+                writtenSliceSizes += size
+                observedFramesDuringWrite += player.totalFramesWritten
+                head += size / 2L
+                // Flush halfway through to verify mid-batch abort leaves clean state
+                if (writtenSliceSizes.size == 2) {
+                    player.flush()
+                }
+                return size
+            }
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() { head = 0L }
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long get() = head
+        }
+
+        player = AudioTrackPcmPlayer(AudioTrackAdapterFactory { _, _ -> adapter })
+        assertTrue(player.supportsFrameTracking)
+        player.init(24000, 1)
+        player.play()
+
+        // 8000 frames = 16000 bytes (larger than one 1024-frame / 2048-byte sub-chunk)
+        val accepted = player.write(PcmChunk(ByteArray(16000), sampleRate = 24000, channels = 1))
+
+        assertTrue("Expected bounded sub-chunk writes instead of single 16KB write", writtenSliceSizes.all { it <= 2048 })
+        assertEquals(2, writtenSliceSizes.size)
+        // Second sub-chunk observed frames credited by the first sub-chunk BEFORE write() returned
+        assertEquals(listOf(0L, 1024L), observedFramesDuringWrite)
+        // Flush during sub-chunk 2 retired sub-chunk 1's 1024 frames and prevented sub-chunk 2 from leaving phantom buffered frames
+        assertEquals(1024L, player.totalFramesWritten)
+        assertEquals(1024L, player.playbackHeadPositionFrames())
+        assertEquals(0L, player.bufferedMs)
+        assertEquals(4096, accepted)
+
+        // Subsequent write after flush continues monotonically from 1024L
+        player.write(PcmChunk(ByteArray(1000), sampleRate = 24000, channels = 1))
+        assertEquals(1524L, player.totalFramesWritten)
+    }
+
+    @Test
+    fun `odd-byte unaligned chunks carry trailing bytes cleanly across writes without sample shift`() {
+        val writtenBytesOut = java.io.ByteArrayOutputStream()
+        val adapter = object : AudioTrackAdapter {
+            override fun write(data: ByteArray, offset: Int, size: Int): Int {
+                writtenBytesOut.write(data, offset, size)
+                return size
+            }
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long = 0L
+        }
+
+        val player = AudioTrackPcmPlayer(AudioTrackAdapterFactory { _, _ -> adapter })
+        player.init(24000, 1) // frameBytes = 2
+        player.write(PcmChunk(byteArrayOf(10, 20, 30), 24000, 1))
+        player.write(PcmChunk(byteArrayOf(40, 50), 24000, 1))
+        player.write(PcmChunk(byteArrayOf(60), 24000, 1))
+
+        assertTrue(byteArrayOf(10, 20, 30, 40, 50, 60).contentEquals(writtenBytesOut.toByteArray()))
+        assertEquals(3L, player.totalFramesWritten)
+
+        // Verify fallback mode also preserves carried bytes cleanly
+        val fallbackPlayer = AudioTrackPcmPlayer { _, _ -> null }
+        fallbackPlayer.init(24000, 1)
+        fallbackPlayer.write(PcmChunk(byteArrayOf(1, 2, 3), 24000, 1))
+        assertEquals(1L, fallbackPlayer.totalFramesWritten)
+        fallbackPlayer.write(PcmChunk(byteArrayOf(4), 24000, 1))
+        assertEquals(2L, fallbackPlayer.totalFramesWritten)
+    }
+
+    @Test
+    fun `unity 1_0x speed avoids calling adapter setSpeed while non-unity transitions still update`() {
+        val speedCalls = mutableListOf<Float>()
+        val adapter = object : AudioTrackAdapter {
+            override fun write(data: ByteArray, offset: Int, size: Int): Int = size
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean {
+                speedCalls += speed
+                return true
+            }
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long = 0L
+        }
+
+        val player = AudioTrackPcmPlayer(AudioTrackAdapterFactory { _, _ -> adapter })
+        player.init(24000, 1)
+        player.setPlaybackSpeed(1.0f)
+        player.setPlaybackSpeed(1.0002f)
+        assertTrue("1.0x speed must not invoke adapter.setSpeed", speedCalls.isEmpty())
+
+        player.setPlaybackSpeed(1.5f)
+        player.setPlaybackSpeed(1.5f) // duplicate skipped
+        player.setPlaybackSpeed(1.0f) // returning from custom speed applies 1.0f once
+        player.setPlaybackSpeed(1.0f) // already back at 1.0f, skipped
+        assertEquals(listOf(1.5f, 1.0f), speedCalls)
+
+        // Fresh init at 1.0x must again skip adapter.setSpeed
+        speedCalls.clear()
+        player.init(24000, 1)
+        player.setPlaybackSpeed(1.0f)
+        assertTrue(speedCalls.isEmpty())
+    }
 }

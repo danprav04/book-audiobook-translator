@@ -31,7 +31,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import io.github.danprav04.polyglotbooks.core.data.BugReportClipboardHelper
+import io.github.danprav04.polyglotbooks.core.model.BugReportContextFormatter
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
+import kotlinx.coroutines.launch
 import java.io.File
 import java.util.Locale
 
@@ -44,6 +47,8 @@ fun AudiobookPlayerScreen(
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val snackbarHostState = remember { SnackbarHostState() }
+    val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(bookId) {
         viewModel.loadBook(bookId)
@@ -87,6 +92,9 @@ fun AudiobookPlayerScreen(
     val displayTitle = state.bookTitle.ifBlank { "Audiobook" }
     val displayAuthor = state.author.ifBlank { "Unknown Author" }
     val duckPercent = (state.duckLevel * 100).toInt().coerceIn(0, 100)
+    val diagnosticEngineInfo = remember(state.isLiveTranslationActive, state.targetLanguage, state.playbackSpeed, state.isDuckingEnabled, duckPercent, state.bufferAheadMs) {
+        "LiveTranslation=${state.isLiveTranslationActive}, Target=${state.targetLanguage.displayName} (${state.targetLanguage.code}), Speed=${state.playbackSpeed}x, Ducking=${state.isDuckingEnabled} ($duckPercent%), Buffer=${state.bufferAheadMs}ms"
+    }
 
     Scaffold(
         topBar = {
@@ -112,7 +120,8 @@ fun AudiobookPlayerScreen(
                     }
                 }
             )
-        }
+        },
+        snackbarHost = { SnackbarHost(snackbarHostState) }
     ) { paddingValues ->
         Column(
             modifier = Modifier
@@ -169,6 +178,32 @@ fun AudiobookPlayerScreen(
                                 color = MaterialTheme.colorScheme.onErrorContainer,
                                 modifier = Modifier.weight(1f)
                             )
+                            TextButton(
+                                onClick = {
+                                    val result = BugReportClipboardHelper.copyBugReport(
+                                        context = context,
+                                        screenOrArea = "Audiobook Player",
+                                        bookFormat = state.bookFormat,
+                                        engineOrModelInfo = diagnosticEngineInfo,
+                                        lastError = state.errorMessage
+                                    )
+                                    coroutineScope.launch {
+                                        snackbarHostState.showSnackbar(
+                                            if (result.copiedToClipboard) "Diagnostic context copied to clipboard"
+                                            else "Failed to copy diagnostic context"
+                                        )
+                                    }
+                                }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.ContentCopy,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Copy Bug", color = MaterialTheme.colorScheme.onErrorContainer)
+                            }
                             IconButton(
                                 onClick = { viewModel.clearError() },
                                 modifier = Modifier.size(28.dp)
@@ -742,11 +777,15 @@ fun AudiobookPlayerScreen(
         }
 
         if (state.showAiReportDialog) {
+            var reportNotes by remember(state.bookId) { mutableStateOf("") }
             AlertDialog(
                 onDismissRequest = { viewModel.setAiReportDialogVisible(false) },
-                title = { Text("Live AI Translation Status") },
+                title = { Text("Live AI Translation Status & Report") },
                 text = {
-                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         Text("Gemini Live Audio-to-Audio Pipeline:", fontWeight = FontWeight.Bold)
                         Text(
                             "• Mode: ${if (state.isLiveTranslationActive) "Live AI Speech-to-Speech Active" else "Disabled (Original Audiobook Audio)"}"
@@ -755,7 +794,7 @@ fun AudiobookPlayerScreen(
                             "• Target Language: ${state.targetLanguage.displayName} (${state.targetLanguage.code})"
                         )
                         Text(
-                            "• Look-Ahead Buffer: ${String.format("%.1fs", state.bufferAheadMs / 1000.0)}"
+                            "• Look-Ahead Buffer: ${String.format(Locale.US, "%.1fs", state.bufferAheadMs / 1000.0)}"
                         )
                         Text(
                             "• Original Audio Mix: ${
@@ -772,10 +811,68 @@ fun AudiobookPlayerScreen(
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        OutlinedTextField(
+                            value = reportNotes,
+                            onValueChange = { reportNotes = it },
+                            label = { Text("Feedback / issue details (optional)") },
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 4
+                        )
+                        OutlinedButton(
+                            onClick = {
+                                val res = BugReportClipboardHelper.copyBugReport(
+                                    context = context,
+                                    screenOrArea = "Audiobook Player - AI Output Report",
+                                    bookFormat = state.bookFormat,
+                                    engineOrModelInfo = diagnosticEngineInfo,
+                                    lastError = state.errorMessage,
+                                    userNotes = reportNotes.takeIf { it.isNotBlank() }
+                                )
+                                coroutineScope.launch {
+                                    snackbarHostState.showSnackbar(
+                                        if (res.copiedToClipboard) "Diagnostic context copied to clipboard"
+                                        else "Failed to copy diagnostic context"
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Copy Context")
+                        }
                     }
                 },
                 confirmButton = {
-                    Button(onClick = { viewModel.setAiReportDialogVisible(false) }) {
+                    Button(
+                        onClick = {
+                            BugReportClipboardHelper.copyBugReport(
+                                context = context,
+                                screenOrArea = "Audiobook Player - AI Output Report",
+                                bookFormat = state.bookFormat,
+                                engineOrModelInfo = diagnosticEngineInfo,
+                                lastError = state.errorMessage,
+                                userNotes = reportNotes.takeIf { it.isNotBlank() }
+                            )
+                            val opened = BugReportClipboardHelper.openExternalUrl(
+                                context,
+                                BugReportContextFormatter.GITHUB_AI_REPORT_URL
+                            )
+                            viewModel.setAiReportDialogVisible(false)
+                            coroutineScope.launch {
+                                snackbarHostState.showSnackbar(
+                                    if (opened) "Report context copied — paste into GitHub issue"
+                                    else "Report context copied to clipboard"
+                                )
+                            }
+                        }
+                    ) {
+                        Text("Report Issue")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { viewModel.setAiReportDialogVisible(false) }) {
                         Text("Close")
                     }
                 }
@@ -789,8 +886,8 @@ private fun formatTime(millis: Long): String {
     val minutes = (millis / (1000 * 60)) % 60
     val hours = millis / (1000 * 60 * 60)
     return if (hours > 0) {
-        String.format("%d:%02d:%02d", hours, minutes, seconds)
+        String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
     } else {
-        String.format("%02d:%02d", minutes, seconds)
+        String.format(Locale.US, "%02d:%02d", minutes, seconds)
     }
 }

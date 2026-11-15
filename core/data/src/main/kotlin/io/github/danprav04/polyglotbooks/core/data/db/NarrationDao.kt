@@ -12,11 +12,24 @@ interface NarrationDao {
     @Query("SELECT * FROM narration_lines WHERE chapterId = :chapterId ORDER BY paraIndex ASC, startOffset ASC")
     fun getLinesForChapter(chapterId: String): Flow<List<NarrationLineEntity>>
 
+    @Query("SELECT * FROM narration_lines WHERE chapterId = :chapterId ORDER BY paraIndex ASC, startOffset ASC")
+    suspend fun getLinesForChapterOnce(chapterId: String): List<NarrationLineEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLines(lines: List<NarrationLineEntity>)
 
     @Query("DELETE FROM narration_lines WHERE chapterId = :chapterId")
     suspend fun deleteLinesForChapter(chapterId: String)
+
+    @Query(
+        """
+        UPDATE narration_lines
+        SET speakerId = :newSpeakerId
+        WHERE speakerId = :oldSpeakerId
+          AND chapterId IN (SELECT id FROM chapters WHERE bookId = :bookId)
+        """
+    )
+    suspend fun reassignSpeakerForBook(bookId: String, oldSpeakerId: String, newSpeakerId: String)
 
     @Query("SELECT * FROM tts_segments WHERE lineId = :lineId")
     suspend fun getTtsSegment(lineId: String): TtsSegmentEntity?
