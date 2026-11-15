@@ -89,6 +89,13 @@ interface AudioTrackAdapter {
 
     /** Frames rendered since the last flush/stop. */
     val playbackHeadPositionFrames: Long
+
+    /**
+     * True when [write] uses non-blocking mode and may return `0` while the hardware buffer is
+     * temporarily full rather than stopped/errored, enabling paced retries and stall recovery.
+     */
+    val usesNonBlockingWrite: Boolean
+        get() = false
 }
 
 /**
@@ -183,7 +190,15 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     @Volatile
     private var needsBoundaryFadeIn: Boolean = true
 
+    private var pendingPreRoll: ByteArray? = null
+    private var pendingPreRollOffset: Int = 0
+    private var boundaryFadeFramesTotal: Int = 0
+    private var boundaryFadeFramesApplied: Int = 0
+
     private val lastFrameSamples = ShortArray(channelCount)
+
+    override val usesNonBlockingWrite: Boolean
+        get() = true
 
     init {
         val channelMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
@@ -220,26 +235,49 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     override fun write(data: ByteArray, offset: Int, size: Int): Int {
         if (size <= 0) return 0
         val alignedSize = (size / bytesPerFrame) * bytesPerFrame
-        if (alignedSize <= 0) return track.write(data, offset, size, AudioTrack.WRITE_BLOCKING)
+        if (alignedSize <= 0) return track.write(data, offset, size, AudioTrack.WRITE_NON_BLOCKING)
 
         if (needsBoundaryFadeIn) {
-            val preRollBytes = buildBoundaryPreRollBytes(sampleRateHz, bytesPerFrame)
-            val preWritten = track.write(preRollBytes, 0, preRollBytes.size, AudioTrack.WRITE_BLOCKING)
-            if (preWritten > 0) {
+            val preRoll = pendingPreRoll ?: buildBoundaryPreRollBytes(sampleRateHz, bytesPerFrame).also {
+                pendingPreRoll = it
+                pendingPreRollOffset = 0
+            }
+            while (pendingPreRollOffset < preRoll.size) {
+                val remaining = preRoll.size - pendingPreRollOffset
+                val preWritten = track.write(preRoll, pendingPreRollOffset, remaining, AudioTrack.WRITE_NON_BLOCKING)
+                if (preWritten < 0) return preWritten
+                if (preWritten == 0) return 0
+                pendingPreRollOffset += preWritten
                 paddingTracker.recordPaddingFrames(preWritten.toLong() / bytesPerFrame)
             }
-
-            val faded = applyBoundaryFadeIn(data, offset, alignedSize, sampleRateHz, channelCount)
+            pendingPreRoll = null
+            pendingPreRollOffset = 0
             needsBoundaryFadeIn = false
-            val written = track.write(faded, 0, alignedSize, AudioTrack.WRITE_BLOCKING)
+            boundaryFadeFramesTotal = (sampleRateHz * BOUNDARY_FADE_IN_MS / 1000).coerceAtLeast(1)
+            boundaryFadeFramesApplied = 0
+        }
+
+        if (boundaryFadeFramesApplied < boundaryFadeFramesTotal) {
+            val faded = applyBoundaryFadeIn(
+                data = data,
+                offset = offset,
+                alignedSize = alignedSize,
+                sampleRateHz = sampleRateHz,
+                channelCount = channelCount,
+                startFadeFrame = boundaryFadeFramesApplied,
+                totalFadeFrames = boundaryFadeFramesTotal
+            )
+            val written = track.write(faded, 0, alignedSize, AudioTrack.WRITE_NON_BLOCKING)
             if (written > 0) {
-                paddingTracker.recordSpeechFrames(written.toLong() / bytesPerFrame)
+                val framesWritten = written / bytesPerFrame
+                boundaryFadeFramesApplied = minOf(boundaryFadeFramesTotal, boundaryFadeFramesApplied + framesWritten)
+                paddingTracker.recordSpeechFrames(framesWritten.toLong())
                 captureLastFrame(faded, 0, written)
             }
             return written
         }
 
-        val written = track.write(data, offset, size, AudioTrack.WRITE_BLOCKING)
+        val written = track.write(data, offset, alignedSize, AudioTrack.WRITE_NON_BLOCKING)
         if (written > 0) {
             paddingTracker.recordSpeechFrames(written.toLong() / bytesPerFrame)
             captureLastFrame(data, offset, written)
@@ -249,14 +287,26 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
 
     override fun endUtterance() {
         val tail = buildEndUtteranceTailBytes(sampleRateHz, channelCount, lastFrameSamples)
-        val written = track.write(tail, 0, tail.size, AudioTrack.WRITE_BLOCKING)
-        if (written > 0) {
-            // Record the utterance tail as a padding span so hardware continues draining through
-            // endFrame while speech-frame tracking plateaus without accumulating inter-chunk drift.
-            paddingTracker.recordPaddingFrames(written.toLong() / bytesPerFrame)
+        var offset = 0
+        var stalledPolls = 0
+        while (offset < tail.size && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+            val written = track.write(tail, offset, tail.size - offset, AudioTrack.WRITE_NON_BLOCKING)
+            if (written < 0) break
+            if (written > 0) {
+                offset += written
+                paddingTracker.recordPaddingFrames(written.toLong() / bytesPerFrame)
+                stalledPolls = 0
+            } else {
+                if (++stalledPolls >= MAX_END_UTTERANCE_STALL_POLLS) break
+                try {
+                    Thread.sleep(END_UTTERANCE_POLL_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
         }
-        lastFrameSamples.fill(0)
-        needsBoundaryFadeIn = true
+        resetTurnBoundaryState()
     }
 
     override fun play() = track.play()
@@ -275,6 +325,10 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
 
     private fun resetTurnBoundaryState() {
         paddingTracker.reset()
+        pendingPreRoll = null
+        pendingPreRollOffset = 0
+        boundaryFadeFramesTotal = 0
+        boundaryFadeFramesApplied = 0
         lastFrameSamples.fill(0)
         needsBoundaryFadeIn = true
     }
@@ -325,6 +379,8 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
         const val BOUNDARY_FADE_IN_MS = 4
         const val END_UTTERANCE_FADE_OUT_MS = 8
         const val END_UTTERANCE_SILENCE_MS = 250
+        private const val END_UTTERANCE_POLL_MS = 5L
+        private const val MAX_END_UTTERANCE_STALL_POLLS = 200
 
         /** Builds the silence pre-roll buffer prepended before a new utterance begins. */
         fun buildBoundaryPreRollBytes(sampleRateHz: Int, bytesPerFrame: Int): ByteArray {
@@ -338,17 +394,18 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
             offset: Int,
             alignedSize: Int,
             sampleRateHz: Int,
-            channelCount: Int
+            channelCount: Int,
+            startFadeFrame: Int = 0,
+            totalFadeFrames: Int = (sampleRateHz * BOUNDARY_FADE_IN_MS / 1000).coerceAtLeast(1)
         ): ByteArray {
             val bytesPerFrame = channelCount * 2
-            val fadeFrames = minOf(
-                (sampleRateHz * BOUNDARY_FADE_IN_MS / 1000).coerceAtLeast(1),
-                alignedSize / bytesPerFrame
-            )
+            val sliceFrames = alignedSize / bytesPerFrame
+            val remainingFadeFrames = (totalFadeFrames - startFadeFrame).coerceAtLeast(0)
+            val fadeFrames = minOf(remainingFadeFrames, sliceFrames)
             val faded = ByteArray(alignedSize)
             data.copyInto(faded, destinationOffset = 0, startIndex = offset, endIndex = offset + alignedSize)
             for (f in 0 until fadeFrames) {
-                val gain = (f + 1).toFloat() / fadeFrames.toFloat()
+                val gain = (startFadeFrame + f + 1).toFloat() / totalFadeFrames.coerceAtLeast(1).toFloat()
                 for (ch in 0 until channelCount) {
                     val i = (f * channelCount + ch) * 2
                     val lo = faded[i].toInt() and 0xFF
@@ -456,6 +513,7 @@ class AudioTrackPcmPlayer private constructor(
     private var volume = 1.0f
 
     private var formatEpoch = 0L
+    private var adapterGeneration = 0L
 
     @Volatile
     private var monotonicFramesWritten = 0L
@@ -467,6 +525,11 @@ class AudioTrackPcmPlayer private constructor(
     private var appliedAdapterSpeed = 1.0f
     private var pendingTailBytes = ByteArray(4)
     private var pendingTailCount = 0
+
+    // Stall-detection state for live/non-blocking AudioTrack recovery.
+    private var lastObservedProgressHeadFrames = 0L
+    private var lastHeadProgressNs = 0L
+    private var softKickAttemptedForStall = false
 
     // Fallback wall-clock pacing state used when no AudioTrackAdapter is available (e.g. JVM tests).
     private var fallbackTrackPlayedFrames = 0.0
@@ -493,7 +556,7 @@ class AudioTrackPcmPlayer private constructor(
 
     override fun playbackHeadPositionFrames(): Long =
         synchronized(lock) {
-            refreshPositionLocked(nanoTimeProvider()).first
+            refreshPositionLocked(nanoTimeProvider(), allowStallRecovery = true).first
         }
 
     override fun init(sampleRate: Int, channels: Int) {
@@ -508,7 +571,9 @@ class AudioTrackPcmPlayer private constructor(
         synchronized(lock) {
             val isFormatSwitch = initialized && (normRate != this.sampleRate || normChannels != this.channels)
             if (!isFormatSwitch) {
+                val nowNs = nanoTimeProvider()
                 formatEpoch++
+                adapterGeneration++
                 releaseAdapterLocked()
                 this.sampleRate = normRate
                 this.channels = normChannels
@@ -519,7 +584,8 @@ class AudioTrackPcmPlayer private constructor(
                 sessionMsOffset = 0L
                 pendingTailCount = 0
                 fallbackTrackPlayedFrames = 0.0
-                fallbackLastTickNs = nanoTimeProvider()
+                fallbackLastTickNs = nowNs
+                resetStallTrackerLocked(nowNs)
                 _currentPositionMs.value = 0L
                 initialized = true
                 adapter = createConfiguredAdapter(normRate, normChannels)
@@ -572,6 +638,8 @@ class AudioTrackPcmPlayer private constructor(
                 "Switching AudioTrack format from ${this.sampleRate}Hz/${this.channels}ch to ${normRate}Hz/${normChannels}ch"
             )
             formatEpoch++
+            adapterGeneration++
+            resetStallTrackerLocked(nowNs)
             releaseAdapterLocked()
             this.sampleRate = normRate
             this.channels = normChannels
@@ -590,6 +658,7 @@ class AudioTrackPcmPlayer private constructor(
         var track: AudioTrackAdapter? = null
         var frameBytes = 2
         var epochAtStart = 0L
+        var adapterGenAtStart = 0L
 
         synchronized(lock) {
             frameBytes = channels * 2
@@ -651,26 +720,49 @@ class AudioTrackPcmPlayer private constructor(
                 return chunk.data.size
             }
 
+            val nowNs = nanoTimeProvider()
+            val played = readCurrentTrackPlayedFramesLocked(nowNs)
+            if (trackFramesWritten <= played) {
+                lastObservedProgressHeadFrames = played
+                lastHeadProgressNs = nowNs
+                softKickAttemptedForStall = false
+            }
             track = currentTrack
             epochAtStart = formatEpoch
+            adapterGenAtStart = adapterGeneration
         }
 
-        val activeTrack = track ?: return 0
+        var activeTrack = track ?: return 0
+        var activeGen = adapterGenAtStart
         val maxSubChunkBytes = frameBytes * WRITE_SUBCHUNK_FRAMES
         var totalBytesWritten = 0
         var uncreditedBytes = 0
         var abortedOrFailed = false
+        var stallRecoveries = 0
 
         fun writeSpan(data: ByteArray, start: Int, end: Int) {
             var offset = start
             while (offset < end) {
-                val stillValid = synchronized(lock) {
-                    formatEpoch == epochAtStart && adapter === activeTrack
+                val resolvedTrack = synchronized(lock) {
+                    if (formatEpoch != epochAtStart) {
+                        null
+                    } else if (adapterGeneration != activeGen) {
+                        val current = adapter
+                        if (current != null) {
+                            activeGen = adapterGeneration
+                        }
+                        current
+                    } else if (adapter === activeTrack) {
+                        activeTrack
+                    } else {
+                        null
+                    }
                 }
-                if (!stillValid) {
+                if (resolvedTrack == null) {
                     abortedOrFailed = true
                     break
                 }
+                activeTrack = resolvedTrack
                 val stepSize = minOf(maxSubChunkBytes, end - offset)
                 val result = try {
                     activeTrack.write(data, offset, stepSize)
@@ -682,6 +774,73 @@ class AudioTrackPcmPlayer private constructor(
                         throwable = t
                     )
                     -1
+                }
+                if (result == 0 && activeTrack.usesNonBlockingWrite) {
+                    val action = synchronized(lock) {
+                        when {
+                            formatEpoch != epochAtStart || !isPlayingState -> 0
+                            adapterGeneration != activeGen -> {
+                                val next = adapter
+                                if (next == null) {
+                                    0
+                                } else {
+                                    activeTrack = next
+                                    activeGen = adapterGeneration
+                                    2
+                                }
+                            }
+                            adapter !== activeTrack -> 0
+                            else -> {
+                                val nowNs = nanoTimeProvider()
+                                val played = readCurrentTrackPlayedFramesLocked(nowNs)
+                                if (played > lastObservedProgressHeadFrames || trackFramesWritten <= played) {
+                                    lastObservedProgressHeadFrames = played
+                                    lastHeadProgressNs = nowNs
+                                    softKickAttemptedForStall = false
+                                    1
+                                } else {
+                                    val stalledNs = nowNs - lastHeadProgressNs
+                                    if (stalledNs >= WRITE_STALL_RECOVERY_MS * 1_000_000L) {
+                                        if (stallRecoveries >= MAX_WRITE_STALL_RECOVERIES) {
+                                            0
+                                        } else {
+                                            stallRecoveries++
+                                            DiagnosticLogBuffer.record(
+                                                "AudioTrackPcmPlayer",
+                                                "AudioTrack write stalled at $played/$trackFramesWritten frames; recreating AudioTrack",
+                                                level = "WARN"
+                                            )
+                                            val fresh = recoverStalledAdapterLocked(nowNs)
+                                            if (fresh == null) {
+                                                0
+                                            } else {
+                                                activeTrack = fresh
+                                                activeGen = adapterGeneration
+                                                2
+                                            }
+                                        }
+                                    } else {
+                                        if (!softKickAttemptedForStall && stalledNs >= SOFT_KICK_STALL_MS * 1_000_000L) {
+                                            softKickAttemptedForStall = true
+                                            safely { activeTrack.play() }
+                                        }
+                                        1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    when (action) {
+                        0 -> {
+                            abortedOrFailed = true
+                            break
+                        }
+                        1 -> {
+                            drainSleepMs(WRITE_RETRY_SLEEP_MS)
+                            continue
+                        }
+                        else -> continue
+                    }
                 }
                 if (result <= 0) {
                     if (result != 0) {
@@ -700,13 +859,24 @@ class AudioTrackPcmPlayer private constructor(
                 val newFrames = (uncreditedBytes / frameBytes).toLong()
                 uncreditedBytes %= frameBytes
                 val continueWriting = synchronized(lock) {
-                    if (formatEpoch == epochAtStart && adapter === activeTrack) {
+                    if (formatEpoch == epochAtStart) {
                         if (newFrames > 0L) {
                             trackFramesWritten += newFrames
                             monotonicFramesWritten += newFrames
                         }
-                        refreshPositionLocked(nanoTimeProvider())
-                        true
+                        refreshPositionLocked(nanoTimeProvider(), allowStallRecovery = false)
+                        if (adapterGeneration != activeGen) {
+                            val current = adapter
+                            if (current != null) {
+                                activeTrack = current
+                                activeGen = adapterGeneration
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            adapter === activeTrack
+                        }
                     } else {
                         false
                     }
@@ -726,7 +896,7 @@ class AudioTrackPcmPlayer private constructor(
         }
 
         synchronized(lock) {
-            if (!abortedOrFailed && trailingByteCount > 0 && formatEpoch == epochAtStart && adapter === activeTrack) {
+            if (!abortedOrFailed && trailingByteCount > 0 && formatEpoch == epochAtStart && adapter != null) {
                 chunk.data.copyInto(
                     pendingTailBytes,
                     destinationOffset = 0,
@@ -736,7 +906,7 @@ class AudioTrackPcmPlayer private constructor(
                 pendingTailCount = trailingByteCount
             }
             if (formatEpoch == epochAtStart) {
-                refreshPositionLocked(nanoTimeProvider())
+                refreshPositionLocked(nanoTimeProvider(), allowStallRecovery = false)
             }
         }
         return totalBytesWritten + if (!abortedOrFailed) trailingByteCount else 0
@@ -744,7 +914,10 @@ class AudioTrackPcmPlayer private constructor(
 
     override fun play() {
         synchronized(lock) {
-            fallbackLastTickNs = nanoTimeProvider()
+            val nowNs = nanoTimeProvider()
+            fallbackLastTickNs = nowNs
+            lastHeadProgressNs = nowNs
+            softKickAttemptedForStall = false
             isPlayingState = true
             adapter?.let { safely { it.play() } }
         }
@@ -758,13 +931,15 @@ class AudioTrackPcmPlayer private constructor(
             }
             isPlayingState = false
             adapter?.let { safely { it.pause() } }
-            refreshPositionLocked(nowNs)
+            refreshPositionLocked(nowNs, allowStallRecovery = false)
         }
     }
 
     override fun flush() {
         synchronized(lock) {
+            val nowNs = nanoTimeProvider()
             formatEpoch++
+            adapterGeneration++
             pendingTailCount = 0
             adapter?.let { track ->
                 // AudioTrack.flush() only works while paused/stopped.
@@ -777,16 +952,19 @@ class AudioTrackPcmPlayer private constructor(
             maxObservedTrackHeadFrames = 0L
             sessionMsOffset = 0L
             fallbackTrackPlayedFrames = 0.0
-            fallbackLastTickNs = nanoTimeProvider()
+            fallbackLastTickNs = nowNs
+            resetStallTrackerLocked(nowNs)
             _currentPositionMs.value = 0L
         }
     }
 
     override fun stop() {
         synchronized(lock) {
+            val nowNs = nanoTimeProvider()
             isPlayingState = false
             initialized = false
             formatEpoch++
+            adapterGeneration++
             pendingTailCount = 0
             adapter?.let { track ->
                 safely { track.pause() }
@@ -799,7 +977,8 @@ class AudioTrackPcmPlayer private constructor(
             maxObservedTrackHeadFrames = 0L
             sessionMsOffset = 0L
             fallbackTrackPlayedFrames = 0.0
-            fallbackLastTickNs = nanoTimeProvider()
+            fallbackLastTickNs = nowNs
+            resetStallTrackerLocked(nowNs)
             _currentPositionMs.value = 0L
         }
     }
@@ -818,10 +997,12 @@ class AudioTrackPcmPlayer private constructor(
             pendingTailCount = 0
             fallbackTrackPlayedFrames = 0.0
             fallbackLastTickNs = nowNs
+            resetStallTrackerLocked(nowNs)
 
             isPlayingState = false
             initialized = false
             formatEpoch++
+            adapterGeneration++
             releaseAdapterLocked()
         }
     }
@@ -875,18 +1056,69 @@ class AudioTrackPcmPlayer private constructor(
      */
     fun refreshPosition(): Long =
         synchronized(lock) {
-            refreshPositionLocked(nanoTimeProvider()).second
+            refreshPositionLocked(nanoTimeProvider(), allowStallRecovery = true).second
         }
 
-    private fun refreshPositionLocked(nowNs: Long): Pair<Long, Long> {
+    private fun refreshPositionLocked(nowNs: Long, allowStallRecovery: Boolean = false): Pair<Long, Long> {
         if (adapter == null) {
             advanceFallbackLocked(nowNs)
         }
-        val trackPlayed = readCurrentTrackPlayedFramesLocked(nowNs)
+        var trackPlayed = readCurrentTrackPlayedFramesLocked(nowNs)
+        val currentAdapter = adapter
+        if (allowStallRecovery && currentAdapter != null && isPlayingState && speed > 0f) {
+            if (trackFramesWritten > trackPlayed) {
+                if (trackPlayed > lastObservedProgressHeadFrames) {
+                    lastObservedProgressHeadFrames = trackPlayed
+                    lastHeadProgressNs = nowNs
+                    softKickAttemptedForStall = false
+                } else {
+                    val stalledNs = nowNs - lastHeadProgressNs
+                    if (currentAdapter.usesNonBlockingWrite && stalledNs >= PLAYBACK_HEAD_STALL_RECOVERY_MS * 1_000_000L) {
+                        DiagnosticLogBuffer.record(
+                            "AudioTrackPcmPlayer",
+                            "AudioTrack playback head stalled at $trackPlayed/$trackFramesWritten frames; recreating AudioTrack",
+                            level = "WARN"
+                        )
+                        recoverStalledAdapterLocked(nowNs)
+                        trackPlayed = 0L
+                    } else if (!softKickAttemptedForStall && stalledNs >= SOFT_KICK_STALL_MS * 1_000_000L) {
+                        softKickAttemptedForStall = true
+                        safely { currentAdapter.play() }
+                    }
+                }
+            } else {
+                lastObservedProgressHeadFrames = trackPlayed
+                lastHeadProgressNs = nowNs
+                softKickAttemptedForStall = false
+            }
+        }
         val monotonicHead = headFrameOffset + trackPlayed
         val posMs = sessionMsOffset + (trackPlayed * 1000L / sampleRate)
         _currentPositionMs.value = posMs
         return monotonicHead to posMs
+    }
+
+    private fun resetStallTrackerLocked(nowNs: Long) {
+        lastObservedProgressHeadFrames = 0L
+        lastHeadProgressNs = nowNs
+        softKickAttemptedForStall = false
+    }
+
+    private fun recoverStalledAdapterLocked(nowNs: Long): AudioTrackAdapter? {
+        val oldPlayed = readCurrentTrackPlayedFramesLocked(nowNs)
+        sessionMsOffset += oldPlayed * 1000L / sampleRate
+        headFrameOffset = monotonicFramesWritten
+        trackFramesWritten = 0L
+        maxObservedTrackHeadFrames = 0L
+        pendingTailCount = 0
+        fallbackTrackPlayedFrames = 0.0
+        fallbackLastTickNs = nowNs
+        resetStallTrackerLocked(nowNs)
+        adapterGeneration++
+        releaseAdapterLocked()
+        val fresh = createConfiguredAdapter(sampleRate, channels)
+        adapter = fresh
+        return fresh
     }
 
     private fun advanceFallbackLocked(nowNs: Long) {
@@ -1034,6 +1266,11 @@ class AudioTrackPcmPlayer private constructor(
         const val DRAIN_POLL_INTERVAL_MS = 10L
         const val MAX_DRAIN_POLL_ITERATIONS = 400
         const val WRITE_SUBCHUNK_FRAMES = 1024
+        const val WRITE_RETRY_SLEEP_MS = 10L
+        const val SOFT_KICK_STALL_MS = 1_000L
+        const val WRITE_STALL_RECOVERY_MS = 2_500L
+        const val PLAYBACK_HEAD_STALL_RECOVERY_MS = 3_000L
+        const val MAX_WRITE_STALL_RECOVERIES = 2
         const val UNITY_SPEED_EPSILON = 0.001f
     }
 }

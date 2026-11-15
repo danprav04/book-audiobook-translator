@@ -414,4 +414,145 @@ class AudioTrackPcmPlayerTest {
         fallbackPlayer.onUtteranceEnd()
         assertEquals(2400L, fallbackPlayer.totalFramesWritten)
     }
+
+    @Test
+    fun `non-blocking write stall soft-kicks play at 1s and recreates adapter at 2_5s`() {
+        var nowNs = 1_000_000_000L
+        var playCallsOnStalled = 0
+        var releasedStalled = false
+        var recoveredWritten = 0L
+
+        val stalledAdapter = object : AudioTrackAdapter {
+            override val usesNonBlockingWrite: Boolean = true
+            override fun write(data: ByteArray, offset: Int, size: Int): Int = 0
+            override fun play() {
+                playCallsOnStalled++
+            }
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {
+                releasedStalled = true
+            }
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long = 0L
+        }
+
+        val freshAdapter = object : AudioTrackAdapter {
+            override val usesNonBlockingWrite: Boolean = true
+            var head = 0L
+            override fun write(data: ByteArray, offset: Int, size: Int): Int {
+                recoveredWritten += size
+                return size
+            }
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long get() = head
+        }
+
+        var createCount = 0
+        val player = AudioTrackPcmPlayer(
+            adapterFactory = AudioTrackAdapterFactory { _, _ ->
+                createCount++
+                if (createCount == 1) stalledAdapter else freshAdapter
+            },
+            nanoTimeProvider = { nowNs },
+            drainSleepMs = { ms -> nowNs += ms * 1_000_000L }
+        )
+
+        player.init(24000, 1)
+        player.play()
+        assertEquals(1, playCallsOnStalled)
+
+        // Writing 2400 frames on a stalled non-blocking adapter must soft-kick play() once
+        // after 1s and recover onto a fresh adapter after 2.5s instead of hanging forever.
+        player.write(PcmChunk(ByteArray(4800), sampleRate = 24000, channels = 1))
+
+        assertEquals(2, createCount)
+        assertEquals(2, playCallsOnStalled)
+        assertTrue(releasedStalled)
+        assertEquals(4800L, recoveredWritten)
+        assertEquals(2400L, player.totalFramesWritten)
+    }
+
+    @Test
+    fun `refreshPosition recovers non-blocking adapter after 3s playback head freeze monotonically`() {
+        var nowNs = 1_000_000_000L
+        var playCallsOnStalled = 0
+        var releasedStalled = false
+
+        val stalledAdapter = object : AudioTrackAdapter {
+            override val usesNonBlockingWrite: Boolean = true
+            var head = 1200L
+            override fun write(data: ByteArray, offset: Int, size: Int): Int = size
+            override fun play() {
+                playCallsOnStalled++
+            }
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {
+                releasedStalled = true
+            }
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long get() = head
+        }
+
+        val freshAdapter = object : AudioTrackAdapter {
+            override val usesNonBlockingWrite: Boolean = true
+            var head = 0L
+            override fun write(data: ByteArray, offset: Int, size: Int): Int = size
+            override fun play() {}
+            override fun pause() {}
+            override fun flush() {}
+            override fun stop() {}
+            override fun release() {}
+            override fun setSpeed(speed: Float): Boolean = true
+            override fun setVolume(volume: Float) {}
+            override val playbackHeadPositionFrames: Long get() = head
+        }
+
+        var createCount = 0
+        val player = AudioTrackPcmPlayer(
+            adapterFactory = AudioTrackAdapterFactory { _, _ ->
+                createCount++
+                if (createCount == 1) stalledAdapter else freshAdapter
+            },
+            nanoTimeProvider = { nowNs },
+            drainSleepMs = { ms -> nowNs += ms * 1_000_000L }
+        )
+
+        player.init(24000, 1)
+        player.play()
+        player.write(PcmChunk(ByteArray(4800), sampleRate = 24000, channels = 1)) // 2400 frames written, head at 1200
+
+        // Sample initial head (1200 < 2400 unplayed) -> starts stall timer
+        assertEquals(1200L, player.playbackHeadPositionFrames())
+        assertEquals(1, playCallsOnStalled)
+
+        // Advance 1.1s with frozen head -> triggers soft kick play()
+        nowNs += 1_100_000_000L
+        player.refreshPosition()
+        assertEquals(2, playCallsOnStalled)
+        assertFalse(releasedStalled)
+
+        // Advance past 3s total stall -> releases stalled adapter, retires unplayed frames cleanly
+        nowNs += 2_000_000_000L
+        player.refreshPosition()
+        assertEquals(2, createCount)
+        assertTrue(releasedStalled)
+        // Monotonic position advances past retired 2400 frames; next chunk continues cleanly
+        assertEquals(2400L, player.playbackHeadPositionFrames())
+        player.write(PcmChunk(ByteArray(2400), sampleRate = 24000, channels = 1)) // +1200 frames -> total 3600
+        freshAdapter.head = 600L
+        assertEquals(3600L, player.totalFramesWritten)
+        assertEquals(3000L, player.playbackHeadPositionFrames())
+    }
 }
