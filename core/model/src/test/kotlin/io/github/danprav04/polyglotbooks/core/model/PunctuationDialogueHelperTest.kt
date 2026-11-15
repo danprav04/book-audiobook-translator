@@ -39,47 +39,33 @@ class PunctuationDialogueHelperTest {
     }
 
     @Test
-    fun `resolves expressive punctuation-only dialogue into natural non-verbal cues`() {
-        val ellipsis = PunctuationDialogueHelper.resolve("\"...\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, ellipsis.kind)
-        assertEquals("Mmm...", ellipsis.spokenText)
-        assertTrue(ellipsis.styleCue.orEmpty().contains("sigh", ignoreCase = true))
-
-        val puzzledEllipsis = PunctuationDialogueHelper.resolve("\"......?\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, puzzledEllipsis.kind)
-        assertEquals("Hmm...?", puzzledEllipsis.spokenText)
-        assertTrue(puzzledEllipsis.styleCue.orEmpty().contains("puzzled", ignoreCase = true))
-
-        val startled = PunctuationDialogueHelper.resolve("\"?!" + "\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, startled.kind)
-        assertEquals("Huh?!", startled.spokenText)
-        assertTrue(startled.styleCue.orEmpty().contains("startled", ignoreCase = true))
-
-        val question = PunctuationDialogueHelper.resolve("\"?\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, question.kind)
-        assertEquals("Hmm?", question.spokenText)
-
-        val exclaim = PunctuationDialogueHelper.resolve("\"!\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, exclaim.kind)
-        assertEquals("Oh!", exclaim.spokenText)
-
-        val cutOffDash = PunctuationDialogueHelper.resolve("\"—\"")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, cutOffDash.kind)
-        assertEquals("Ah—", cutOffDash.spokenText)
-        assertTrue(cutOffDash.styleCue.orEmpty().contains("cut-off", ignoreCase = true))
-
-        val cjkEllipsis = PunctuationDialogueHelper.resolve("「……？」")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, cjkEllipsis.kind)
-        assertEquals("Hmm...?", cjkEllipsis.spokenText)
+    fun `keeps punctuation-only dialogue silent without fabricating interjections`() {
+        val inputs = listOf(
+            "\"...\"",
+            "\"......?\"",
+            "\"?!\"",
+            "\"?\"",
+            "\"!\"",
+            "\"—\"",
+            "「……？」"
+        )
+        inputs.forEach { raw ->
+            val resolved = PunctuationDialogueHelper.resolve(raw)
+            assertEquals(
+                "Expected punctuation-only '$raw' to stay silent instead of inventing words",
+                PunctuationKind.SILENT_DIVIDER,
+                resolved.kind
+            )
+            assertEquals(raw, resolved.spokenText)
+        }
     }
 
     @Test
-    fun `merges existing emotional style and leaves regular prose intact`() {
-        val merged = PunctuationDialogueHelper.resolve("...?", existingStyle = "whispered")
-        assertEquals(PunctuationKind.EXPRESSIVE_DIALOGUE, merged.kind)
-        assertEquals("Hmm...?", merged.spokenText)
-        assertNotNull(merged.styleCue)
-        assertTrue(merged.styleCue!!.startsWith("whispered, "))
+    fun `preserves existing style on punctuation-only lines and leaves regular prose intact`() {
+        val paused = PunctuationDialogueHelper.resolve("...?", existingStyle = "whispered")
+        assertEquals(PunctuationKind.SILENT_DIVIDER, paused.kind)
+        assertEquals("...?", paused.spokenText)
+        assertEquals("whispered", paused.styleCue)
 
         val regular = PunctuationDialogueHelper.resolve("Hello...", existingStyle = "neutral")
         assertEquals(PunctuationKind.REGULAR_TEXT, regular.kind)

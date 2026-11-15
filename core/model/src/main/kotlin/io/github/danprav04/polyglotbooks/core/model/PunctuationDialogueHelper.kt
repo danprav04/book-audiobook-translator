@@ -52,81 +52,12 @@ object PunctuationDialogueHelper {
         }
 
         val wasWrapped = trimmed.first() in WRAPPER_CHARS && trimmed.last() in WRAPPER_CHARS && trimmed.length >= 2
-        val core = stripWrappers(trimmed)
-        if (core.isEmpty()) {
-            return ResolvedPunctuationUtterance(
-                kind = PunctuationKind.SILENT_DIVIDER,
-                spokenText = rawText,
-                styleCue = cleanExisting
-            )
-        }
-
-        val normalizedCore = normalizePunctuation(core)
-
-        if (isSilentDivider(core, normalizedCore, wasWrapped)) {
-            return ResolvedPunctuationUtterance(
-                kind = PunctuationKind.SILENT_DIVIDER,
-                spokenText = rawText,
-                styleCue = cleanExisting
-            )
-        }
-
-        val hasQuestion = '?' in normalizedCore
-        val hasExclaim = '!' in normalizedCore
-        val hasEllipsis = normalizedCore.contains("..") || '…' in core || isSpacedThreeDotEllipsis(normalizedCore)
-        val hasDash = normalizedCore.any { it in DASH_CHARS }
-
-        if (!hasQuestion && !hasExclaim && !hasEllipsis && !hasDash) {
-            return ResolvedPunctuationUtterance(
-                kind = PunctuationKind.SILENT_DIVIDER,
-                spokenText = rawText,
-                styleCue = cleanExisting
-            )
-        }
-
-        val (spokenText, baseCue) = when {
-            hasQuestion && hasExclaim -> {
-                val cue = if (hasEllipsis) {
-                    "hesitant then startled, incredulous gasp"
-                } else {
-                    "startled, incredulous gasp"
-                }
-                "Huh?!" to cue
-            }
-            hasQuestion && hasEllipsis -> "Hmm...?" to "hesitant, puzzled questioning murmur"
-            hasQuestion && hasDash -> "Huh?" to "abrupt, startled questioning inflection"
-            hasQuestion -> {
-                val multiQ = normalizedCore.count { it == '?' } >= 2
-                if (multiQ) {
-                    "Huh?" to "confused, emphatic questioning inflection"
-                } else {
-                    "Hmm?" to "curious, questioning inflection"
-                }
-            }
-            hasExclaim && hasEllipsis -> "Oh...!" to "hesitant, breathy surprised gasp"
-            hasExclaim && hasDash -> "Ah!" to "abrupt, startled exclamation"
-            hasExclaim -> {
-                val multiEx = normalizedCore.count { it == '!' } >= 2
-                if (multiEx) {
-                    "Oh!" to "sharp, intensely surprised exclamation"
-                } else {
-                    "Oh!" to "sharp, surprised exclamation"
-                }
-            }
-            hasEllipsis -> "Mmm..." to "quiet, hesitant sigh, trailing off softly"
-            else -> "Ah—" to "abrupt, breathless cut-off gasp"
-        }
-
-        val mergedStyle = when {
-            cleanExisting == null -> baseCue
-            cleanExisting.contains(baseCue, ignoreCase = true) -> cleanExisting
-            else -> "$cleanExisting, $baseCue"
-        }
-
+        // Punctuation-only lines (e.g. "...", "...?", "?!", "—", "---", "* * *") contain no
+        // spoken words and must stay silent pauses rather than inventing interjections like "Hmm...".
         return ResolvedPunctuationUtterance(
-            kind = PunctuationKind.EXPRESSIVE_DIALOGUE,
-            spokenText = spokenText,
-            styleCue = mergedStyle
+            kind = PunctuationKind.SILENT_DIVIDER,
+            spokenText = rawText,
+            styleCue = cleanExisting
         )
     }
 
