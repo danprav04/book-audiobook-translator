@@ -1157,7 +1157,7 @@ class ReaderNarrationSessionManagerTest {
     }
 
     @Test
-    fun `paused session chapter change clears stale highlightedCfi and flash tts uses GEMINI_TTS_V2 cache tag`() = runTest {
+    fun `paused session chapter change clears stale highlightedCfi and flash tts uses GEMINI_TTS_V3 cache tag`() = runTest {
         val tempDir = Files.createTempDirectory("reader-cache-v2").toFile()
         try {
             val diskCache = TranslationDiskCache(tempDir)
@@ -1252,7 +1252,7 @@ class ReaderNarrationSessionManagerTest {
                 style = null,
                 text = "Clean book sentence."
             )
-            assertNotNull("Synthesized audio must be cached under GEMINI_TTS_V2_en", v2Cached)
+            assertNotNull("Synthesized audio must be cached under GEMINI_TTS_V3_en", v2Cached)
             assertTrue(v2Cached!!.pcmBytes.contentEquals(freshPcm))
         } finally {
             tempDir.deleteRecursively()
@@ -2010,6 +2010,34 @@ class ReaderNarrationSessionManagerTest {
             assertTrue(req.segments.none { it.text.contains("Say as ") })
         } finally {
             tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `buildSpeechChunks keeps contractions and apostrophe words intact without breaking before apostrophes`() {
+        val manager = ReaderNarrationSessionManager(
+            bookDao = FakeBookDao(),
+            chapterDao = FakeChapterDao(),
+            applicationScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob())
+        )
+        val sentence = "I don't know if it's I'm, O'Brien's, or the dogs' toy\u2019s fault."
+        val paragraphs = listOf(
+            ReaderParagraph(0, "p0", sentence, "epubcfi(/6/2!/4/2/1:0)")
+        )
+
+        listOf(
+            NarrationEngine.GEMINI_FLASH_TTS,
+            NarrationEngine.GEMINI_LIVE,
+            NarrationEngine.SYSTEM_TTS
+        ).forEach { engine ->
+            val chunks = manager.buildSpeechChunks(
+                paragraphs = paragraphs,
+                characters = emptyList(),
+                engine = engine,
+                defaultNarratorVoiceId = "Charon"
+            )
+            assertEquals("Engine $engine should keep apostrophe sentence in one chunk", 1, chunks.size)
+            assertEquals(sentence, chunks.single().text)
         }
     }
 }

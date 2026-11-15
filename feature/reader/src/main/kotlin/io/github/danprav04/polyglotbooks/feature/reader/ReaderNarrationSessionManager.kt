@@ -3846,8 +3846,8 @@ class ReaderNarrationSessionManager @Inject constructor(
     }
 
     companion object {
-        internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V2"
-        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V2"
+        internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V3"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V3"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =
