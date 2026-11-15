@@ -29,6 +29,18 @@ data class VoiceInfo(
     val language: String
 )
 
+/**
+ * Per-part segment inside a single [SynthesisRequest] allowing multi-paragraph batches to
+ * carry distinct single-narrator delivery cues (`style`, `speakerName`, `characterPersonality`)
+ * while sharing one voice and one API request.
+ */
+data class SynthesisSegment(
+    val text: String,
+    val style: String? = null,
+    val speakerName: String? = null,
+    val characterPersonality: String? = null
+)
+
 data class SynthesisRequest(
     val text: String,
     val voiceId: String,
@@ -37,7 +49,8 @@ data class SynthesisRequest(
     val languageCode: String? = null,
     val speakerName: String? = null,
     val characterPersonality: String? = null,
-    val storySummary: String? = null
+    val storySummary: String? = null,
+    val segments: List<SynthesisSegment> = emptyList()
 )
 
 /**

@@ -4,6 +4,7 @@ import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.QuotaExhaustedException
 import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
+import io.github.danprav04.polyglotbooks.core.gemini.TtsSegment
 import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.DiagnosticLogBuffer
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
@@ -25,7 +26,7 @@ class GeminiTtsEngine(
 ) : NarrationEngine {
     override val id: EngineId = EngineId.GEMINI_TTS
     override val capabilities: EngineCapabilities = EngineCapabilities(
-        supportsMultiVoice = true,
+        supportsMultiVoice = false,
         supportsEmotionalStyles = true,
         supportsStreaming = true,
         outputSampleRate = 24000
@@ -91,7 +92,15 @@ class GeminiTtsEngine(
             model = model,
             languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() },
             personality = request.characterPersonality?.trim()?.takeIf { it.isNotEmpty() },
-            storyContext = request.storySummary?.trim()?.takeIf { it.isNotEmpty() }
+            storyContext = request.storySummary?.trim()?.takeIf { it.isNotEmpty() },
+            segments = request.segments.map { seg ->
+                TtsSegment(
+                    text = seg.text,
+                    style = seg.style?.trim()?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) },
+                    speaker = seg.speakerName?.trim()?.takeIf { it.isNotEmpty() },
+                    personality = seg.characterPersonality?.trim()?.takeIf { it.isNotEmpty() }
+                )
+            }
         )
 
         var emittedCount = 0

@@ -68,7 +68,7 @@ class GeminiLiveEngine(
 ) : NarrationEngine {
     override val id: EngineId = EngineId.GEMINI_LIVE
     override val capabilities: EngineCapabilities = EngineCapabilities(
-        supportsMultiVoice = true,
+        supportsMultiVoice = false,
         supportsEmotionalStyles = true,
         supportsStreaming = true,
         outputSampleRate = 24000
@@ -685,15 +685,19 @@ class GeminiLiveEngine(
 
             val outputTranscript = transcriptBuilder.toString().trim()
             val similarity = if (outputTranscript.isEmpty()) 1.0 else calculateWordOverlapSimilarity(request.text, outputTranscript)
+            val sourceWordCount = countWords(request.text)
+            val outputWordCount = countWords(outputTranscript)
+            val excessiveExpansion = sourceWordCount >= 4 &&
+                outputWordCount > ((sourceWordCount * 1.75).toInt() + 3)
             val expressiveTranscriptAcceptable = isExpressivePunctuation &&
-                outputTranscript.split(Regex("\\s+")).count { it.isNotBlank() } <= 4
+                outputWordCount <= 4
             val similarityOk = outputTranscript.isEmpty() ||
                 expressiveTranscriptAcceptable ||
-                similarity >= SIMILARITY_THRESHOLD
+                (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion)
             if (!similarityOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Transcript similarity low (${"%.2f".format(similarity)} < $SIMILARITY_THRESHOLD) on model=$cleanModel; rotating session",
+                    "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
             }
@@ -776,20 +780,14 @@ class GeminiLiveEngine(
 
     private data class SessionSetupKey(
         val voiceId: String,
-        val style: String?,
-        val languageCode: String?,
-        val speakerName: String?,
-        val characterPersonality: String?,
-        val storySummary: String?
+        val languageCode: String?
     ) {
         companion object {
+            // Key only on narrator voice and language so the Live WebSocket stays open smoothly
+            // across character dialogue turns without reconnecting every paragraph.
             fun from(request: SynthesisRequest): SessionSetupKey = SessionSetupKey(
                 voiceId = request.voiceId.trim(),
-                style = request.style?.trim()?.takeIf { it.isNotEmpty() && !it.equals("neutral", ignoreCase = true) },
-                languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() },
-                speakerName = request.speakerName?.trim()?.takeIf { it.isNotEmpty() },
-                characterPersonality = request.characterPersonality?.trim()?.takeIf { it.isNotEmpty() },
-                storySummary = request.storySummary?.trim()?.takeIf { it.isNotEmpty() }
+                languageCode = request.languageCode?.trim()?.takeIf { it.isNotEmpty() }
             )
         }
     }
@@ -858,12 +856,15 @@ class GeminiLiveEngine(
             }
             .toSet()
 
+    private fun countWords(text: String): Int =
+        text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
+
     companion object {
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
         private const val POST_GENERATION_IDLE_TIMEOUT_MS = 1_500L
-        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_500L
+        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 1_500L
 
         /**
          * Joins streaming BPE outputTranscription fragments without inserting artificial spaces
@@ -899,6 +900,9 @@ class GeminiLiveEngine(
             append("You are an accomplished audiobook narrator and voice actor bringing a story to life. ")
             append("Read the user's text aloud strictly verbatim, word for word, without adding, omitting, ")
             append("paraphrasing, replying conversationally, or repeating these instructions. ")
+            append("Read each phrase once and only once—never repeat, echo, or restart a sentence. ")
+            append("Stop cleanly at trailing dashes (—), hyphens (-), or ellipses (...) and never complete or guess unfinished words. ")
+            append("Never speak stage directions, speaker labels, or delivery metadata aloud. ")
             append("Perform with natural human warmth, expressive cadence, emotional presence, vivid intonation, ")
             append("and authentic pauses at punctuation (dashes, ellipses, questions, and exclamations) rather than a flat monotone. ")
             append("When bracketed system prompts or status messages appear (e.g. [text in brackets]), read their exact words clearly in a crisp, composed system-voice cadence.")

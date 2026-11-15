@@ -612,4 +612,78 @@ class GeminiLiveEngineStreamingTest {
         assertEquals(11.toByte(), received[0].data[0])
         assertEquals(17.toByte(), received[3].data[0])
     }
+
+    @Test
+    fun `streaming Live session reuses setup across style changes and rejects repeated hallucinated transcript`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val fallbackTexts = mutableListOf<String>()
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackTexts += request.text
+                return flowOf(PcmChunk(byteArrayOf(99, 100), 24000, 1))
+            }
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            // Turn 1 -> Narrator
+            val t1Job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = "The train stopped cleanly.", voiceId = "Charon", speakerName = "Narrator", style = "calm")
+                ).toList()
+            }
+            runCurrent()
+            createdSessions.last().emitServerMessage(audioServerMessage(byteArrayOf(1, 2), transcript = "The train stopped cleanly.", turnComplete = true))
+            t1Job.join()
+
+            // Turn 2 -> Different character & style keeps the exact same WebSocket session (only 1 setup sent)
+            val t2Job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = "Why are you staring at me?", voiceId = "Charon", speakerName = "Kim Namwoon", style = "angry")
+                ).toList()
+            }
+            runCurrent()
+            createdSessions.last().emitServerMessage(audioServerMessage(byteArrayOf(3, 4), transcript = "Why are you staring at me?", turnComplete = true))
+            t2Job.join()
+            assertEquals(1, createdSessions.size)
+            assertEquals(1, createdSessions.single().setups.size)
+
+            // Turn 3 -> Doubled hallucinated transcript exceeds word expansion guard -> rejected across candidates and falls back cleanly
+            val t3Chunks = mutableListOf<PcmChunk>()
+            val sourceLine = "Why would you do such a thing?"
+            val doubledTranscript = "$sourceLine $sourceLine $sourceLine"
+            val t3Job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = sourceLine, voiceId = "Charon")
+                ).collect { t3Chunks += it }
+            }
+            repeat(8) {
+                runCurrent()
+                createdSessions.lastOrNull()?.emitServerMessage(
+                    audioServerMessage(byteArrayOf(5, 6), transcript = doubledTranscript, turnComplete = true)
+                )
+            }
+            t3Job.join()
+
+            assertEquals(listOf(sourceLine), fallbackTexts)
+            assertEquals(1, t3Chunks.size)
+            assertEquals(99.toByte(), t3Chunks[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
 }

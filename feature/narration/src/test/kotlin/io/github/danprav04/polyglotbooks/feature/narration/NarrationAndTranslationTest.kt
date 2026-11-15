@@ -622,31 +622,25 @@ class NarrationAndTranslationTest {
         assertEquals(jaInstruction, capturedSetups[0].systemInstruction?.parts?.firstOrNull()?.text)
         assertEquals(listOf("こんにちは"), capturedClientTurns)
 
-        // Blank and structural divider turns must not be sent to Live model, whereas expressive punctuation dialogue IS sent
+        // Blank and punctuation-only turns must stay silent pauses without invoking Live model
         val liveSession = engine.openStreamingSession()
         try {
             assertTrue(liveSession.synthesizeTurnStreaming(SynthesisRequest(text = "   ", voiceId = "Charon")).toList().isEmpty())
-            val divider = liveSession.synthesizeTurnStreaming(SynthesisRequest(text = "---", voiceId = "Charon")).toList()
-            assertEquals(1, divider.size)
-            assertTrue(divider[0].data.all { it == 0.toByte() })
+            listOf("---", "\"......?\"", "\"?!\"", "\"—\"").forEach { nonLexical ->
+                val silentChunks = liveSession.synthesizeTurnStreaming(
+                    SynthesisRequest(text = nonLexical, voiceId = "Charon")
+                ).toList()
+                assertEquals(1, silentChunks.size)
+                assertTrue("Expected '$nonLexical' to stay silent", silentChunks[0].data.all { it == 0.toByte() })
+            }
             assertEquals(1, capturedClientTurns.size)
-
-            val expressive = liveSession.synthesizeTurnStreaming(SynthesisRequest(text = "\"......?\"", voiceId = "Charon")).toList()
-            assertEquals(1, expressive.size)
-            assertTrue(rawAudio.contentEquals(expressive[0].data))
-            assertEquals(2, capturedClientTurns.size)
-            assertEquals("Hmm...?", capturedClientTurns[1])
-            assertTrue(
-                capturedSetups.last().systemInstruction?.parts?.firstOrNull()?.text.orEmpty()
-                    .contains("puzzled", ignoreCase = true)
-            )
         } finally {
             liveSession.close()
         }
     }
 
     @Test
-    fun `GeminiTtsEngine and SystemTtsEngine keep structural dividers silent while vocalizing expressive punctuation`() = runTest {
+    fun `GeminiTtsEngine and SystemTtsEngine keep structural dividers and punctuation-only lines silent`() = runTest {
         val capturedTtsRequests = mutableListOf<TtsRequest>()
         val fakeClient = object : InteractionsTtsClient {
             override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = byteArrayOf(7, 8)
@@ -660,20 +654,12 @@ class NarrationAndTranslationTest {
             apiKeyProvider = { "test-key" }
         )
 
-        listOf("---", "* * *", "===", "___").forEach { divider ->
+        listOf("---", "* * *", "===", "___", "\"......?\"", "\"?!\"", "\"—\"").forEach { divider ->
             val chunks = ttsEngine.synthesize(SynthesisRequest(text = divider, voiceId = "Charon")).toList()
             assertEquals(1, chunks.size)
-            assertTrue("Divider '$divider' should stay silent", chunks[0].data.all { it == 0.toByte() })
+            assertTrue("Non-lexical '$divider' should stay silent", chunks[0].data.all { it == 0.toByte() })
         }
         assertTrue(capturedTtsRequests.isEmpty())
-
-        listOf("\"......?\"", "\"?!\"", "\"—\"").forEach { cue ->
-            val chunks = ttsEngine.synthesize(SynthesisRequest(text = cue, voiceId = "Aoede")).toList()
-            assertEquals(1, chunks.size)
-            assertEquals(7.toByte(), chunks[0].data[0])
-        }
-        assertEquals(listOf("Hmm...?", "Huh?!", "Ah—"), capturedTtsRequests.map { it.text })
-        assertTrue(capturedTtsRequests.all { !it.style.isNullOrBlank() })
 
         val sysDivider = SystemTtsEngine().synthesize(SynthesisRequest(text = "===", voiceId = "default")).toList()
         assertEquals(1, sysDivider.size)
