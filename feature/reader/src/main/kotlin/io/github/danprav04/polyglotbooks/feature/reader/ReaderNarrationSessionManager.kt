@@ -1134,7 +1134,12 @@ class ReaderNarrationSessionManager @Inject constructor(
             apiKeyProvider = { resolveApiKey() },
             modelProvider = { resolveModel(ModelRole.LIVE_NARRATION) },
             quotaTracker = quotaTracker,
-            modelCatalogService = modelCatalogService
+            modelCatalogService = modelCatalogService,
+            turnTimeoutMsProvider = { text ->
+                // Fail over promptly on ultra-short turns like "\"Go!\"" while still giving
+                // full paragraphs enough budget to start streaming.
+                (10_000L + text.length.coerceAtLeast(0).toLong() * 140L).coerceIn(10_000L, 90_000L)
+            }
         )
     }
 
@@ -1784,10 +1789,10 @@ class ReaderNarrationSessionManager @Inject constructor(
                             }
                         }
                     } else {
-                        // Producer-consumer multi-turn streaming pipeline (GEMINI_LIVE & SYSTEM_TTS, up to 4-turn lookahead).
+                        // Producer-consumer multi-turn streaming pipeline (GEMINI_LIVE & SYSTEM_TTS, up to 7-turn lookahead).
                         kotlinx.coroutines.coroutineScope {
                             val events = Channel<LiveStreamEvent>(Channel.UNLIMITED)
-                            val turnCredits = Semaphore(permits = 5)
+                            val turnCredits = Semaphore(permits = 8)
                             val producerJob = launch(ioDispatcher) {
                                 try {
                                     for (chunkIdx in chunks.indices) {
@@ -3847,7 +3852,7 @@ class ReaderNarrationSessionManager @Inject constructor(
 
     companion object {
         internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V3"
-        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V3"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V5"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =
