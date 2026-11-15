@@ -116,6 +116,58 @@ fun interface AudioTrackAdapterFactory {
 }
 
 /**
+ * Tracks hardware-written frame counts and non-speech padding intervals (boundary pre-rolls and
+ * end-of-utterance silence tails) so [adjustedHeadFrames] progresses strictly monotonically along
+ * actual speech frames with zero cumulative per-turn drift even when the next turn pre-buffers.
+ */
+internal class PaddingFrameTracker {
+    private data class Span(
+        val startRawFrame: Long,
+        val frames: Long
+    )
+
+    private val lock = Any()
+    private val spans = ArrayList<Span>()
+    private var hardwareFramesWritten: Long = 0L
+
+    fun recordSpeechFrames(frames: Long) {
+        if (frames <= 0L) return
+        synchronized(lock) {
+            hardwareFramesWritten += frames
+        }
+    }
+
+    fun recordPaddingFrames(frames: Long) {
+        if (frames <= 0L) return
+        synchronized(lock) {
+            spans.add(Span(startRawFrame = hardwareFramesWritten, frames = frames))
+            hardwareFramesWritten += frames
+        }
+    }
+
+    fun adjustedHeadFrames(rawHeadFrame: Long): Long {
+        if (rawHeadFrame <= 0L) return 0L
+        synchronized(lock) {
+            var renderedPadding = 0L
+            for (i in 0 until spans.size) {
+                val span = spans[i]
+                if (rawHeadFrame <= span.startRawFrame) break
+                val elapsed = rawHeadFrame - span.startRawFrame
+                renderedPadding += if (elapsed >= span.frames) span.frames else elapsed
+            }
+            return (rawHeadFrame - renderedPadding).coerceAtLeast(0L)
+        }
+    }
+
+    fun reset() {
+        synchronized(lock) {
+            spans.clear()
+            hardwareFramesWritten = 0L
+        }
+    }
+}
+
+/**
  * [AudioTrackAdapter] backed by a streaming [AudioTrack] configured for speech media playback.
  */
 class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapter {
@@ -123,15 +175,10 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     private val sampleRateHz: Int = sampleRate.coerceAtLeast(8_000)
     private val channelCount: Int = if (channels >= 2) 2 else 1
     private val bytesPerFrame: Int = channelCount * 2
+    private val paddingTracker = PaddingFrameTracker()
 
     @Volatile
     private var hasCustomPlaybackParams = false
-
-    @Volatile
-    private var hardwareFramesWritten: Long = 0L
-
-    @Volatile
-    private var injectedPreRollFrames: Long = 0L
 
     @Volatile
     private var needsBoundaryFadeIn: Boolean = true
@@ -175,24 +222,15 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
         val alignedSize = (size / bytesPerFrame) * bytesPerFrame
         if (alignedSize <= 0) return track.write(data, offset, size, AudioTrack.WRITE_BLOCKING)
 
-        val rawHead = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-        if (!needsBoundaryFadeIn && hardwareFramesWritten > 0L && rawHead >= hardwareFramesWritten) {
-            // Hardware track drained completely since previous chunk; pad & fade-in before resuming.
-            needsBoundaryFadeIn = true
-        }
-
         if (needsBoundaryFadeIn) {
             val preRollFrames = (sampleRateHz / 50).coerceAtLeast(1) // 20 ms silence pre-roll
             val preRollBytes = ByteArray(preRollFrames * bytesPerFrame)
             val preWritten = track.write(preRollBytes, 0, preRollBytes.size, AudioTrack.WRITE_BLOCKING)
             if (preWritten > 0) {
-                val writtenFrames = preWritten.toLong() / bytesPerFrame
-                hardwareFramesWritten += writtenFrames
-                injectedPreRollFrames += writtenFrames
+                paddingTracker.recordPaddingFrames(preWritten.toLong() / bytesPerFrame)
             }
 
             val fadeFrames = minOf((sampleRateHz / 250).coerceAtLeast(1), alignedSize / bytesPerFrame) // 4 ms ramp
-            val fadeBytesLen = fadeFrames * bytesPerFrame
             val faded = ByteArray(alignedSize)
             data.copyInto(faded, destinationOffset = 0, startIndex = offset, endIndex = offset + alignedSize)
             for (f in 0 until fadeFrames) {
@@ -211,7 +249,7 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
             needsBoundaryFadeIn = false
             val written = track.write(faded, 0, alignedSize, AudioTrack.WRITE_BLOCKING)
             if (written > 0) {
-                hardwareFramesWritten += written.toLong() / bytesPerFrame
+                paddingTracker.recordSpeechFrames(written.toLong() / bytesPerFrame)
                 captureLastFrame(faded, 0, written)
             }
             return written
@@ -219,7 +257,7 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
 
         val written = track.write(data, offset, size, AudioTrack.WRITE_BLOCKING)
         if (written > 0) {
-            hardwareFramesWritten += written.toLong() / bytesPerFrame
+            paddingTracker.recordSpeechFrames(written.toLong() / bytesPerFrame)
             captureLastFrame(data, offset, written)
         }
         return written
@@ -245,9 +283,9 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
         }
         val written = track.write(tail, 0, tail.size, AudioTrack.WRITE_BLOCKING)
         if (written > 0) {
-            // Deliberately count tail into hardwareFramesWritten only (not injectedPreRollFrames) so
-            // playbackHeadPosition advances cleanly past real speech endFrame before idling.
-            hardwareFramesWritten += written.toLong() / bytesPerFrame
+            // Record the utterance tail as a padding span so hardware continues draining through
+            // endFrame while speech-frame tracking plateaus without accumulating 44 ms drift/turn.
+            paddingTracker.recordPaddingFrames(written.toLong() / bytesPerFrame)
         }
         lastFrameSamples.fill(0)
         needsBoundaryFadeIn = true
@@ -259,21 +297,24 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
 
     override fun flush() {
         track.flush()
-        hardwareFramesWritten = 0L
-        injectedPreRollFrames = 0L
-        lastFrameSamples.fill(0)
-        needsBoundaryFadeIn = true
+        resetTurnBoundaryState()
     }
 
     override fun stop() {
         if (track.playState != AudioTrack.PLAYSTATE_STOPPED) track.stop()
-        hardwareFramesWritten = 0L
-        injectedPreRollFrames = 0L
+        resetTurnBoundaryState()
+    }
+
+    private fun resetTurnBoundaryState() {
+        paddingTracker.reset()
         lastFrameSamples.fill(0)
         needsBoundaryFadeIn = true
     }
 
-    override fun release() = track.release()
+    override fun release() {
+        paddingTracker.reset()
+        track.release()
+    }
 
     override fun setSpeed(speed: Float): Boolean = try {
         val isUnity = kotlin.math.abs(speed - 1.0f) <= 0.001f
@@ -297,7 +338,7 @@ class AndroidAudioTrackAdapter(sampleRate: Int, channels: Int) : AudioTrackAdapt
     override val playbackHeadPositionFrames: Long
         get() {
             val raw = track.playbackHeadPosition.toLong() and 0xFFFFFFFFL
-            return (raw - injectedPreRollFrames).coerceAtLeast(0L)
+            return paddingTracker.adjustedHeadFrames(raw)
         }
 
     private fun captureLastFrame(data: ByteArray, offset: Int, writtenBytes: Int) {

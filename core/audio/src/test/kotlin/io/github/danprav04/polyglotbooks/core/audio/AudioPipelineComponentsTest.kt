@@ -201,4 +201,50 @@ class AudioPipelineComponentsTest {
         assertEquals(500L, chunks.first().timestampMs)
         assertEquals(16000, chunks.first().sampleRate)
     }
+
+    @Test
+    fun testPaddingFrameTrackerExcludesPreRollAndTailsWithoutCumulativeDrift() {
+        val tracker = PaddingFrameTracker()
+        // Turn 1: 480 pre-roll, 24000 speech, 1056 tail
+        tracker.recordPaddingFrames(480L)
+        tracker.recordSpeechFrames(24000L)
+        tracker.recordPaddingFrames(1056L)
+        // Turn 2 pre-buffered ahead of hardware: 480 pre-roll, 12000 speech, 1056 tail
+        tracker.recordPaddingFrames(480L)
+        tracker.recordSpeechFrames(12000L)
+        tracker.recordPaddingFrames(1056L)
+
+        // During Turn 1 pre-roll [0..480]
+        assertEquals(0L, tracker.adjustedHeadFrames(0L))
+        assertEquals(0L, tracker.adjustedHeadFrames(240L))
+        assertEquals(0L, tracker.adjustedHeadFrames(480L))
+
+        // Mid Turn 1 speech
+        assertEquals(12000L, tracker.adjustedHeadFrames(480L + 12000L))
+
+        // End of Turn 1 speech, throughout Turn 1 tail and Turn 2 pre-roll
+        val turn1EndRaw = 480L + 24000L
+        assertEquals(24000L, tracker.adjustedHeadFrames(turn1EndRaw))
+        assertEquals(24000L, tracker.adjustedHeadFrames(turn1EndRaw + 528L))
+        assertEquals(24000L, tracker.adjustedHeadFrames(turn1EndRaw + 1056L))
+        assertEquals(24000L, tracker.adjustedHeadFrames(turn1EndRaw + 1056L + 240L))
+        assertEquals(24000L, tracker.adjustedHeadFrames(turn1EndRaw + 1056L + 480L))
+
+        // During and at end of Turn 2 speech -> zero cumulative drift
+        val turn2SpeechStartRaw = turn1EndRaw + 1056L + 480L
+        assertEquals(30000L, tracker.adjustedHeadFrames(turn2SpeechStartRaw + 6000L))
+        assertEquals(36000L, tracker.adjustedHeadFrames(turn2SpeechStartRaw + 12000L))
+        assertEquals(36000L, tracker.adjustedHeadFrames(turn2SpeechStartRaw + 12000L + 1056L))
+
+        // Verify strict monotonicity across every 100-frame step
+        var prev = 0L
+        for (raw in 0L..(turn2SpeechStartRaw + 12000L + 1500L) step 100L) {
+            val current = tracker.adjustedHeadFrames(raw)
+            assertTrue("Expected monotonic progression at raw=$raw ($prev -> $current)", current >= prev)
+            prev = current
+        }
+
+        tracker.reset()
+        assertEquals(500L, tracker.adjustedHeadFrames(500L))
+    }
 }
