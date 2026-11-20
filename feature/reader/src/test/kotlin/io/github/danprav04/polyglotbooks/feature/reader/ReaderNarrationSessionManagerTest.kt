@@ -13,17 +13,21 @@ import io.github.danprav04.polyglotbooks.core.gemini.Blob
 import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.InteractionsTtsClient
 import io.github.danprav04.polyglotbooks.core.gemini.LiveClientMessage
+import io.github.danprav04.polyglotbooks.core.gemini.LiveErrorData
 import io.github.danprav04.polyglotbooks.core.gemini.LiveServerMessage
 import io.github.danprav04.polyglotbooks.core.gemini.LiveSession
 import io.github.danprav04.polyglotbooks.core.gemini.LiveSessionFactory
 import io.github.danprav04.polyglotbooks.core.gemini.ModelTurn
 import io.github.danprav04.polyglotbooks.core.gemini.Part
+import io.github.danprav04.polyglotbooks.core.gemini.QuotaExhaustedException
 import io.github.danprav04.polyglotbooks.core.gemini.ServerContentData
 import io.github.danprav04.polyglotbooks.core.gemini.SetupConfig
 import io.github.danprav04.polyglotbooks.core.gemini.TextModelClient
 import io.github.danprav04.polyglotbooks.core.gemini.TranscriptionData
 import io.github.danprav04.polyglotbooks.core.gemini.TtsRequest
+import io.github.danprav04.polyglotbooks.core.model.DefaultModels
 import io.github.danprav04.polyglotbooks.core.model.LanguageCode
+import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import io.github.danprav04.polyglotbooks.core.playback.ActivePlaybackSource
 import io.github.danprav04.polyglotbooks.core.playback.PlaybackCoordinator
@@ -1157,7 +1161,7 @@ class ReaderNarrationSessionManagerTest {
     }
 
     @Test
-    fun `paused session chapter change clears stale highlightedCfi and flash tts uses GEMINI_TTS_V3 cache tag`() = runTest {
+    fun `paused session chapter change clears stale highlightedCfi and flash tts uses GEMINI_TTS_V4 cache tag`() = runTest {
         val tempDir = Files.createTempDirectory("reader-cache-v2").toFile()
         try {
             val diskCache = TranslationDiskCache(tempDir)
@@ -1252,7 +1256,7 @@ class ReaderNarrationSessionManagerTest {
                 style = null,
                 text = "Clean book sentence."
             )
-            assertNotNull("Synthesized audio must be cached under GEMINI_TTS_V3_en", v2Cached)
+            assertNotNull("Synthesized audio must be cached under GEMINI_TTS_V4_en", v2Cached)
             assertTrue(v2Cached!!.pcmBytes.contentEquals(freshPcm))
         } finally {
             tempDir.deleteRecursively()
@@ -2038,6 +2042,453 @@ class ReaderNarrationSessionManagerTest {
             )
             assertEquals("Engine $engine should keep apostrophe sentence in one chunk", 1, chunks.size)
             assertEquals(sentence, chunks.single().text)
+        }
+    }
+
+    private fun failingLiveSessionFactory(errorMessage: String = "Live overloaded"): LiveSessionFactory =
+        object : LiveSessionFactory {
+            override fun create(): LiveSession = create(reconnectOnGoAway = true)
+            override fun create(reconnectOnGoAway: Boolean): LiveSession {
+                return object : LiveSession {
+                    private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
+                    override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                    private var connected = false
+                    override val isConnected: Boolean get() = connected
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        connected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        _incoming.emit(
+                            LiveServerMessage.ErrorMessage(
+                                LiveErrorData(code = 503, message = errorMessage)
+                            )
+                        )
+                    }
+
+                    override suspend fun disconnect() {
+                        connected = false
+                    }
+                }
+            }
+        }
+
+    @Test
+    fun `gemini live clears device TTS fallback status banner once next paragraph recovers on Live`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-status-recover").toFile()
+        try {
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+            }
+            val p0Text = "Paragraph zero fails all Live attempts."
+            val p1Text = "Paragraph one recovers cleanly on Gemini Live."
+            val deviceFallbackPcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+            val liveRecoveredPcm = ByteArray(2400) { 0x33 }
+            val liveRecoveredB64 = Base64.getEncoder().encodeToString(liveRecoveredPcm)
+
+            val p1ReachedLive = CompletableDeferred<Unit>()
+            val allowP1Live = CompletableDeferred<Unit>()
+
+            val systemFallbackEngine = object : FeatureNarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = testCapabilities(streaming = false)
+                val requests = mutableListOf<SynthesisRequest>()
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    requests += request
+                    emit(PcmChunk(deviceFallbackPcm, sampleRate = 24000, channels = 1))
+                }
+            }
+
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession {
+                    return object : LiveSession {
+                        private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
+                        override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                        private var connected = false
+                        override val isConnected: Boolean get() = connected
+
+                        override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                            connected = true
+                        }
+
+                        override suspend fun send(message: LiveClientMessage) {
+                            val clientMsg = message as? LiveClientMessage.ClientContentMessage ?: return
+                            val promptText = clientMsg.clientContent.turns.orEmpty()
+                                .flatMap { it.parts }
+                                .mapNotNull { it.text }
+                                .joinToString("\n")
+                            if (promptText.contains(p0Text)) {
+                                _incoming.emit(
+                                    LiveServerMessage.ErrorMessage(
+                                        LiveErrorData(code = 503, message = "Overloaded")
+                                    )
+                                )
+                            } else {
+                                p1ReachedLive.complete(Unit)
+                                allowP1Live.await()
+                                _incoming.emit(
+                                    LiveServerMessage.ServerContentMessage(
+                                        ServerContentData(
+                                            modelTurn = ModelTurn(
+                                                parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", liveRecoveredB64)))
+                                            ),
+                                            outputTranscription = TranscriptionData(p1Text),
+                                            turnComplete = true
+                                        )
+                                    )
+                                )
+                            }
+                        }
+
+                        override suspend fun disconnect() {
+                            connected = false
+                        }
+                    }
+                }
+            }
+
+            val player = RecordingPcmPlayer()
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("live-recover-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { player }
+                systemTtsFactory = { systemFallbackEngine }
+            }
+            runCurrent()
+
+            manager.startOrResume(
+                bookId = "book-live-recover",
+                bookTitle = "Live Recovery",
+                paragraphs = listOf(
+                    ReaderParagraph(0, "p0", p0Text, "epubcfi(/6/2!/4/2/1:0)"),
+                    ReaderParagraph(1, "p1", p1Text, "epubcfi(/6/2!/4/2/2:0)")
+                )
+            )
+            runCurrent()
+
+            assertTrue("Paragraph 1 should reach Live turn after paragraph 0 fell back", p1ReachedLive.isCompleted)
+            assertEquals(1, systemFallbackEngine.requests.size)
+            assertEquals(p0Text, systemFallbackEngine.requests[0].text)
+            assertEquals(
+                "Using device TTS fallback (Gemini Live unavailable)",
+                manager.sessionState.value.statusMessage
+            )
+
+            allowP1Live.complete(Unit)
+            runCurrent()
+            advanceUntilIdle()
+
+            assertNull(
+                "Recovered Live turn must clear device TTS fallback statusMessage back to null",
+                manager.sessionState.value.statusMessage
+            )
+            assertNull(manager.sessionState.value.errorMessage)
+            assertFalse(manager.sessionState.value.isPlaying)
+            assertEquals(2, player.writtenChunks.size)
+            assertTrue(player.writtenChunks[0].data.contentEquals(deviceFallbackPcm))
+            assertTrue(player.writtenChunks[1].data.contentEquals(liveRecoveredPcm))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `gemini live cached playback hit clears device TTS fallback status banner and synthesizeSpeechChunk notifies onClearFallbackStatus`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-cache-recover").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+            }
+            val p0Text = "Uncached paragraph zero fails Live."
+            val p1Text = "Cached paragraph one hits Gemini Live V4 cache."
+            val deviceFallbackPcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+            val cachedLivePcm = ByteArray(2000) { 0x55 }
+
+            diskCache.saveAudioSegment(
+                engineTag = ReaderNarrationSessionManager.GEMINI_LIVE_CACHE_TAG_PREFIX,
+                voiceId = "Charon",
+                style = null,
+                text = p1Text,
+                sampleRate = 24000,
+                channels = 1,
+                pcmBytes = cachedLivePcm
+            )
+
+            val systemFallbackEngine = object : FeatureNarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = testCapabilities(streaming = false)
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    emit(PcmChunk(deviceFallbackPcm, sampleRate = 24000, channels = 1))
+                }
+            }
+
+            val failingLiveFactory = failingLiveSessionFactory("Overloaded")
+
+            val player = RecordingPcmPlayer()
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("live-cache-recover-key"),
+                liveSessionFactory = failingLiveFactory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = diskCache
+                playerFactory = { player }
+                systemTtsFactory = { systemFallbackEngine }
+            }
+            runCurrent()
+
+            val observedStatuses = mutableListOf<String?>()
+            val collectorJob = backgroundScope.launch(kotlinx.coroutines.Dispatchers.Unconfined) {
+                manager.sessionState.collect { state ->
+                    if (observedStatuses.lastOrNull() != state.statusMessage) {
+                        observedStatuses += state.statusMessage
+                    }
+                }
+            }
+
+            manager.startOrResume(
+                bookId = "book-live-cache-recover",
+                bookTitle = "Live Cache Recovery",
+                paragraphs = listOf(
+                    ReaderParagraph(0, "p0", p0Text, "epubcfi(/6/2!/4/2/1:0)"),
+                    ReaderParagraph(1, "p1", p1Text, "epubcfi(/6/2!/4/2/2:0)")
+                )
+            )
+            runCurrent()
+            advanceUntilIdle()
+            collectorJob.cancel()
+
+            assertTrue(
+                "Device TTS fallback banner must have been displayed before cached recovery",
+                observedStatuses.contains("Using device TTS fallback (Gemini Live unavailable)")
+            )
+            assertNull(manager.sessionState.value.statusMessage)
+            assertEquals(2, player.writtenChunks.size)
+            assertTrue(player.writtenChunks[0].data.contentEquals(deviceFallbackPcm))
+            assertTrue(player.writtenChunks[1].data.contentEquals(cachedLivePcm))
+
+            var clearCalls = 0
+            val emittedChunks = mutableListOf<PcmChunk>()
+            manager.synthesizeSpeechChunk(
+                chunk = SpeechChunk(
+                    text = p1Text,
+                    leadCfi = "epubcfi(/6/2!/4/2/2:0)",
+                    allCfis = listOf("epubcfi(/6/2!/4/2/2:0)"),
+                    leadIndex = 1,
+                    voiceId = "Charon",
+                    style = null,
+                    paragraphIndices = listOf(1),
+                    paragraphCharWeights = listOf(p1Text.length)
+                ),
+                engineChoice = NarrationEngine.GEMINI_LIVE,
+                systemFallback = systemFallbackEngine,
+                diskCache = diskCache,
+                maxCacheBytes = TranslationDiskCache.DEFAULT_MAX_AUDIO_BYTES,
+                ttsAlreadyFailed = false,
+                onTtsFailed = {},
+                onStatusUpdate = {},
+                onClearFallbackStatus = { clearCalls++ },
+                onPcmChunk = { emittedChunks += it }
+            )
+            assertEquals(1, clearCalls)
+            assertEquals(1, emittedChunks.size)
+            assertTrue(emittedChunks.single().data.contentEquals(cachedLivePcm))
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `transient QuotaExhaustedException on Flash TTS fallback does not permanently latch sessionEngineFailedTts once cooldown clears`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-quota-latch-test").toFile()
+        try {
+            var nowMs = 1_000_000L
+            val quotaTracker = GeminiQuotaTracker(clockMs = { nowMs })
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+            }
+            val p0Text = "Paragraph zero hits Live error and transient Flash TTS 429 cooldown."
+            val p1Text = "Paragraph one falls back to device TTS while Flash TTS cooldown is active."
+            val p2Text = "Paragraph two re-enables Flash TTS fallback once cooldown expires."
+
+            val systemPcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+            val flashTtsPcm = ByteArray(1600) { 0x44 }
+
+            val p1FallbackDone = CompletableDeferred<Unit>()
+            val allowP2Start = CompletableDeferred<Unit>()
+
+            var ttsCallCount = 0
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = flashTtsPcm
+
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    ttsCallCount++
+                    if (ttsCallCount == 1) {
+                        quotaTracker.ttsCandidatePool(DefaultModels.get(ModelRole.TTS)).forEach { model ->
+                            quotaTracker.recordHttpError(
+                                modelId = model,
+                                httpCode = 429,
+                                responseBody = "ResourceExhausted",
+                                retryAfterHeader = "10"
+                            )
+                        }
+                        throw QuotaExhaustedException("Transient 429 cooldown", retryAfterMs = 10_000L)
+                    }
+                    emit(PcmChunk(flashTtsPcm, 24000, 1))
+                }
+            }
+
+            var systemCallCount = 0
+            val systemFallbackEngine = object : FeatureNarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = testCapabilities(streaming = false)
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    val callNum = ++systemCallCount
+                    emit(PcmChunk(systemPcm, 24000, 1))
+                    if (callNum == 2) {
+                        p1FallbackDone.complete(Unit)
+                        allowP2Start.await()
+                    }
+                }
+            }
+
+            val liveFactory = failingLiveSessionFactory("Live overloaded")
+
+            val player = RecordingPcmPlayer()
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("quota-latch-key"),
+                interactionsTtsClient = ttsClient,
+                liveSessionFactory = liveFactory,
+                quotaTracker = quotaTracker,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { player }
+                systemTtsFactory = { systemFallbackEngine }
+            }
+            runCurrent()
+
+            manager.startOrResume(
+                bookId = "book-quota-latch",
+                bookTitle = "Quota Latch",
+                paragraphs = listOf(
+                    ReaderParagraph(0, "p0", p0Text, "epubcfi(/6/2!/4/2/1:0)"),
+                    ReaderParagraph(1, "p1", p1Text, "epubcfi(/6/2!/4/2/2:0)"),
+                    ReaderParagraph(2, "p2", p2Text, "epubcfi(/6/2!/4/2/3:0)")
+                )
+            )
+            runCurrent()
+
+            assertTrue("Paragraph 1 should complete device fallback before paragraph 2", p1FallbackDone.isCompleted)
+            assertEquals("Paragraph 0 calls Flash TTS once; paragraph 1 skips during cooldown", 1, ttsCallCount)
+            assertEquals(2, systemCallCount)
+            assertTrue(quotaTracker.isTtsQuotaLikelyExhausted())
+
+            nowMs += 15_000L
+            assertFalse(quotaTracker.isTtsQuotaLikelyExhausted())
+
+            allowP2Start.complete(Unit)
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals(
+                "Flash TTS fallback must re-enable automatically once quota cooldown clears",
+                2,
+                ttsCallCount
+            )
+            assertEquals("Paragraph 2 must use Flash TTS instead of device TTS", 2, systemCallCount)
+            assertEquals(3, player.writtenChunks.size)
+            assertTrue(player.writtenChunks[0].data.contentEquals(systemPcm))
+            assertTrue(player.writtenChunks[1].data.contentEquals(systemPcm))
+            assertTrue(player.writtenChunks[2].data.contentEquals(flashTtsPcm))
+            assertNull(manager.sessionState.value.errorMessage)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `non-quota exception on Flash TTS fallback still latches sessionEngineFailedTts for rest of session`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-nonquota-latch-test").toFile()
+        try {
+            val quotaTracker = GeminiQuotaTracker()
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+            }
+            val systemPcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+            var ttsCallCount = 0
+            val ttsClient = object : InteractionsTtsClient {
+                override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray = systemPcm
+                override fun synthesizeStream(apiKey: String, request: TtsRequest): Flow<PcmChunk> = flow {
+                    ttsCallCount++
+                    throw IllegalStateException("Unexpected malformed audio payload")
+                }
+            }
+            var systemCallCount = 0
+            val systemFallbackEngine = object : FeatureNarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = testCapabilities(streaming = false)
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    systemCallCount++
+                    emit(PcmChunk(systemPcm, 24000, 1))
+                }
+            }
+            val failingLiveFactory = failingLiveSessionFactory("Live overloaded")
+
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("nonquota-latch-key"),
+                interactionsTtsClient = ttsClient,
+                liveSessionFactory = failingLiveFactory,
+                quotaTracker = quotaTracker,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { RecordingPcmPlayer() }
+                systemTtsFactory = { systemFallbackEngine }
+            }
+            runCurrent()
+
+            manager.startOrResume(
+                bookId = "book-nonquota-latch",
+                bookTitle = "Non-quota Latch",
+                paragraphs = listOf(
+                    ReaderParagraph(0, "p0", "First paragraph hits non-quota TTS error.", "epubcfi(/6/2!/4/2/1:0)"),
+                    ReaderParagraph(1, "p1", "Second paragraph must skip TTS after latch.", "epubcfi(/6/2!/4/2/2:0)")
+                )
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertFalse(quotaTracker.isTtsQuotaLikelyExhausted())
+            assertEquals("Non-quota error must latch sessionEngineFailedTts on first failure", 1, ttsCallCount)
+            assertEquals(2, systemCallCount)
+        } finally {
+            tempDir.deleteRecursively()
         }
     }
 }

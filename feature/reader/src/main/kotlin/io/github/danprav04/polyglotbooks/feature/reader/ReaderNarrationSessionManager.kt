@@ -1472,7 +1472,9 @@ class ReaderNarrationSessionManager @Inject constructor(
                                     if (ttsEmitted) return@flow
                                 } catch (e: Exception) {
                                     if (e is CancellationException) throw e
-                                    sessionEngineFailedTts = true
+                                    if (e !is QuotaExhaustedException || quotaTracker == null) {
+                                        sessionEngineFailedTts = true
+                                    }
                                     DiagnosticLogBuffer.record(
                                         tag = "ReaderSession",
                                         message = "Gemini TTS fallback attempt failed; falling back to device TTS",
@@ -1672,6 +1674,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                             } catch (_: Throwable) {
                                             }
                                         },
+                                        onClearFallbackStatus = { clearFallbackStatusIfLiveRecovered(myGeneration) },
                                         onPcmChunk = { pcm -> writeSingleParaPcm(pcm) }
                                     )
                                 }
@@ -1725,6 +1728,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                             } catch (_: Throwable) {
                                             }
                                         },
+                                        onClearFallbackStatus = { clearFallbackStatusIfLiveRecovered(myGeneration) },
                                         onPcmChunk = { pcm ->
                                             if (pcm.data.isNotEmpty()) {
                                                 batchSampleRate = pcm.sampleRate
@@ -1808,6 +1812,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                             val liveTag = "$GEMINI_LIVE_CACHE_TAG_PREFIX$langSuffix"
                                             val cached = diskCache?.loadAudioSegment(liveTag, chunk.voiceId, chunk.style, chunk.text)
                                             if (cached != null) {
+                                                clearFallbackStatusIfLiveRecovered(myGeneration)
                                                 events.send(
                                                     LiveStreamEvent.AudioChunk(
                                                         chunkIdx,
@@ -1835,6 +1840,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                         }
                                                     }
                                                     if (emitted && !thisTurnFallback.get()) {
+                                                        clearFallbackStatusIfLiveRecovered(myGeneration)
                                                         val bytes = pcmBuf.toByteArray()
                                                         recordAudioUsage(isLive = true, byteCount = bytes.size, sampleRate = sr, channels = ch)
                                                         if (diskCache != null) {
@@ -2474,6 +2480,19 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
     }
 
+    private fun clearFallbackStatusIfLiveRecovered(generation: Long) {
+        if (playbackGenerationId.get() != generation) return
+        _sessionState.update { state ->
+            if (playbackGenerationId.get() == generation &&
+                state.statusMessage?.startsWith("Using device TTS fallback") == true
+            ) {
+                state.copy(statusMessage = null)
+            } else {
+                state
+            }
+        }
+    }
+
     private fun toSynthesisRequest(chunk: SpeechChunk): SynthesisRequest =
         SynthesisRequest(
             text = chunk.text,
@@ -2640,6 +2659,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         onStatusUpdate: (String) -> Unit,
         liveSessionProvider: (suspend () -> LiveNarrationSession)? = null,
         onLiveSessionError: (suspend () -> Unit)? = null,
+        onClearFallbackStatus: () -> Unit = {},
         onPcmChunk: suspend (PcmChunk) -> Unit
     ) {
         // Apply playback speed uniformly on PcmPlayer; pass speed = 1.0f to all synthesis engines.
@@ -2659,6 +2679,9 @@ class ReaderNarrationSessionManager @Inject constructor(
 
         val cachedPrimary = diskCache?.loadAudioSegment(primaryTag, chunk.voiceId, chunk.style, chunk.text)
         if (cachedPrimary != null) {
+            if (engineChoice == NarrationEngine.GEMINI_LIVE) {
+                onClearFallbackStatus()
+            }
             onPcmChunk(PcmChunk(cachedPrimary.pcmBytes, cachedPrimary.sampleRate, cachedPrimary.channels))
             return
         }
@@ -2716,6 +2739,7 @@ class ReaderNarrationSessionManager @Inject constructor(
             val liveTag = "$GEMINI_LIVE_CACHE_TAG_PREFIX$langTagSuffix"
             val cachedLive = diskCache?.loadAudioSegment(liveTag, chunk.voiceId, chunk.style, chunk.text)
             if (cachedLive != null) {
+                onClearFallbackStatus()
                 onPcmChunk(PcmChunk(cachedLive.pcmBytes, cachedLive.sampleRate, cachedLive.channels))
                 return
             }
@@ -2791,6 +2815,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                     )
                     onStatusUpdate("Using device TTS fallback (Gemini unavailable)")
                 },
+                onClearFallbackStatus = onClearFallbackStatus,
                 onPcmChunk = onPcmChunk
             )
             if (!playedViaLive) {
@@ -2851,6 +2876,7 @@ class ReaderNarrationSessionManager @Inject constructor(
             diskCache = diskCache,
             maxCacheBytes = maxCacheBytes,
             onSystemFallbackUsed = { },
+            onClearFallbackStatus = onClearFallbackStatus,
             onPcmChunk = onPcmChunk
         )
     }
@@ -2863,6 +2889,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         diskCache: TranslationDiskCache?,
         maxCacheBytes: Long,
         onSystemFallbackUsed: () -> Unit,
+        onClearFallbackStatus: () -> Unit = {},
         onPcmChunk: suspend (PcmChunk) -> Unit
     ): Boolean {
         var usedFallback = false
@@ -2923,6 +2950,7 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
 
         if (emitted && !usedFallback) {
+            onClearFallbackStatus()
             val bytes = pcmBuffer.toByteArray()
             diskCache?.saveAudioSegment(
                 engineTag = cacheTag,
@@ -3846,8 +3874,8 @@ class ReaderNarrationSessionManager @Inject constructor(
     }
 
     companion object {
-        internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V3"
-        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V3"
+        internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V4"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V4"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =
