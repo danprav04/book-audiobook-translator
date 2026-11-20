@@ -1,11 +1,18 @@
 package io.github.danprav04.polyglotbooks.core.gemini
 
 import kotlinx.serialization.DeserializationStrategy
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.buildClassSerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
 import kotlinx.serialization.json.JsonContentPolymorphicSerializer
+import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonEncoder
 import kotlinx.serialization.json.JsonObject
 
 /**
@@ -159,8 +166,8 @@ data class RealtimeInputData(
  */
 @Serializable
 data class Blob(
-    val mimeType: String,
-    val data: String
+    val mimeType: String = "",
+    val data: String = ""
 )
 
 /**
@@ -245,10 +252,41 @@ sealed interface LiveServerMessage {
     ) : LiveServerMessage
 
     /**
-     * Empty heartbeat/acknowledgement frame (e.g. `{}`) safely ignored by callers.
+     * Empty heartbeat/acknowledgement or unrecognized server frame (e.g. `{}`, `voiceActivity`,
+     * `toolCall`) safely ignored by callers.
      */
-    @Serializable
+    @Serializable(with = IgnoredMessageSerializer::class)
     data object IgnoredMessage : LiveServerMessage
+}
+
+/**
+ * Serializer for [LiveServerMessage.IgnoredMessage] that consumes arbitrary JSON payloads on decode
+ * and encodes as `{}`.
+ */
+object IgnoredMessageSerializer : KSerializer<LiveServerMessage.IgnoredMessage> {
+    override val descriptor: SerialDescriptor =
+        buildClassSerialDescriptor("io.github.danprav04.polyglotbooks.core.gemini.LiveServerMessage.IgnoredMessage")
+
+    override fun deserialize(decoder: Decoder): LiveServerMessage.IgnoredMessage {
+        val jsonDecoder = decoder as? JsonDecoder
+        if (jsonDecoder != null) {
+            jsonDecoder.decodeJsonElement()
+        } else {
+            val composite = decoder.beginStructure(descriptor)
+            composite.endStructure(descriptor)
+        }
+        return LiveServerMessage.IgnoredMessage
+    }
+
+    override fun serialize(encoder: Encoder, value: LiveServerMessage.IgnoredMessage) {
+        val jsonEncoder = encoder as? JsonEncoder
+        if (jsonEncoder != null) {
+            jsonEncoder.encodeJsonElement(JsonObject(emptyMap()))
+        } else {
+            val composite = encoder.beginStructure(descriptor)
+            composite.endStructure(descriptor)
+        }
+    }
 }
 
 /**
@@ -265,8 +303,7 @@ object LiveServerMessageSerializer : JsonContentPolymorphicSerializer<LiveServer
             "setupComplete" in jsonObject -> LiveServerMessage.SetupCompleteMessage.serializer()
             "error" in jsonObject -> LiveServerMessage.ErrorMessage.serializer()
             "usageMetadata" in jsonObject -> LiveServerMessage.UsageMetadataMessage.serializer()
-            jsonObject.isEmpty() -> LiveServerMessage.IgnoredMessage.serializer()
-            else -> throw SerializationException("Unknown LiveServerMessage envelope: $element")
+            else -> LiveServerMessage.IgnoredMessage.serializer()
         }
     }
 }
@@ -295,8 +332,9 @@ data class ModelTurn(
  */
 @Serializable
 data class TranscriptionData(
-    val text: String,
-    val languageCode: String? = null
+    val text: String = "",
+    val languageCode: String? = null,
+    val finished: Boolean? = null
 )
 
 /**
@@ -304,7 +342,7 @@ data class TranscriptionData(
  */
 @Serializable
 data class GoAwayData(
-    val timeLeft: String
+    val timeLeft: String? = null
 )
 
 /**

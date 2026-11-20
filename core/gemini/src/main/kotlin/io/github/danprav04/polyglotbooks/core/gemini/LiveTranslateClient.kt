@@ -487,8 +487,9 @@ class DefaultLiveTranslateClient(
                     }
                 }
 
-                val sourceText = content.inputTranscription?.text ?: content.interimInputTranscription?.text
-                val targetText = content.outputTranscription?.text
+                val sourceText = content.inputTranscription?.text?.takeIf { it.isNotEmpty() }
+                    ?: content.interimInputTranscription?.text?.takeIf { it.isNotEmpty() }
+                val targetText = content.outputTranscription?.text?.takeIf { it.isNotEmpty() }
                 val isComplete = content.turnComplete == true || content.generationComplete == true
 
                 if (pcmChunk != null || sourceText != null || targetText != null || isComplete) {

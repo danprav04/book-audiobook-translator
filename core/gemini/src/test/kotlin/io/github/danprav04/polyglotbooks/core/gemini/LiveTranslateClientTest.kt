@@ -424,6 +424,50 @@ class LiveTranslateClientTest {
         client.stop()
     }
 
+    @Test
+    fun testEmptyFinishedTranscriptionDoesNotEmitSpuriousBlankTranscript() = runTest {
+        val stubSession = StubLiveSession()
+        val client = DefaultLiveTranslateClient(object : LiveSessionFactory {
+            override fun create(): LiveSession = stubSession
+        })
+
+        client.start("test-key", "ru")
+
+        // Finished-only outputTranscription without audio or turnComplete must produce null (nothing emitted)
+        val finishedOnlyMsg = LiveServerMessage.ServerContentMessage(
+            ServerContentData(
+                inputTranscription = TranscriptionData(text = "", finished = true),
+                outputTranscription = TranscriptionData(text = "", finished = true)
+            )
+        )
+        assertNull(client.parseServerMessage(finishedOnlyMsg))
+
+        // Finished outputTranscription alongside modelTurn audio emits audio with null targetTranscript
+        val expectedPcm = byteArrayOf(1, 2, 3, 4)
+        val encoded = Base64.getEncoder().encodeToString(expectedPcm)
+        stubSession.emitServerMessage(finishedOnlyMsg)
+        stubSession.emitServerMessage(
+            LiveServerMessage.ServerContentMessage(
+                ServerContentData(
+                    modelTurn = ModelTurn(
+                        parts = listOf(Part(inlineData = Blob(mimeType = "audio/pcm;rate=24000", data = encoded)))
+                    ),
+                    inputTranscription = TranscriptionData(text = "", finished = true),
+                    interimInputTranscription = TranscriptionData(text = "Interim text"),
+                    outputTranscription = TranscriptionData(text = "", finished = true)
+                )
+            )
+        )
+
+        val emitted = client.translationStream.first()
+        assertNotNull(emitted.audioChunk)
+        assertArrayEquals(expectedPcm, emitted.audioChunk?.data)
+        assertEquals("Interim text", emitted.sourceTranscript)
+        assertNull(emitted.targetTranscript)
+
+        client.stop()
+    }
+
     private class ScriptedLiveSession : LiveSession {
         private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
         private val _failures = MutableSharedFlow<Throwable>(replay = 1, extraBufferCapacity = 4)

@@ -45,6 +45,29 @@ object SpeechTextNormalizer {
         ',', ';', ':', ']', ')', '}'
     )
 
+    private const val NON_ASCII_DASH_CHARS = "\u2012\u2013\u2014\u2015\u2E3A\u2E3B"
+    private const val ALL_DASH_CHARS = "-$NON_ASCII_DASH_CHARS"
+    private const val DASH_RUN_PATTERN = "(?:[$NON_ASCII_DASH_CHARS][$ALL_DASH_CHARS]*|-{2,}|[$ALL_DASH_CHARS]{2,})"
+
+    private val LEADING_LINE_DASH_REGEX = Regex("^[ \\t]*$DASH_RUN_PATTERN[ \\t]*", RegexOption.MULTILINE)
+    private val AFTER_OPENER_DASH_REGEX = Regex(
+        "([\"\\u201C\\u2018\\[(\\u300C\\u300E])[ \\t]*$DASH_RUN_PATTERN[ \\t]*"
+    )
+    private val BEFORE_PUNCT_DASH_REGEX = Regex(
+        "[ \\t]*$DASH_RUN_PATTERN(?:[ \\t]+$DASH_RUN_PATTERN)*[ \\t]*(?=[!?,;:.\\u2026])"
+    )
+    private val LOWERCASE_HYPHEN_BEFORE_EXCLAIM_REGEX = Regex("(?<=\\p{Ll})-(?=[!?])")
+    private val TRAILING_DASH_RUN_REGEX = Regex("[ \\t]*$DASH_RUN_PATTERN(?:[ \\t]+$DASH_RUN_PATTERN)*")
+    private val MID_SENTENCE_DASH_REGEX = Regex(
+        "[ \\t]*(?:[$ALL_DASH_CHARS]{2,}|[\\u2012\\u2014\\u2015\\u2E3A\\u2E3B])(?:[ \\t]+(?:[$ALL_DASH_CHARS]{2,}|[\\u2012\\u2014\\u2015\\u2E3A\\u2E3B]))*[ \\t]*|(?<=\\S)[ \\t]+[\\u2013-][ \\t]+(?=\\S)"
+    )
+    private val HORIZONTAL_SPACES_REGEX = Regex("[ \\t]{2,}")
+
+    private val UNAMBIGUOUS_OPENERS = setOf('\u201C', '\u2018', '[', '(', '\u300C', '\u300E')
+    private val UNAMBIGUOUS_CLOSERS = setOf('\u201D', '\u2019', ']', ')', '\u300D', '\u300F')
+    private val SENTENCE_OR_PAUSE_PUNCT = setOf('.', '!', '?', ',', ';', ':', '\u2026')
+    private val CLOSING_FOLLOW_PUNCT = setOf(',', '.', ';', ':', '!', '?')
+
     private val DECADE_REGEX = Regex("^\\d{2}s$")
 
     private enum class CandidateKind {
@@ -62,12 +85,35 @@ object SpeechTextNormalizer {
      * Returns [text] normalized for speech synthesis.
      *
      * Paired single quotes become curly double quotes (`“...”`, with nested quotes as `‘...’`),
-     * and all genuine apostrophes/lookalikes normalize to the typographic apostrophe (`’`, U+2019)
-     * so raw ASCII `'` (U+0027) never triggers mid-word breaks in speech models.
+     * all genuine apostrophes/lookalikes normalize to the typographic apostrophe (`’`, U+2019),
+     * and prose dashes normalize into natural pauses or ellipses without altering compounds,
+     * numeric ranges, negative numbers, letter grades, or punctuation-only dividers.
      */
     fun normalizeForSpeech(text: String): String {
         if (text.isEmpty()) return text
 
+        val quoteNormalized = normalizeQuotesAndApostrophes(text)
+        return normalizeDashesForSpeech(quoteNormalized)
+    }
+
+    /**
+     * Normalizes prose dashes (em-dashes, horizontal bars, en-dashes, double hyphens) in [text]
+     * for speech synthesis while preserving hyphenated compounds, numeric ranges, negative
+     * numbers, letter grades, and punctuation-only dividers.
+     */
+    fun normalizeDashesForSpeech(text: String): String {
+        if (text.isEmpty() || !text.any { it.isLetterOrDigit() } || !containsDashChar(text)) {
+            return text
+        }
+
+        val withoutLeading = stripLeadingDashes(text)
+        val withoutBeforePunct = stripDashesBeforePunctuation(withoutLeading)
+        val withTrailingEllipsis = normalizeTrailingDashes(withoutBeforePunct)
+        val withMidSentencePauses = normalizeMidSentenceDashes(withTrailingEllipsis)
+        return HORIZONTAL_SPACES_REGEX.replace(withMidSentencePauses, " ")
+    }
+
+    private fun normalizeQuotesAndApostrophes(text: String): String {
         val normalized = normalizeLookalikeApostrophes(text)
         if (!containsSingleQuoteChar(normalized)) return normalized
 
@@ -88,6 +134,145 @@ object SpeechTextNormalizer {
             }
         }
         return sb.toString()
+    }
+
+    private fun containsDashChar(text: String): Boolean {
+        for (c in text) {
+            if (c in ALL_DASH_CHARS) return true
+        }
+        return false
+    }
+
+    private fun stripLeadingDashes(text: String): String {
+        var current = LEADING_LINE_DASH_REGEX.replace(text, "")
+        while (true) {
+            val next = AFTER_OPENER_DASH_REGEX.replace(current) { match ->
+                val openerIdx = match.range.first
+                val opener = current[openerIdx]
+                if (opener == '"' && !isOpeningDoubleQuote(current, openerIdx)) {
+                    match.value
+                } else {
+                    opener.toString()
+                }
+            }
+            if (next == current) break
+            current = next
+        }
+        return current
+    }
+
+    private fun stripDashesBeforePunctuation(text: String): String {
+        val withoutRuns = BEFORE_PUNCT_DASH_REGEX.replace(text, "")
+        return LOWERCASE_HYPHEN_BEFORE_EXCLAIM_REGEX.replace(withoutRuns, "")
+    }
+
+    private fun normalizeTrailingDashes(text: String): String {
+        return TRAILING_DASH_RUN_REGEX.replace(text) { match ->
+            if (!isTrailingOrBeforeCloser(text, match.range.last + 1)) {
+                match.value
+            } else if (isPrecededByEllipsis(text, match.range.first)) {
+                ""
+            } else {
+                "\u2026"
+            }
+        }
+    }
+
+    private fun normalizeMidSentenceDashes(text: String): String {
+        return MID_SENTENCE_DASH_REGEX.replace(text) { match ->
+            if (isPreservedNumericDash(text, match)) {
+                return@replace match.value
+            }
+            val prevNonSpaceIdx = findPrevNonHorizontalSpaceIndex(text, match.range.first)
+            if (prevNonSpaceIdx < 0) {
+                ""
+            } else {
+                val prevNonSpace = text[prevNonSpaceIdx]
+                when {
+                    prevNonSpace == '\n' || prevNonSpace == '\r' -> ""
+                    isOpeningDelimiterAt(text, prevNonSpaceIdx, prevNonSpace) -> ""
+                    isPrecededByPunctuation(text, prevNonSpaceIdx, prevNonSpace) -> " "
+                    else -> ", "
+                }
+            }
+        }
+    }
+
+    private fun isPreservedNumericDash(text: String, match: MatchResult): Boolean {
+        val trimmed = match.value.trim(' ', '\t')
+        if (trimmed.length != 1) return false
+        val dash = trimmed[0]
+        if (dash != '-' && dash != '\u2013') return false
+        val before = text.getOrNull(match.range.first - 1) ?: return false
+        val after = text.getOrNull(match.range.last + 1) ?: return false
+        return before.isDigit() && after.isDigit()
+    }
+
+    private fun isTrailingOrBeforeCloser(text: String, afterIndex: Int): Boolean {
+        var i = afterIndex
+        while (i < text.length && (text[i] == ' ' || text[i] == '\t')) {
+            i++
+        }
+        if (i >= text.length || text[i] == '\n' || text[i] == '\r') return true
+        if (text[i] in UNAMBIGUOUS_CLOSERS) return true
+        return text[i] == '"' && isClosingDoubleQuote(text, i)
+    }
+
+    private fun isClosingDoubleQuote(text: String, quoteIndex: Int): Boolean {
+        val next = text.getOrNull(quoteIndex + 1) ?: return true
+        if (next == '\n' || next == '\r' || next == ' ' || next == '\t') return true
+        if (next in UNAMBIGUOUS_CLOSERS) return true
+        if (next in CLOSING_FOLLOW_PUNCT) {
+            val afterPunct = text.getOrNull(quoteIndex + 2)
+            return afterPunct == null || afterPunct == '\n' || afterPunct == '\r' ||
+                afterPunct == ' ' || afterPunct == '\t' || afterPunct in UNAMBIGUOUS_CLOSERS
+        }
+        return false
+    }
+
+    private fun isOpeningDoubleQuote(text: String, quoteIndex: Int): Boolean {
+        if (quoteIndex <= 0) return true
+        val prev = text[quoteIndex - 1]
+        if (prev.isWhitespace() || prev in UNAMBIGUOUS_OPENERS || prev == '"') return true
+        if (prev in ALL_DASH_CHARS) {
+            // Disambiguate closing quote after an inner dash (`"Wait—"—he`) from an opening quote after a dash (`said—"—Wait"`).
+            var countBeforeOnLine = 0
+            var i = quoteIndex - 1
+            while (i >= 0 && text[i] != '\n' && text[i] != '\r') {
+                if (text[i] == '"') countBeforeOnLine++
+                i--
+            }
+            return countBeforeOnLine % 2 == 0
+        }
+        return false
+    }
+
+    private fun isOpeningDelimiterAt(text: String, idx: Int, ch: Char): Boolean {
+        return ch in UNAMBIGUOUS_OPENERS || (ch == '"' && isOpeningDoubleQuote(text, idx))
+    }
+
+    private fun isPrecededByPunctuation(text: String, idx: Int, ch: Char): Boolean {
+        if (ch in SENTENCE_OR_PAUSE_PUNCT) return true
+        if (ch in UNAMBIGUOUS_CLOSERS || (ch == '"' && !isOpeningDoubleQuote(text, idx))) {
+            val innerIdx = findPrevNonHorizontalSpaceIndex(text, idx)
+            return innerIdx >= 0 && text[innerIdx] in SENTENCE_OR_PAUSE_PUNCT
+        }
+        return false
+    }
+
+    private fun isPrecededByEllipsis(text: String, matchStart: Int): Boolean {
+        val end = findPrevNonHorizontalSpaceIndex(text, matchStart)
+        if (end < 0) return false
+        if (text[end] == '\u2026') return true
+        return end >= 2 && text[end] == '.' && text[end - 1] == '.' && text[end - 2] == '.'
+    }
+
+    private fun findPrevNonHorizontalSpaceIndex(text: String, beforeIndex: Int): Int {
+        var i = beforeIndex - 1
+        while (i >= 0 && (text[i] == ' ' || text[i] == '\t')) {
+            i--
+        }
+        return i
     }
 
     private fun normalizeLookalikeApostrophes(text: String): String {

@@ -34,6 +34,7 @@ class OkHttpLiveSession(
         ignoreUnknownKeys = true
         encodeDefaults = true
         explicitNulls = false
+        coerceInputValues = true
     },
     private val connectTimeoutMs: Long = 10_000L,
     private val maxReconnectAttempts: Int = 2,
@@ -554,6 +555,7 @@ class DefaultLiveSessionFactory(
 
     override fun create(reconnectOnGoAway: Boolean): LiveSession = OkHttpLiveSession(
         okHttpClient = configuredClient,
+        maxReconnectAttempts = if (reconnectOnGoAway) 2 else 0,
         awaitSetupCompleteBeforeSend = true,
         reconnectOnGoAway = reconnectOnGoAway
     )

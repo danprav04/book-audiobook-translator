@@ -6,6 +6,7 @@ import kotlinx.serialization.json.jsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.InputStreamReader
@@ -277,5 +278,65 @@ class LiveSessionMessageTest {
 
         val newlineEmptyMsg = json.decodeFromString<LiveServerMessage>("{\n}")
         assertTrue(newlineEmptyMsg is LiveServerMessage.IgnoredMessage)
+    }
+
+    @Test
+    fun testMissingTranscriptionTextGoAwayTimeLeftAndBlobFieldsDeserializeWithDefaults() {
+        val finishedJson = """
+            {
+              "serverContent": {
+                "modelTurn": {
+                  "parts": [
+                    { "inlineData": { "mimeType": "audio/pcm;rate=24000", "data": "AQID" } }
+                  ]
+                },
+                "outputTranscription": { "finished": true }
+              }
+            }
+        """.trimIndent()
+        val finishedMsg = json.decodeFromString<LiveServerMessage>(finishedJson) as LiveServerMessage.ServerContentMessage
+        assertEquals("AQID", finishedMsg.serverContent.modelTurn?.parts?.firstOrNull()?.inlineData?.data)
+        assertEquals("", finishedMsg.serverContent.outputTranscription?.text)
+        assertEquals(true, finishedMsg.serverContent.outputTranscription?.finished)
+
+        val emptyTranscriptionJson = """
+            {
+              "serverContent": {
+                "modelTurn": {
+                  "parts": [
+                    { "inlineData": {} }
+                  ]
+                },
+                "outputTranscription": {}
+              }
+            }
+        """.trimIndent()
+        val emptyTranscriptMsg = json.decodeFromString<LiveServerMessage>(emptyTranscriptionJson) as LiveServerMessage.ServerContentMessage
+        assertEquals("", emptyTranscriptMsg.serverContent.outputTranscription?.text)
+        assertNull(emptyTranscriptMsg.serverContent.outputTranscription?.finished)
+        assertEquals("", emptyTranscriptMsg.serverContent.modelTurn?.parts?.firstOrNull()?.inlineData?.mimeType)
+        assertEquals("", emptyTranscriptMsg.serverContent.modelTurn?.parts?.firstOrNull()?.inlineData?.data)
+
+        val emptyGoAwayMsg = json.decodeFromString<LiveServerMessage>("""{"goAway":{}}""") as LiveServerMessage.GoAwayMessage
+        assertNull(emptyGoAwayMsg.goAway.timeLeft)
+    }
+
+    @Test
+    fun testUnknownServerEnvelopesDeserializeToIgnoredMessageWithoutThrowing() {
+        val strictJson = Json { ignoreUnknownKeys = false }
+
+        val voiceActivityMsg = strictJson.decodeFromString<LiveServerMessage>(
+            """{"voiceActivity":{"type":"START","nested":{"ms":120}}}"""
+        )
+        assertTrue(voiceActivityMsg is LiveServerMessage.IgnoredMessage)
+
+        val toolCallMsg = strictJson.decodeFromString<LiveServerMessage>(
+            """{"toolCall":{"functionCalls":[{"id":"fc-1","name":"lookup"}]}}"""
+        )
+        assertTrue(toolCallMsg is LiveServerMessage.IgnoredMessage)
+
+        val encodedIgnored = strictJson.encodeToString<LiveServerMessage>(LiveServerMessage.IgnoredMessage)
+        assertEquals("{}", encodedIgnored)
+        assertTrue(strictJson.decodeFromString<LiveServerMessage>(encodedIgnored) is LiveServerMessage.IgnoredMessage)
     }
 }

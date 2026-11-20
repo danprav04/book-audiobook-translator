@@ -26,6 +26,7 @@ import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.IOException
+import java.util.Base64
 import java.util.concurrent.TimeUnit
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -485,6 +486,86 @@ class OkHttpLiveSessionTest {
         assertTrue("Expected zero ERROR logs for empty keepalive envelopes, got $errorLogs", errorLogs.isEmpty())
 
         collectJob.cancel()
+        session.disconnect()
+    }
+
+    @Test
+    fun testLargeAudioMessageWithFinishedTranscriptionAndNullTextCoerceWithoutErrorLogs() = runTest {
+        DiagnosticLogBuffer.clear()
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(okHttpClient = mockClient)
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val listener = listenerSlot.captured
+        listener.onOpen(mockWebSocket, mockk(relaxed = true))
+
+        val pcmBytes = ByteArray(26 * 1024) { (it % 127).toByte() }
+        val base64Audio = Base64.getEncoder().encodeToString(pcmBytes)
+        val largeJson =
+            """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$base64Audio"}}]},"outputTranscription":{"finished":true}}}"""
+        assertTrue("Expected payload >= 35KB, got ${largeJson.length}", largeJson.length >= 35_000)
+
+        listener.onMessage(mockWebSocket, largeJson)
+        val firstMsg = session.incomingMessages.first() as LiveServerMessage.ServerContentMessage
+        assertEquals(base64Audio, firstMsg.serverContent.modelTurn?.parts?.firstOrNull()?.inlineData?.data)
+        assertEquals("", firstMsg.serverContent.outputTranscription?.text)
+        assertEquals(true, firstMsg.serverContent.outputTranscription?.finished)
+
+        val nullTextJson =
+            """{"serverContent":{"outputTranscription":{"text":null,"finished":true},"inputTranscription":{"text":null}}}"""
+        listener.onMessage(mockWebSocket, nullTextJson)
+        val secondMsg = session.incomingMessages
+            .first { (it as? LiveServerMessage.ServerContentMessage)?.serverContent?.modelTurn == null } as LiveServerMessage.ServerContentMessage
+        assertEquals("", secondMsg.serverContent.outputTranscription?.text)
+        assertEquals("", secondMsg.serverContent.inputTranscription?.text)
+
+        val errorLogs = DiagnosticLogBuffer.recentEntries().filter { it.level == "ERROR" }
+        assertTrue("Expected zero ERROR logs, got $errorLogs", errorLogs.isEmpty())
+
+        session.disconnect()
+    }
+
+    @Test
+    fun testDefaultLiveSessionFactoryWithReconnectOnGoAwayFalseFailsFastOnMidTurnClose1011() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        val factory = DefaultLiveSessionFactory(mockClient)
+        val session = factory.create(reconnectOnGoAway = false) as OkHttpLiveSession
+        session.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.8-live", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onMessage(sockets[0], """{"setupComplete":{}}""")
+        listeners[0].onMessage(
+            sockets[0],
+            """{"sessionResumptionUpdate":{"resumable":true,"newHandle":"resume-token-1011"}}"""
+        )
+
+        // Mid-turn 1011 must fail fast without silent resumption reconnect that could duplicate audio.
+        listeners[0].onClosing(sockets[0], 1011, "Internal error mid-turn")
+        assertEquals(1, listeners.size)
+        assertFalse(session.isConnected)
+
+        try {
+            session.incomingMessages.first { false }
+            fail("Expected IOException on mid-turn 1011 close when reconnectOnGoAway = false")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("code=1011"))
+        }
         session.disconnect()
     }
 }

@@ -109,4 +109,71 @@ class SpeechTextNormalizerTest {
         assertEquals("\u201CUnclosed quote don\u2019t break", unclosed)
         assertFalse(unclosed.contains('\''))
     }
+
+    @Test
+    fun normalizesOrvDashesToNaturalSpeechPausesAndEllipses() {
+        assertEquals("adulthood, a", SpeechTextNormalizer.normalizeForSpeech("adulthood\u2014a"))
+        assertEquals("tls123, it", SpeechTextNormalizer.normalizeForSpeech("tls123\u2014it"))
+        assertEquals("Wait, what", SpeechTextNormalizer.normalizeForSpeech("Wait--what"))
+        assertEquals("Wait, what", SpeechTextNormalizer.normalizeForSpeech("Wait -- what"))
+        assertEquals(
+            "[Kuwaaaaah! I shall block this!]",
+            SpeechTextNormalizer.normalizeForSpeech("[Kuwaaaaah---! I shall block this!]")
+        )
+        assertEquals("\"Ranvir Khan\u2026\"", SpeechTextNormalizer.normalizeForSpeech("\"Ranvir Khan--\""))
+        assertEquals(
+            "\"Ranvir Khan\u2026\" she whispered.",
+            SpeechTextNormalizer.normalizeForSpeech("\"Ranvir Khan--\" she whispered.")
+        )
+        assertEquals(
+            "[The stream contract is a soul pledge\u2026]",
+            SpeechTextNormalizer.normalizeForSpeech("[The stream contract is a soul pledge\u2015]")
+        )
+        assertEquals(
+            "[The stream contract is a soul pledge\u2026] Kim Dokja read.",
+            SpeechTextNormalizer.normalizeForSpeech("[The stream contract is a soul pledge\u2015] Kim Dokja read.")
+        )
+        assertEquals("\"Everybody, down!\"", SpeechTextNormalizer.normalizeForSpeech("\"Everybody, down\u2014!\""))
+        assertEquals("Kieeeeeeek!", SpeechTextNormalizer.normalizeForSpeech("Kieeeeeeek-!"))
+        assertEquals("tls123: Thank you.", SpeechTextNormalizer.normalizeForSpeech("\u2013tls123: Thank you."))
+        assertEquals(
+            "Chapter 14: Ep. 3, Contract, III",
+            SpeechTextNormalizer.normalizeForSpeech("Chapter 14: Ep. 3 \u2013 Contract, III")
+        )
+        assertEquals(
+            "Impossible! she countered",
+            SpeechTextNormalizer.normalizeForSpeech("\u2014Impossible!\u2014 she countered")
+        )
+        assertEquals("riding, [3807]", SpeechTextNormalizer.normalizeForSpeech("riding\u2014 [3807]"))
+        assertEquals("\u201CWait!\u201D", SpeechTextNormalizer.normalizeForSpeech("\u201C\u2014Wait!\u201D"))
+        assertEquals("\u201CWait!\u201D", SpeechTextNormalizer.normalizeForSpeech("'\u2014Wait!'"))
+        assertEquals("She looked at him, \"What?\"", SpeechTextNormalizer.normalizeForSpeech("She looked at him\u2014\"What?\""))
+        assertEquals("\"Hello\", she said", SpeechTextNormalizer.normalizeForSpeech("\"Hello\"\u2014she said"))
+        assertEquals("\"Impossible!\" she countered", SpeechTextNormalizer.normalizeForSpeech("\"Impossible!\"\u2014she countered"))
+        assertEquals("word, word", SpeechTextNormalizer.normalizeForSpeech("word\u2014\u2014word"))
+        assertEquals("Wait...", SpeechTextNormalizer.normalizeForSpeech("Wait...\u2014"))
+        assertEquals("First line\u2026\nSecond line!\nThird line", SpeechTextNormalizer.normalizeForSpeech("\u2014First line\u2014\n\u2013Second line\u2014!\nThird  line"))
+    }
+
+    @Test
+    fun preservesHyphenatedCompoundsNumericRangesNegativeNumbersGradesAndDividers() {
+        val preservedSamples = listOf(
+            "Demon-like",
+            "well-known",
+            "A-Ahh",
+            "B-But",
+            "10\u201320",
+            "5 - 3",
+            "10 \u2013 20",
+            "-5",
+            "at -5 degrees",
+            "Difficulty: B-",
+            "Difficulty: S-",
+            "---"
+        )
+        preservedSamples.forEach { sample ->
+            assertEquals(sample, SpeechTextNormalizer.normalizeForSpeech(sample))
+            assertEquals(sample, SpeechTextNormalizer.normalizeDashesForSpeech(sample))
+        }
+    }
 }
