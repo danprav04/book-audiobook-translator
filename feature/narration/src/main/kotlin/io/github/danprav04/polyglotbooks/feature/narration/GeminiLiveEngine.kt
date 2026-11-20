@@ -175,6 +175,7 @@ class GeminiLiveEngine(
         private var turnsInSession: Int = 0
         private var charsInSession: Int = 0
         private var hasOpenedAnySession: Boolean = false
+        private var previousTurnEndedWithoutTurnComplete: Boolean = false
         private var rotationCount: Int = 0
 
         /** Candidate model ID currently bound to the open WebSocket session, or `null`. */
@@ -298,47 +299,68 @@ class GeminiLiveEngine(
                 }
                 val countingRotation = hasOpenedAnySession
                 var rotatedThisTurn = false
+                val softFailedCandidates = mutableListOf<String>()
                 for (candidateModel in orderedCandidates) {
-                    if (quotaTracker != null && !quotaTracker.isModelAvailable(candidateModel)) {
-                        continue
-                    }
-
-                    val opened = openCandidateSessionLocked(
+                    val attempt = attemptCandidateOnFreshSession(
                         liveSessionFactory = factory,
                         apiKey = apiKey,
                         candidateModel = candidateModel,
-                        request = effectiveRequest,
+                        effectiveRequest = effectiveRequest,
                         requestKey = requestKey,
-                        estimatedTokens = estimatedTokens
-                    )
-                    if (!opened) {
-                        continue
-                    }
-                    if (countingRotation && !rotatedThisTurn) {
-                        rotationCount++
-                        rotatedThisTurn = true
-                    }
-
-                    val active = liveSession ?: continue
-                    val outcome = executeTurnOnCurrentSession(
-                        session = active,
-                        cleanModel = candidateModel,
-                        request = effectiveRequest,
                         estimatedTokens = estimatedTokens,
                         timeoutMs = timeoutMs,
                         isExpressivePunctuation = isExpressivePunctuation,
+                        countingRotation = countingRotation,
+                        alreadyRotatedThisTurn = rotatedThisTurn,
+                        softFailedCandidates = softFailedCandidates,
                         emitChunk = { chunk -> emit(chunk) }
                     )
-                    if (outcome.emittedAnyAudio) {
-                        turnsInSession++
-                        charsInSession += effectiveRequest.text.length
-                        if (outcome.rotateAfterTurn) {
-                            needsRotationFlag.set(true)
-                        }
+                    rotatedThisTurn = rotatedThisTurn || attempt.rotatedThisTurn
+                    if (attempt.emittedAnyAudio) {
                         return@withLock
                     }
+                }
 
-                    closeCurrentLiveSessionLocked()
+                // 2b. Bounded soft-failure retry on the top still-available candidate before TTS fallback.
+                if (softFailedCandidates.isNotEmpty()) {
+                    val retryOrder = buildList {
+                        val verified = lastVerifiedModel?.takeIf { it in softFailedCandidates }
+                        if (verified != null) add(verified)
+                        for (candidate in softFailedCandidates) {
+                            if (candidate != verified) add(candidate)
+                        }
+                    }
+                    var softRetryAttempts = 0
+                    for (retryModel in retryOrder) {
+                        if (softRetryAttempts >= MAX_SOFT_RETRY_ATTEMPTS) break
+                        if (quotaTracker != null && !quotaTracker.isModelAvailable(retryModel)) {
+                            continue
+                        }
+                        softRetryAttempts++
+                        DiagnosticLogBuffer.record(
+                            "GeminiLiveEngine",
+                            "Retrying soft-failed Live candidate model=$retryModel before TTS fallback",
+                            level = "INFO"
+                        )
+                        val retryAttempt = attemptCandidateOnFreshSession(
+                            liveSessionFactory = factory,
+                            apiKey = apiKey,
+                            candidateModel = retryModel,
+                            effectiveRequest = effectiveRequest,
+                            requestKey = requestKey,
+                            estimatedTokens = estimatedTokens,
+                            timeoutMs = timeoutMs,
+                            isExpressivePunctuation = isExpressivePunctuation,
+                            countingRotation = countingRotation,
+                            alreadyRotatedThisTurn = rotatedThisTurn,
+                            softFailedCandidates = null,
+                            emitChunk = { chunk -> emit(chunk) }
+                        )
+                        rotatedThisTurn = rotatedThisTurn || retryAttempt.rotatedThisTurn
+                        if (retryAttempt.emittedAnyAudio) {
+                            return@withLock
+                        }
+                    }
                 }
 
                 // 3. No Live candidate emitted usable audio -> fall back cleanly to TTS engine.
@@ -376,6 +398,78 @@ class GeminiLiveEngine(
             return true
         }
 
+        private suspend fun attemptCandidateOnFreshSession(
+            liveSessionFactory: () -> LiveSession,
+            apiKey: String,
+            candidateModel: String,
+            effectiveRequest: SynthesisRequest,
+            requestKey: SessionSetupKey,
+            estimatedTokens: Int,
+            timeoutMs: Long,
+            isExpressivePunctuation: Boolean,
+            countingRotation: Boolean,
+            alreadyRotatedThisTurn: Boolean,
+            softFailedCandidates: MutableList<String>?,
+            emitChunk: suspend (PcmChunk) -> Unit
+        ): CandidateAttemptResult {
+            if (quotaTracker != null && !quotaTracker.isModelAvailable(candidateModel)) {
+                return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = false)
+            }
+
+            val openStatus = openCandidateSessionLocked(
+                liveSessionFactory = liveSessionFactory,
+                apiKey = apiKey,
+                candidateModel = candidateModel,
+                request = effectiveRequest,
+                requestKey = requestKey,
+                estimatedTokens = estimatedTokens
+            )
+            if (openStatus != OpenCandidateStatus.OPENED) {
+                if (softFailedCandidates != null &&
+                    openStatus == OpenCandidateStatus.SOFT_FAILURE &&
+                    candidateModel !in softFailedCandidates
+                ) {
+                    softFailedCandidates += candidateModel
+                }
+                return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = false)
+            }
+
+            var rotatedNow = false
+            if (countingRotation && !alreadyRotatedThisTurn) {
+                rotationCount++
+                rotatedNow = true
+            }
+
+            val active = liveSession
+                ?: return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = rotatedNow)
+            val outcome = executeTurnOnCurrentSession(
+                session = active,
+                cleanModel = candidateModel,
+                request = effectiveRequest,
+                estimatedTokens = estimatedTokens,
+                timeoutMs = timeoutMs,
+                isExpressivePunctuation = isExpressivePunctuation,
+                emitChunk = emitChunk
+            )
+            if (outcome.emittedAnyAudio) {
+                turnsInSession++
+                charsInSession += effectiveRequest.text.length
+                if (outcome.rotateAfterTurn) {
+                    needsRotationFlag.set(true)
+                }
+                return CandidateAttemptResult(emittedAnyAudio = true, rotatedThisTurn = rotatedNow)
+            }
+
+            if (softFailedCandidates != null &&
+                !outcome.hardModelError &&
+                candidateModel !in softFailedCandidates
+            ) {
+                softFailedCandidates += candidateModel
+            }
+            closeCurrentLiveSessionLocked()
+            return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = rotatedNow)
+        }
+
         private suspend fun openCandidateSessionLocked(
             liveSessionFactory: () -> LiveSession,
             apiKey: String,
@@ -383,7 +477,7 @@ class GeminiLiveEngine(
             request: SynthesisRequest,
             requestKey: SessionSetupKey,
             estimatedTokens: Int
-        ): Boolean {
+        ): OpenCandidateStatus {
             val cleanModel = candidateModel.removePrefix("models/")
             val normalizedModel = "models/$cleanModel"
             var candidateSession: LiveSession? = null
@@ -430,8 +524,9 @@ class GeminiLiveEngine(
                 currentModel = cleanModel
                 turnsInSession = 0
                 charsInSession = 0
+                previousTurnEndedWithoutTurnComplete = false
                 hasOpenedAnySession = true
-                true
+                OpenCandidateStatus.OPENED
             } catch (e: Exception) {
                 withContext(NonCancellable) {
                     candidateReader?.cancel()
@@ -447,14 +542,22 @@ class GeminiLiveEngine(
                     level = "WARN",
                     throwable = e
                 )
-                inferErrorCode(e)?.let { code ->
+                val errCode = inferErrorCode(e)
+                errCode?.let { code ->
                     quotaTracker?.recordHttpError(
                         modelId = cleanModel,
                         httpCode = code,
                         responseBody = e.message.orEmpty()
                     )
                 }
-                false
+                val quotaPermUnavailable = quotaTracker?.quotaSnapshots?.value
+                    ?.get(cleanModel)
+                    ?.permanentlyUnavailable == true
+                if (quotaPermUnavailable || errCode in HARD_MODEL_ERROR_CODES) {
+                    OpenCandidateStatus.PERMANENT_FAILURE
+                } else {
+                    OpenCandidateStatus.SOFT_FAILURE
+                }
             }
         }
 
@@ -503,6 +606,9 @@ class GeminiLiveEngine(
                                 }
                                 content.outputTranscription?.text?.takeIf { it.isNotEmpty() }?.let { text ->
                                     turnChannel.trySend(TurnEvent.Transcript(text))
+                                }
+                                if (content.outputTranscription?.finished == true) {
+                                    turnChannel.trySend(TurnEvent.TranscriptionFinished)
                                 }
                                 if (content.generationComplete == true) {
                                     turnChannel.trySend(TurnEvent.GenerationComplete)
@@ -562,11 +668,14 @@ class GeminiLiveEngine(
             activeChannelRef.set(turnChannel)
             val transcriptBuilder = StringBuilder()
             val bufferedChunks = if (bufferAndVerifyTurns) mutableListOf<PcmChunk>() else null
+            val sourceWordCount = countWords(request.text)
             var collectedAnyAudio = false
             var emittedAnyAudio = false
             var completedTurn = false
             var sawGenerationComplete = false
+            var sawTranscriptionFinished = false
             var idleTimedOutAfterAudio = false
+            var idleStepTimeoutMs = 0L
             var interrupted = false
             var failed = false
             var timedOut = false
@@ -588,12 +697,17 @@ class GeminiLiveEngine(
                 )
 
                 while (true) {
-                    val stepTimeoutMs = if (!collectedAnyAudio) {
-                        timeoutMs
-                    } else if (sawGenerationComplete) {
-                        minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
-                    } else {
-                        minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
+                    val stepTimeoutMs = when {
+                        !collectedAnyAudio -> timeoutMs
+                        sawGenerationComplete && sawTranscriptionFinished ->
+                            minOf(timeoutMs, POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS)
+                        sawGenerationComplete ->
+                            minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
+                        transcriptBuilder.isEmpty() || sourceWordCount <= 0 ||
+                            countWords(transcriptBuilder.toString()) * 100 >= sourceWordCount * 85 ->
+                            minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
+                        else ->
+                            minOf(timeoutMs, MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS)
                     }
                     val event = withTimeoutOrNull(stepTimeoutMs) {
                         turnChannel.receive()
@@ -608,16 +722,13 @@ class GeminiLiveEngine(
                             )
                         } else {
                             idleTimedOutAfterAudio = true
-                            DiagnosticLogBuffer.record(
-                                "GeminiLiveEngine",
-                                "Live turn audio stream went idle after ${stepTimeoutMs}ms without turnComplete (model=$cleanModel, genComplete=$sawGenerationComplete, chars=${request.text.length})",
-                                level = "WARN"
-                            )
+                            idleStepTimeoutMs = stepTimeoutMs
                         }
                         break
                     }
                     when (event) {
                         is TurnEvent.AudioChunk -> {
+                            previousTurnEndedWithoutTurnComplete = false
                             collectedAnyAudio = true
                             if (bufferedChunks != null) {
                                 bufferedChunks.add(event.chunk)
@@ -627,30 +738,49 @@ class GeminiLiveEngine(
                             }
                         }
                         is TurnEvent.Transcript -> {
+                            previousTurnEndedWithoutTurnComplete = false
                             appendTranscriptFragment(transcriptBuilder, event.text)
                         }
+                        is TurnEvent.TranscriptionFinished -> {
+                            previousTurnEndedWithoutTurnComplete = false
+                            sawTranscriptionFinished = true
+                        }
                         is TurnEvent.GenerationComplete -> {
+                            previousTurnEndedWithoutTurnComplete = false
                             sawGenerationComplete = true
                         }
                         is TurnEvent.TurnComplete -> {
+                            if (!collectedAnyAudio &&
+                                transcriptBuilder.isEmpty() &&
+                                !sawGenerationComplete &&
+                                previousTurnEndedWithoutTurnComplete
+                            ) {
+                                // Consume ONE stray turnComplete from the prior turn that finalized on generationComplete.
+                                previousTurnEndedWithoutTurnComplete = false
+                                continue
+                            }
+                            previousTurnEndedWithoutTurnComplete = false
                             completedTurn = true
                             break
                         }
                         is TurnEvent.TurnInterrupted -> {
+                            previousTurnEndedWithoutTurnComplete = false
                             interrupted = true
                             failed = true
                             break
                         }
                         is TurnEvent.ServerError -> {
-                            if (event.code in setOf(401, 403, 404, 429, 1007, 1008)) {
+                            previousTurnEndedWithoutTurnComplete = false
+                            if (event.code in HARD_MODEL_ERROR_CODES) {
                                 hardModelError = true
                             }
                             failed = true
                             break
                         }
                         is TurnEvent.StreamFailed -> {
+                            previousTurnEndedWithoutTurnComplete = false
                             inferErrorCode(event.error)?.let { code ->
-                                if (code in setOf(400, 401, 403, 404, 429)) {
+                                if (code in HARD_MODEL_ERROR_CODES) {
                                     hardModelError = true
                                 }
                                 quotaTracker?.recordHttpError(
@@ -678,7 +808,7 @@ class GeminiLiveEngine(
                     throwable = e
                 )
                 inferErrorCode(e)?.let { code ->
-                    if (code in setOf(400, 401, 403, 404, 429)) {
+                    if (code in HARD_MODEL_ERROR_CODES) {
                         hardModelError = true
                     }
                     quotaTracker?.recordHttpError(
@@ -695,7 +825,6 @@ class GeminiLiveEngine(
 
             val outputTranscript = transcriptBuilder.toString().trim()
             val similarity = if (outputTranscript.isEmpty()) 1.0 else calculateWordOverlapSimilarity(request.text, outputTranscript)
-            val sourceWordCount = countWords(request.text)
             val outputWordCount = countWords(outputTranscript)
             val excessiveExpansion = !isExpressivePunctuation &&
                 isExcessiveWordExpansion(sourceWordCount, outputWordCount)
@@ -711,25 +840,49 @@ class GeminiLiveEngine(
             } else {
                 countSwallowedSourceWords(request.text, outputTranscript)
             }
-            val similarityOk = outputTranscript.isEmpty() ||
+            val durationOk = isBufferedAudioDurationValid(
+                bufferedChunks = bufferedChunks,
+                collectedAnyAudio = collectedAnyAudio,
+                isExpressivePunctuation = isExpressivePunctuation,
+                outputTranscript = outputTranscript,
+                sourceWordCount = sourceWordCount,
+                cleanModel = cleanModel
+            )
+            val transcriptOk = outputTranscript.isEmpty() ||
                 expressiveTranscriptAcceptable ||
                 (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase &&
                     swallowedWords <= allowedSwallowedWords(sourceWordCount))
-            if (!similarityOk) {
+            if (!transcriptOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
                     "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, swallowed=$swallowedWords) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
             }
+            val similarityOk = transcriptOk && durationOk
 
             if (idleTimedOutAfterAudio && !failed && !interrupted) {
-                if (sawGenerationComplete || outputTranscript.isEmpty() || similarityOk) {
-                    // Server finished streaming audio (and matched transcript/generation) but omitted turnComplete.
+                if (sawGenerationComplete) {
                     completedTurn = true
-                    needsRotationFlag.set(true)
+                    previousTurnEndedWithoutTurnComplete = true
+                    DiagnosticLogBuffer.record(
+                        "GeminiLiveEngine",
+                        "Live turn finalized after generationComplete (${idleStepTimeoutMs}ms idle, txFinished=$sawTranscriptionFinished, model=$cleanModel, chars=${request.text.length})",
+                        level = if (similarityOk) "INFO" else "WARN"
+                    )
                 } else {
-                    timedOut = true
+                    DiagnosticLogBuffer.record(
+                        "GeminiLiveEngine",
+                        "Live turn audio stream went idle after ${idleStepTimeoutMs}ms without turnComplete (model=$cleanModel, genComplete=false, chars=${request.text.length})",
+                        level = "WARN"
+                    )
+                    if (similarityOk) {
+                        // Server finished streaming audio (and matched transcript/duration) but omitted turnComplete.
+                        completedTurn = true
+                        needsRotationFlag.set(true)
+                    } else {
+                        timedOut = true
+                    }
                 }
             }
 
@@ -748,7 +901,7 @@ class GeminiLiveEngine(
                 val chunksToEmit = if (isExpressivePunctuation) {
                     bufferedChunks
                 } else {
-                    trimExcessiveEdgeSilence(bufferedChunks)
+                    compressExcessiveInternalSilence(trimExcessiveEdgeSilence(bufferedChunks))
                 }
                 for (chunk in chunksToEmit) {
                     emitChunk(chunk)
@@ -767,7 +920,8 @@ class GeminiLiveEngine(
                 quotaTracker?.recordSuccess(cleanModel, estimatedTokens)
             }
 
-            val rotateAfterTurn = audioGlitch || failed || timedOut || interrupted || idleTimedOutAfterAudio || !similarityOk || !completedTurn || needsRotationFlag.get()
+            val idleWithoutGeneration = idleTimedOutAfterAudio && !sawGenerationComplete
+            val rotateAfterTurn = audioGlitch || failed || timedOut || interrupted || idleWithoutGeneration || !similarityOk || !completedTurn || needsRotationFlag.get()
             return TurnOutcome(
                 emittedAnyAudio = emittedAnyAudio,
                 rotateAfterTurn = rotateAfterTurn,
@@ -784,6 +938,7 @@ class GeminiLiveEngine(
             currentModel = null
             turnsInSession = 0
             charsInSession = 0
+            previousTurnEndedWithoutTurnComplete = false
             needsRotationFlag.set(false)
             activeChannelRef.set(null)
             withContext(NonCancellable) {
@@ -801,12 +956,24 @@ class GeminiLiveEngine(
     private sealed interface TurnEvent {
         data class AudioChunk(val chunk: PcmChunk) : TurnEvent
         data class Transcript(val text: String) : TurnEvent
+        data object TranscriptionFinished : TurnEvent
         data object GenerationComplete : TurnEvent
         data object TurnComplete : TurnEvent
         data object TurnInterrupted : TurnEvent
         data class ServerError(val code: Int, val message: String) : TurnEvent
         data class StreamFailed(val error: Throwable) : TurnEvent
     }
+
+    private enum class OpenCandidateStatus {
+        OPENED,
+        SOFT_FAILURE,
+        PERMANENT_FAILURE
+    }
+
+    private data class CandidateAttemptResult(
+        val emittedAnyAudio: Boolean,
+        val rotatedThisTurn: Boolean
+    )
 
     private data class TurnOutcome(
         val emittedAnyAudio: Boolean,
@@ -911,8 +1078,12 @@ class GeminiLiveEngine(
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
-        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 1_500L
-        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 1_500L
+        private const val POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS = 300L
+        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 500L
+        private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_500L
+        private const val MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS = 4_500L
+        private const val MAX_SOFT_RETRY_ATTEMPTS = 1
+        private val HARD_MODEL_ERROR_CODES = setOf(400, 401, 403, 404, 429, 1007, 1008)
         private const val MIN_TRIM_DURATION_MS = 300L
         private const val LEAD_SILENCE_THRESHOLD_MS = 180L
         private const val LEAD_KEEP_MS = 60L
@@ -920,12 +1091,81 @@ class GeminiLiveEngine(
         private const val TAIL_KEEP_MS = 150L
         private const val EDGE_FADE_IN_MS = 4L
         private const val EDGE_FADE_OUT_MS = 8L
+        private const val MAX_INTERNAL_SILENCE_MS = 750L
+        private const val COMPRESSED_INTERNAL_SILENCE_MS = 420L
+        private const val INTERNAL_SILENCE_FADE_MS = 8L
         private const val SILENCE_AMPLITUDE_THRESHOLD = 300
         private const val LIVE_NARRATION_TEMPERATURE = 0.4f
         private const val GLITCH_JUMP_THRESHOLD = 16_000
         private const val GLITCH_EDGE_AMPLITUDE = 1_500
         private val TOKEN_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026]+")
         private val SENTENCE_SPLIT_REGEX = Regex("[.!?\\n]+")
+        private val CLAUSE_SPLIT_REGEX = Regex("[.!?\\n,;]+")
+        private val CONTRACTION_EXPANSIONS = mapOf(
+            "i'm" to listOf("i", "am"),
+            "you're" to listOf("you", "are"),
+            "we're" to listOf("we", "are"),
+            "they're" to listOf("they", "are"),
+            "he's" to listOf("he", "is"),
+            "she's" to listOf("she", "is"),
+            "it's" to listOf("it", "is"),
+            "that's" to listOf("that", "is"),
+            "there's" to listOf("there", "is"),
+            "here's" to listOf("here", "is"),
+            "what's" to listOf("what", "is"),
+            "who's" to listOf("who", "is"),
+            "where's" to listOf("where", "is"),
+            "when's" to listOf("when", "is"),
+            "why's" to listOf("why", "is"),
+            "how's" to listOf("how", "is"),
+            "let's" to listOf("let", "us"),
+            "don't" to listOf("do", "not"),
+            "doesn't" to listOf("does", "not"),
+            "didn't" to listOf("did", "not"),
+            "can't" to listOf("can", "not"),
+            "cannot" to listOf("can", "not"),
+            "won't" to listOf("will", "not"),
+            "shan't" to listOf("shall", "not"),
+            "couldn't" to listOf("could", "not"),
+            "wouldn't" to listOf("would", "not"),
+            "shouldn't" to listOf("should", "not"),
+            "mustn't" to listOf("must", "not"),
+            "mightn't" to listOf("might", "not"),
+            "needn't" to listOf("need", "not"),
+            "wasn't" to listOf("was", "not"),
+            "weren't" to listOf("were", "not"),
+            "isn't" to listOf("is", "not"),
+            "aren't" to listOf("are", "not"),
+            "haven't" to listOf("have", "not"),
+            "hasn't" to listOf("has", "not"),
+            "hadn't" to listOf("had", "not"),
+            "i've" to listOf("i", "have"),
+            "you've" to listOf("you", "have"),
+            "we've" to listOf("we", "have"),
+            "they've" to listOf("they", "have"),
+            "could've" to listOf("could", "have"),
+            "would've" to listOf("would", "have"),
+            "should've" to listOf("should", "have"),
+            "might've" to listOf("might", "have"),
+            "must've" to listOf("must", "have"),
+            "i'll" to listOf("i", "will"),
+            "he'll" to listOf("he", "will"),
+            "she'll" to listOf("she", "will"),
+            "it'll" to listOf("it", "will"),
+            "we'll" to listOf("we", "will"),
+            "they'll" to listOf("they", "will"),
+            "you'll" to listOf("you", "will"),
+            "that'll" to listOf("that", "will"),
+            "there'll" to listOf("there", "will"),
+            "i'd" to listOf("i", "would"),
+            "he'd" to listOf("he", "would"),
+            "she'd" to listOf("she", "would"),
+            "we'd" to listOf("we", "would"),
+            "they'd" to listOf("they", "would"),
+            "you'd" to listOf("you", "would"),
+            "it'd" to listOf("it", "would"),
+            "that'd" to listOf("that", "would")
+        )
 
         /**
          * Splits [text] into lowercased word tokens in appearance order while preserving internal
@@ -1082,12 +1322,95 @@ class GeminiLiveEngine(
             return false
         }
 
+        private fun isBufferedAudioDurationValid(
+            bufferedChunks: List<PcmChunk>?,
+            collectedAnyAudio: Boolean,
+            isExpressivePunctuation: Boolean,
+            outputTranscript: String,
+            sourceWordCount: Int,
+            cleanModel: String
+        ): Boolean {
+            if (bufferedChunks == null || !collectedAnyAudio || isExpressivePunctuation ||
+                outputTranscript.isNotEmpty() || sourceWordCount < 6
+            ) {
+                return true
+            }
+            val totalPcmBytes = bufferedChunks.sumOf { it.data.size }
+            // Never reject tiny synthetic test chunks (2-16 bytes) when transcript is empty.
+            if (totalPcmBytes <= 256) return true
+
+            val sampleRate = bufferedChunks.firstOrNull()?.sampleRate?.takeIf { it > 0 } ?: 24000
+            val channels = bufferedChunks.firstOrNull()?.channels?.coerceAtLeast(1) ?: 1
+            val durationMs = (totalPcmBytes.toLong() * 1000L) / (sampleRate.toLong() * channels.toLong() * 2L)
+            val minDurationMs = (sourceWordCount * 100L).coerceAtMost(25_000L)
+            val maxDurationMs = maxOf(6_000L, sourceWordCount * 2_000L)
+            val valid = durationMs in minDurationMs..maxDurationMs
+            if (!valid) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Empty-transcript duration sanity check failed (${durationMs}ms outside ${minDurationMs}..${maxDurationMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+            }
+            return valid
+        }
+
         internal fun isExcessiveWordExpansion(sourceWordCount: Int, outputWordCount: Int): Boolean =
             when {
                 sourceWordCount <= 0 -> false
                 sourceWordCount < 4 -> outputWordCount > (sourceWordCount * 2 + 1)
                 else -> outputWordCount > ((sourceWordCount * 1.35).toInt() + 2)
             }
+
+        internal fun expandContractionsForRepeat(tokens: List<String>): List<String> {
+            if (tokens.isEmpty()) return tokens
+            return buildList(tokens.size + 2) {
+                for (tok in tokens) {
+                    val expanded = CONTRACTION_EXPANSIONS[tok]
+                    if (expanded != null) {
+                        addAll(expanded)
+                    } else {
+                        add(tok)
+                    }
+                }
+            }
+        }
+
+        internal fun tokensRoughlyMatch(a: List<String>, b: List<String>): Boolean {
+            if (a.size != b.size) return false
+            for (i in a.indices) {
+                if (!wordsMatch(a[i], b[i])) return false
+            }
+            return true
+        }
+
+        internal fun fuzzyMultisetIntersectionSize(a: List<String>, b: List<String>): Int {
+            if (a.isEmpty() || b.isEmpty()) return 0
+            val usedA = BooleanArray(a.size)
+            val usedB = BooleanArray(b.size)
+            var hits = 0
+            for (i in a.indices) {
+                for (j in b.indices) {
+                    if (!usedB[j] && a[i] == b[j]) {
+                        usedA[i] = true
+                        usedB[j] = true
+                        hits++
+                        break
+                    }
+                }
+            }
+            for (i in a.indices) {
+                if (usedA[i]) continue
+                for (j in b.indices) {
+                    if (!usedB[j] && wordsMatch(a[i], b[j])) {
+                        usedB[j] = true
+                        hits++
+                        break
+                    }
+                }
+            }
+            return hits
+        }
 
         /**
          * Detects when a model transcript echoes/repeats the final sentence, clause, or phrase
@@ -1099,101 +1422,257 @@ class GeminiLiveEngine(
             val outputTokens = tokenizeWordsOrdered(output)
             if (sourceTokens.isEmpty() || outputTokens.size < 2) return false
 
-            val sourceSentences = splitSentencesIntoTokens(source)
-            val outputSentences = splitSentencesIntoTokens(output)
+            val expandedSourceTokens = expandContractionsForRepeat(sourceTokens)
+            val expandedOutputTokens = expandContractionsForRepeat(outputTokens)
+            if (expandedOutputTokens.size <= expandedSourceTokens.size) return false
+
+            val sourceSentences = splitSegmentsIntoTokens(source, SENTENCE_SPLIT_REGEX)
+            val outputSentences = splitSegmentsIntoTokens(output, SENTENCE_SPLIT_REGEX)
+            val expandedSourceSentences = sourceSentences.map(::expandContractionsForRepeat)
+            val expandedOutputSentences = outputSentences.map(::expandContractionsForRepeat)
             val sourceAlreadyEndsRepeated = endsWithRepeatedSegment(sourceTokens, sourceSentences)
+            val expandedSourceAlreadyEndsRepeated = endsWithRepeatedSegment(expandedSourceTokens, expandedSourceSentences)
 
             // 1. Trailing tandem repeat (... + A + A) at the end of outputTokens.
-            val maxBlock = outputTokens.size / 2
-            for (k in maxBlock downTo 1) {
-                if (k == 1) {
-                    if (sourceTokens.size > 2 || outputTokens.size <= sourceTokens.size) continue
-                    val tok = outputTokens.last()
-                    if (outputTokens[outputTokens.size - 2] != tok) continue
-                    val hyphenExpanded = sourceTokens.any { it.contains('-') && it.split('-') == listOf(tok, tok) }
-                    if (hyphenExpanded) continue
-                    val srcRepeatedSingle = sourceTokens.size >= 2 &&
-                        sourceTokens[sourceTokens.size - 1] == tok &&
-                        sourceTokens[sourceTokens.size - 2] == tok
-                    if (!srcRepeatedSingle) return true
-                    continue
-                }
-
-                val tail = outputTokens.subList(outputTokens.size - k, outputTokens.size)
-                val prev = outputTokens.subList(outputTokens.size - 2 * k, outputTokens.size - k)
-                if (prev == tail) {
-                    val sourceHasExactTandem = sourceTokens.size >= 2 * k &&
-                        sourceTokens.subList(sourceTokens.size - 2 * k, sourceTokens.size) == prev + tail
-                    val outputRepeatCount = countTrailingRepeats(outputTokens, tail)
-                    if (sourceHasExactTandem) {
-                        val sourceRepeatCount = countTrailingRepeats(sourceTokens, tail)
-                        if (outputRepeatCount > sourceRepeatCount && outputRepeatCount >= 2 && outputTokens.size > sourceTokens.size) {
-                            return true
-                        }
-                    } else if (!sourceAlreadyEndsRepeated || outputSentences.size > sourceSentences.size) {
-                        return true
-                    } else {
-                        val sourceTrailingCopies = countMaxTrailingCopies(sourceTokens, sourceSentences)
-                        if (outputRepeatCount > sourceTrailingCopies && outputTokens.size > sourceTokens.size) {
-                            return true
-                        }
-                    }
-                }
+            if (hasTrailingTandemRepeat(
+                    srcTokens = sourceTokens,
+                    outTokens = outputTokens,
+                    srcSentences = sourceSentences,
+                    outSentences = outputSentences,
+                    srcAlreadyEndsRepeated = sourceAlreadyEndsRepeated,
+                    allowSingleWord = true
+                ) ||
+                hasTrailingTandemRepeat(
+                    srcTokens = expandedSourceTokens,
+                    outTokens = expandedOutputTokens,
+                    srcSentences = expandedSourceSentences,
+                    outSentences = expandedOutputSentences,
+                    srcAlreadyEndsRepeated = expandedSourceAlreadyEndsRepeated,
+                    allowSingleWord = false
+                )
+            ) {
+                return true
             }
 
-            // 2. Extra trailing sentence matching the penultimate output sentence or last source sentence
-            // (catches slight wording variations or partial restarts of the final sentence).
+            // 2. Extra trailing sentence matching or echoing the penultimate output sentence or last source sentence.
             if (outputTokens.size > sourceTokens.size &&
                 outputSentences.size > sourceSentences.size &&
                 outputSentences.size >= 2
             ) {
-                val lastOut = outputSentences.last()
-                val prevOut = outputSentences[outputSentences.size - 2]
-                val lastSrc = sourceSentences.lastOrNull()
-                if (lastOut.size >= 2 && (lastOut == prevOut || (lastSrc != null && lastOut == lastSrc))) {
+                if (hasExtraTrailingSentenceEcho(sourceSentences, outputSentences) ||
+                    hasExtraTrailingSentenceEcho(expandedSourceSentences, expandedOutputSentences)
+                ) {
                     return true
-                }
-                if (lastOut.size >= 3) {
-                    val prevContainment = multisetIntersectionSize(lastOut, prevOut).toDouble() / lastOut.size.toDouble()
-                    val srcSymmetricOverlap = if (lastSrc != null && lastSrc.size >= 3) {
-                        multisetIntersectionSize(lastOut, lastSrc).toDouble() / maxOf(lastOut.size, lastSrc.size).toDouble()
-                    } else {
-                        0.0
-                    }
-                    if (prevContainment >= 0.75 || srcSymmetricOverlap >= 0.70) {
-                        return true
-                    }
                 }
             }
 
-            // 3. Non-tandem repeated trailing n-gram (catches echoed clauses when sentence punctuation is omitted).
-            if (outputTokens.size >= sourceTokens.size + 2 &&
-                !(sourceAlreadyEndsRepeated && outputSentences.size <= sourceSentences.size)
+            // 3. Unpunctuated clause echoes & false-start restarts.
+            if (expandedOutputTokens.size >= expandedSourceTokens.size + 2 &&
+                !sourceAlreadyEndsRepeated &&
+                !expandedSourceAlreadyEndsRepeated
             ) {
-                val lastSrc = sourceSentences.lastOrNull() ?: sourceTokens
-                val tailWindowStart = (outputTokens.size - maxOf(lastSrc.size + 6, 12)).coerceAtLeast(0)
-                if (outputTokens.size >= 6) {
-                    for (i in tailWindowStart..(outputTokens.size - 3)) {
-                        val trigram = outputTokens.subList(i, i + 3)
-                        val outCount = countNonOverlappingSublist(outputTokens, trigram)
-                        if (outCount >= 2 && outCount > countNonOverlappingSublist(sourceTokens, trigram)) {
-                            return true
-                        }
-                    }
-                }
-                if (lastSrc.size == 2) {
-                    val outCount = countNonOverlappingSublist(outputTokens, lastSrc)
-                    if (outCount >= 2 && outCount > countNonOverlappingSublist(sourceTokens, lastSrc)) {
-                        return true
-                    }
+                val sourceClauses = splitSegmentsIntoTokens(source, CLAUSE_SPLIT_REGEX)
+                val outputClauses = splitSegmentsIntoTokens(output, CLAUSE_SPLIT_REGEX)
+                val expandedSourceClauses = sourceClauses.map(::expandContractionsForRepeat)
+                val expandedOutputClauses = outputClauses.map(::expandContractionsForRepeat)
+                val lastSrcSize = sourceSentences.lastOrNull()?.size ?: sourceTokens.size
+                val expandedLastSrcSize = expandedSourceSentences.lastOrNull()?.size ?: expandedSourceTokens.size
+
+                if (hasClauseOrRestartRepeat(
+                        srcTokens = sourceTokens,
+                        outTokens = outputTokens,
+                        srcClauses = sourceClauses,
+                        outClauses = outputClauses,
+                        lastSrcSentence = sourceSentences.lastOrNull() ?: sourceTokens,
+                        lastSrcSize = lastSrcSize
+                    ) ||
+                    hasClauseOrRestartRepeat(
+                        srcTokens = expandedSourceTokens,
+                        outTokens = expandedOutputTokens,
+                        srcClauses = expandedSourceClauses,
+                        outClauses = expandedOutputClauses,
+                        lastSrcSentence = expandedSourceSentences.lastOrNull() ?: expandedSourceTokens,
+                        lastSrcSize = expandedLastSrcSize
+                    )
+                ) {
+                    return true
                 }
             }
 
             return false
         }
 
-        private fun splitSentencesIntoTokens(text: String): List<List<String>> =
-            text.split(SENTENCE_SPLIT_REGEX)
+        private fun hasTrailingTandemRepeat(
+            srcTokens: List<String>,
+            outTokens: List<String>,
+            srcSentences: List<List<String>>,
+            outSentences: List<List<String>>,
+            srcAlreadyEndsRepeated: Boolean,
+            allowSingleWord: Boolean
+        ): Boolean {
+            val maxBlock = outTokens.size / 2
+            val minBlock = if (allowSingleWord) 1 else 2
+            for (k in maxBlock downTo minBlock) {
+                if (k == 1) {
+                    val tok = outTokens.last()
+                    if (outTokens[outTokens.size - 2] != tok) continue
+                    val hyphenExpanded = srcTokens.any { it.contains('-') && it.split('-') == listOf(tok, tok) }
+                    if (hyphenExpanded) continue
+                    val shortSingleRepeat = srcTokens.size <= 2 && outTokens.size > srcTokens.size
+                    val extraOneWordSentenceRepeat = outSentences.size > srcSentences.size &&
+                        outSentences.size >= 2 &&
+                        outSentences.last().size == 1 &&
+                        outSentences.last() == outSentences[outSentences.lastIndex - 1]
+                    if (!shortSingleRepeat && !extraOneWordSentenceRepeat) continue
+                    val srcRepeatedSingle = srcTokens.size >= 2 &&
+                        srcTokens[srcTokens.size - 1] == tok &&
+                        srcTokens[srcTokens.size - 2] == tok
+                    val srcEndsSameOneWordRepeat = srcSentences.size >= 2 &&
+                        srcSentences.last() == listOf(tok) &&
+                        srcSentences[srcSentences.lastIndex - 1] == listOf(tok)
+                    if (!srcRepeatedSingle && !srcEndsSameOneWordRepeat) return true
+                    if (extraOneWordSentenceRepeat &&
+                        countTrailingRepeats(outTokens, listOf(tok)) > countTrailingRepeats(srcTokens, listOf(tok))
+                    ) {
+                        return true
+                    }
+                    continue
+                }
+
+                val tail = outTokens.subList(outTokens.size - k, outTokens.size)
+                val prev = outTokens.subList(outTokens.size - 2 * k, outTokens.size - k)
+                if (tokensRoughlyMatch(prev, tail)) {
+                    val sourceHasRoughTandem = srcTokens.size >= 2 * k &&
+                        tokensRoughlyMatch(
+                            srcTokens.subList(srcTokens.size - 2 * k, srcTokens.size - k),
+                            srcTokens.subList(srcTokens.size - k, srcTokens.size)
+                        ) &&
+                        tokensRoughlyMatch(srcTokens.subList(srcTokens.size - k, srcTokens.size), tail)
+                    val outputRepeatCount = countTrailingRoughRepeats(outTokens, tail)
+                    if (sourceHasRoughTandem) {
+                        val sourceRepeatCount = countTrailingRoughRepeats(srcTokens, tail)
+                        if (outputRepeatCount > sourceRepeatCount && outputRepeatCount >= 2 && outTokens.size > srcTokens.size) {
+                            return true
+                        }
+                    } else if (!srcAlreadyEndsRepeated || outSentences.size > srcSentences.size) {
+                        return true
+                    } else {
+                        val sourceTrailingCopies = countMaxTrailingCopies(srcTokens, srcSentences)
+                        if (outputRepeatCount > sourceTrailingCopies && outTokens.size > srcTokens.size) {
+                            return true
+                        }
+                    }
+                }
+            }
+            return false
+        }
+
+        private fun hasExtraTrailingSentenceEcho(
+            srcSentences: List<List<String>>,
+            outSentences: List<List<String>>
+        ): Boolean {
+            if (outSentences.size < 2) return false
+            val lastOut = outSentences.last()
+            val prevOut = outSentences[outSentences.size - 2]
+            val lastSrc = srcSentences.lastOrNull()
+            if (lastOut.size >= 2) {
+                if (tokensRoughlyMatch(lastOut, prevOut) ||
+                    (lastSrc != null && tokensRoughlyMatch(lastOut, lastSrc)) ||
+                    isRoughPrefixOrSuffix(lastOut, prevOut) ||
+                    (lastSrc != null && isRoughPrefixOrSuffix(lastOut, lastSrc))
+                ) {
+                    return true
+                }
+                if (lastOut.size == 2 && fuzzyMultisetIntersectionSize(lastOut, prevOut) == 2) {
+                    return true
+                }
+            }
+            if (lastOut.size >= 3) {
+                val prevContainment = fuzzyMultisetIntersectionSize(lastOut, prevOut).toDouble() / lastOut.size.toDouble()
+                val srcSymmetricOverlap = if (lastSrc != null && lastSrc.size >= 3) {
+                    fuzzyMultisetIntersectionSize(lastOut, lastSrc).toDouble() / maxOf(lastOut.size, lastSrc.size).toDouble()
+                } else {
+                    0.0
+                }
+                if (prevContainment >= 0.75 || srcSymmetricOverlap >= 0.70) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun hasClauseOrRestartRepeat(
+            srcTokens: List<String>,
+            outTokens: List<String>,
+            srcClauses: List<List<String>>,
+            outClauses: List<List<String>>,
+            lastSrcSentence: List<String>,
+            lastSrcSize: Int
+        ): Boolean {
+            if (outClauses.size >= 2) {
+                val lastClause = outClauses.last()
+                val penultClause = outClauses[outClauses.lastIndex - 1]
+                if (lastClause.size >= 2) {
+                    val clausesMatchOrContain = clausesOverlapOrEcho(lastClause, penultClause)
+                    val sourceRepeatedLastClause = srcClauses.size >= 2 &&
+                        srcClauses.last().size >= 2 &&
+                        clausesOverlapOrEcho(srcClauses.last(), srcClauses[srcClauses.lastIndex - 1])
+                    if (clausesMatchOrContain && !sourceRepeatedLastClause) {
+                        return true
+                    }
+                }
+            }
+
+            val tailWindowStart = (outTokens.size - maxOf(lastSrcSize + 8, 14)).coerceAtLeast(0)
+            val maxTandemStart = outTokens.size - 4
+            if (tailWindowStart <= maxTandemStart) {
+                for (start in tailWindowStart..maxTandemStart) {
+                    val maxBlockLen = (outTokens.size - start) / 2
+                    for (blockLen in 2..maxBlockLen) {
+                        val first = outTokens.subList(start, start + blockLen)
+                        val second = outTokens.subList(start + blockLen, start + 2 * blockLen)
+                        if (tokensRoughlyMatch(first, second)) {
+                            val tandem = outTokens.subList(start, start + 2 * blockLen)
+                            val outCount = countNonOverlappingRoughSublist(outTokens, tandem)
+                            if (outCount > countNonOverlappingRoughSublist(srcTokens, tandem)) {
+                                return true
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (outTokens.size >= 6) {
+                for (i in tailWindowStart..(outTokens.size - 3)) {
+                    val trigram = outTokens.subList(i, i + 3)
+                    val outCount = countNonOverlappingRoughSublist(outTokens, trigram)
+                    if (outCount >= 2 && outCount > countNonOverlappingRoughSublist(srcTokens, trigram)) {
+                        return true
+                    }
+                }
+            }
+            if (lastSrcSentence.size == 2) {
+                val outCount = countNonOverlappingRoughSublist(outTokens, lastSrcSentence)
+                if (outCount >= 2 && outCount > countNonOverlappingRoughSublist(srcTokens, lastSrcSentence)) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun clausesOverlapOrEcho(lastClause: List<String>, penultClause: List<String>): Boolean =
+            tokensRoughlyMatch(lastClause, penultClause) ||
+                isRoughPrefixOrSuffix(lastClause, penultClause) ||
+                fuzzyMultisetIntersectionSize(lastClause, penultClause).toDouble() / lastClause.size.toDouble() >= 0.75
+
+        private fun isRoughPrefixOrSuffix(needle: List<String>, haystack: List<String>): Boolean {
+            if (needle.size < 2 || haystack.size < needle.size) return false
+            return tokensRoughlyMatch(needle, haystack.subList(0, needle.size)) ||
+                tokensRoughlyMatch(needle, haystack.subList(haystack.size - needle.size, haystack.size))
+        }
+
+        private fun splitSegmentsIntoTokens(text: String, regex: Regex): List<List<String>> =
+            text.split(regex)
                 .map(::tokenizeWordsOrdered)
                 .filter { it.isNotEmpty() }
 
@@ -1216,6 +1695,18 @@ class GeminiLiveEngine(
             var count = 0
             var end = tokens.size
             while (end >= k && tokens.subList(end - k, end) == block) {
+                count++
+                end -= k
+            }
+            return count
+        }
+
+        private fun countTrailingRoughRepeats(tokens: List<String>, block: List<String>): Int {
+            val k = block.size
+            if (k == 0 || tokens.size < k) return 0
+            var count = 0
+            var end = tokens.size
+            while (end >= k && tokensRoughlyMatch(tokens.subList(end - k, end), block)) {
                 count++
                 end -= k
             }
@@ -1245,30 +1736,13 @@ class GeminiLiveEngine(
             return maxCopies
         }
 
-        private fun multisetIntersectionSize(a: List<String>, b: List<String>): Int {
-            if (a.isEmpty() || b.isEmpty()) return 0
-            val counts = HashMap<String, Int>(b.size)
-            for (tok in b) {
-                counts[tok] = (counts[tok] ?: 0) + 1
-            }
-            var hits = 0
-            for (tok in a) {
-                val rem = counts[tok] ?: 0
-                if (rem > 0) {
-                    hits++
-                    counts[tok] = rem - 1
-                }
-            }
-            return hits
-        }
-
-        private fun countNonOverlappingSublist(tokens: List<String>, pattern: List<String>): Int {
+        private fun countNonOverlappingRoughSublist(tokens: List<String>, pattern: List<String>): Int {
             val n = pattern.size
             if (n == 0 || tokens.size < n) return 0
             var count = 0
             var i = 0
             while (i <= tokens.size - n) {
-                if (tokens.subList(i, i + n) == pattern) {
+                if (tokensRoughlyMatch(tokens.subList(i, i + n), pattern)) {
                     count++
                     i += n
                 } else {
@@ -1362,6 +1836,154 @@ class GeminiLiveEngine(
             return listOf(PcmChunk(data = outBytes, sampleRate = sampleRate, channels = channels))
         }
 
+        private data class FrameRun(
+            val startFrame: Long,
+            val endExclusiveFrame: Long
+        )
+
+        /**
+         * Compresses excessively long internal silence stalls (> 750 ms strictly between the first
+         * and last active frames) down to ~420 ms with smooth linear fade-out/fade-in ramps to
+         * prevent clicks or digital-silence discontinuities.
+         */
+        internal fun compressExcessiveInternalSilence(chunks: List<PcmChunk>): List<PcmChunk> {
+            if (chunks.isEmpty()) return chunks
+            val sampleRate = chunks.first().sampleRate
+            val channels = chunks.first().channels
+            if (sampleRate <= 0 || channels <= 0) return chunks
+            val bytesPerFrame = channels * 2
+            if (chunks.any {
+                    it.sampleRate != sampleRate ||
+                        it.channels != channels ||
+                        it.data.size % bytesPerFrame != 0
+                }
+            ) {
+                return chunks
+            }
+
+            val totalFrames = chunks.sumOf { it.data.size.toLong() / bytesPerFrame }
+            val maxInternalSilenceFrames = (sampleRate.toLong() * MAX_INTERNAL_SILENCE_MS) / 1000L
+            if (totalFrames <= maxInternalSilenceFrames) return chunks
+
+            val firstActiveFrame = findFirstActiveFrame(chunks, channels, bytesPerFrame)
+            if (firstActiveFrame < 0L) return chunks
+            val lastActiveFrame = findLastActiveFrame(chunks, totalFrames, firstActiveFrame, channels, bytesPerFrame)
+            if (lastActiveFrame - firstActiveFrame - 1L <= maxInternalSilenceFrames) return chunks
+
+            val longRuns = mutableListOf<FrameRun>()
+            var inactiveRunStart = -1L
+            var globalFrame = 0L
+            scan@ for (chunk in chunks) {
+                val d = chunk.data
+                var off = 0
+                while (off + bytesPerFrame <= d.size) {
+                    if (globalFrame >= lastActiveFrame) {
+                        break@scan
+                    }
+                    if (globalFrame > firstActiveFrame) {
+                        if (!isFrameActive(d, off, channels)) {
+                            if (inactiveRunStart < 0L) {
+                                inactiveRunStart = globalFrame
+                            }
+                        } else if (inactiveRunStart >= 0L) {
+                            if (globalFrame - inactiveRunStart > maxInternalSilenceFrames) {
+                                longRuns.add(FrameRun(inactiveRunStart, globalFrame))
+                            }
+                            inactiveRunStart = -1L
+                        }
+                    }
+                    off += bytesPerFrame
+                    globalFrame++
+                }
+            }
+            if (inactiveRunStart >= 0L && lastActiveFrame - inactiveRunStart > maxInternalSilenceFrames) {
+                longRuns.add(FrameRun(inactiveRunStart, lastActiveFrame))
+            }
+            if (longRuns.isEmpty()) return chunks
+
+            val compressedFrames = ((sampleRate.toLong() * COMPRESSED_INTERNAL_SILENCE_MS) / 1000L)
+                .coerceIn(1L, maxInternalSilenceFrames)
+            val halfKeep = compressedFrames / 2L
+            val secondKeep = compressedFrames - halfKeep
+            val fadeFrames = (sampleRate.toLong() * INTERNAL_SILENCE_FADE_MS) / 1000L
+            val fadeOutCount = minOf(fadeFrames, halfKeep).toInt()
+            val fadeInCount = minOf(fadeFrames, secondKeep).toInt()
+
+            val removedFrames = longRuns.sumOf { (it.endExclusiveFrame - it.startFrame) - compressedFrames }
+            val outBytes = ByteArray(((totalFrames - removedFrames) * bytesPerFrame).toInt())
+            var srcCursor = 0L
+            var outFrameOffset = 0
+            for (run in longRuns) {
+                if (run.startFrame > srcCursor) {
+                    val copiedBytes = copyFrameRangeInto(
+                        chunks = chunks,
+                        bytesPerFrame = bytesPerFrame,
+                        startFrame = srcCursor,
+                        endExclusiveFrame = run.startFrame,
+                        destBytes = outBytes,
+                        destStartOffset = outFrameOffset * bytesPerFrame
+                    )
+                    outFrameOffset += copiedBytes / bytesPerFrame
+                }
+                if (halfKeep > 0L) {
+                    val copiedBytes = copyFrameRangeInto(
+                        chunks = chunks,
+                        bytesPerFrame = bytesPerFrame,
+                        startFrame = run.startFrame,
+                        endExclusiveFrame = run.startFrame + halfKeep,
+                        destBytes = outBytes,
+                        destStartOffset = outFrameOffset * bytesPerFrame
+                    )
+                    val copiedFrames = copiedBytes / bytesPerFrame
+                    val appliedFadeOut = minOf(fadeOutCount, copiedFrames)
+                    if (appliedFadeOut > 0) {
+                        applyLinearFade(
+                            pcm = outBytes,
+                            startFrame = outFrameOffset + copiedFrames - appliedFadeOut,
+                            frameCount = appliedFadeOut,
+                            channels = channels,
+                            fadeIn = false
+                        )
+                    }
+                    outFrameOffset += copiedFrames
+                }
+                if (secondKeep > 0L) {
+                    val copiedBytes = copyFrameRangeInto(
+                        chunks = chunks,
+                        bytesPerFrame = bytesPerFrame,
+                        startFrame = run.endExclusiveFrame - secondKeep,
+                        endExclusiveFrame = run.endExclusiveFrame,
+                        destBytes = outBytes,
+                        destStartOffset = outFrameOffset * bytesPerFrame
+                    )
+                    val copiedFrames = copiedBytes / bytesPerFrame
+                    val appliedFadeIn = minOf(fadeInCount, copiedFrames)
+                    if (appliedFadeIn > 0) {
+                        applyLinearFade(
+                            pcm = outBytes,
+                            startFrame = outFrameOffset,
+                            frameCount = appliedFadeIn,
+                            channels = channels,
+                            fadeIn = true
+                        )
+                    }
+                    outFrameOffset += copiedFrames
+                }
+                srcCursor = run.endExclusiveFrame
+            }
+            if (srcCursor < totalFrames) {
+                copyFrameRangeInto(
+                    chunks = chunks,
+                    bytesPerFrame = bytesPerFrame,
+                    startFrame = srcCursor,
+                    endExclusiveFrame = totalFrames,
+                    destBytes = outBytes,
+                    destStartOffset = outFrameOffset * bytesPerFrame
+                )
+            }
+            return listOf(PcmChunk(data = outBytes, sampleRate = sampleRate, channels = channels))
+        }
+
         private fun isFrameActive(data: ByteArray, byteOffset: Int, channels: Int): Boolean {
             for (ch in 0 until channels) {
                 val idx = byteOffset + ch * 2
@@ -1418,8 +2040,21 @@ class GeminiLiveEngine(
             endExclusiveFrame: Long
         ): ByteArray {
             val outBytes = ByteArray(((endExclusiveFrame - startFrame) * bytesPerFrame).toInt())
+            copyFrameRangeInto(chunks, bytesPerFrame, startFrame, endExclusiveFrame, outBytes, destStartOffset = 0)
+            return outBytes
+        }
+
+        private fun copyFrameRangeInto(
+            chunks: List<PcmChunk>,
+            bytesPerFrame: Int,
+            startFrame: Long,
+            endExclusiveFrame: Long,
+            destBytes: ByteArray,
+            destStartOffset: Int
+        ): Int {
+            if (endExclusiveFrame <= startFrame) return 0
             var cursorFrame = 0L
-            var outOffset = 0
+            var outOffset = destStartOffset
             for (chunk in chunks) {
                 val d = chunk.data
                 val chunkFrames = d.size.toLong() / bytesPerFrame
@@ -1429,12 +2064,13 @@ class GeminiLiveEngine(
                 if (copyEnd > copyStart) {
                     val srcOffset = ((copyStart - cursorFrame) * bytesPerFrame).toInt()
                     val length = ((copyEnd - copyStart) * bytesPerFrame).toInt()
-                    System.arraycopy(d, srcOffset, outBytes, outOffset, length)
+                    System.arraycopy(d, srcOffset, destBytes, outOffset, length)
                     outOffset += length
                 }
                 cursorFrame = chunkEnd
+                if (cursorFrame >= endExclusiveFrame) break
             }
-            return outBytes
+            return outOffset - destStartOffset
         }
 
         private fun applyLinearFade(
@@ -1497,12 +2133,13 @@ class GeminiLiveEngine(
             append("You are an accomplished audiobook narrator and voice actor bringing a story to life. ")
             append("Read the user's text aloud strictly verbatim, word for word, without adding, omitting, ")
             append("paraphrasing, replying conversationally, or repeating these instructions. ")
-            append("Read each phrase once and only once—never repeat, echo, or restart a sentence. ")
-            append("Stop cleanly if a line ends mid-thought with a trailing dash (—) or ellipsis (...) without guessing unfinished words, while pronouncing hyphenated compounds smoothly. ")
+            append("Read each phrase and sentence once and only once—never repeat, echo, or restart the final sentence. ")
+            append("Treat dashes, commas, and punctuation as brief, natural pauses and always continue reading the full text through to the very end—never stop early or skip words mid-sentence. ")
+            append("Only stop at the actual end of the user's text, even if a line ends mid-thought with an ellipsis (...) or dash, without guessing unfinished words, while pronouncing hyphenated compounds smoothly. ")
             append("Pronounce contractions, possessives, and apostrophe-containing words (such as don't, it's, or Kim's) smoothly as single continuous words without pausing or breaking before an apostrophe. ")
             append("Never speak stage directions, speaker labels, or delivery metadata aloud. ")
             append("Perform with natural human warmth, expressive cadence, emotional presence, vivid intonation, ")
-            append("and authentic pauses at punctuation (dashes, ellipses, questions, and exclamations) rather than a flat monotone. ")
+            append("and authentic rhythm across questions and exclamations rather than a flat monotone. ")
             append("When bracketed system prompts or status messages appear (e.g. [text in brackets]), read their exact words clearly in a crisp, composed system-voice cadence.")
             val speakerName = request.speakerName?.trim()?.takeIf { it.isNotEmpty() }
             if (speakerName != null) {

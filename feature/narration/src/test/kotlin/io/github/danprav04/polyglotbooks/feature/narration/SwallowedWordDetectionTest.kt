@@ -76,4 +76,25 @@ class SwallowedWordDetectionTest {
         s[5000] = 25000; s[5001] = -25000
         assertTrue(GeminiLiveEngine.hasPcmGlitch(listOf(pcm(s))))
     }
+
+    @Test
+    fun `compressExcessiveInternalSilence preserves smooth transitions across multiple long gaps`() {
+        val sr = 24000
+        val speech = tone(sr / 4, amp = 5000) // 250ms active
+        for (i in 0 until 240) {
+            speech[i] = (speech[i] * i / 240.0).toInt()
+            speech[speech.lastIndex - i] = (speech[speech.lastIndex - i] * i / 240.0).toInt()
+        }
+        val longGap = IntArray(sr * 2) { if (it % 2 == 0) 60 else -60 } // 2s low-floor silence
+        val combined = speech + longGap + speech + longGap + speech
+        val chunks = listOf(pcm(combined))
+        assertFalse(GeminiLiveEngine.hasPcmGlitch(chunks))
+
+        val compressed = GeminiLiveEngine.compressExcessiveInternalSilence(chunks)
+        assertEquals(1, compressed.size)
+        assertFalse(GeminiLiveEngine.hasPcmGlitch(compressed))
+        // 3 * 6000 speech + 2 * ~10080 compressed gaps = ~38160 frames (original was 114000 frames)
+        val compressedFrames = compressed.single().data.size / 2
+        assertTrue("Expected < 40000 frames, got $compressedFrames", compressedFrames in 36000..40000)
+    }
 }

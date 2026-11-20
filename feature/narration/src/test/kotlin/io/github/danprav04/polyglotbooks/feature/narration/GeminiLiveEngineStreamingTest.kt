@@ -3,6 +3,7 @@ package io.github.danprav04.polyglotbooks.feature.narration
 import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.gemini.Blob
+import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
 import io.github.danprav04.polyglotbooks.core.gemini.GoAwayData
 import io.github.danprav04.polyglotbooks.core.gemini.LiveClientMessage
 import io.github.danprav04.polyglotbooks.core.gemini.LiveErrorData
@@ -942,5 +943,497 @@ class GeminiLiveEngineStreamingTest {
         )
         assertTrue(instruction.contains("contractions, possessives, and apostrophe-containing words", ignoreCase = true))
         assertTrue(instruction.contains("without pausing or breaking before an apostrophe", ignoreCase = true))
+        assertTrue(instruction.contains("never repeat, echo, or restart the final sentence", ignoreCase = true))
+        assertTrue(instruction.contains("continue reading the full text through to the very end", ignoreCase = true))
+    }
+
+    @Test
+    fun `generationComplete with finished transcription finalizes fast without turnComplete reuses session and ignores stray turnComplete`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        var fallbackCalled = false
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackCalled = true
+                return flowOf(PcmChunk(byteArrayOf(99), 24000, 1))
+            }
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            // Turn 1: generationComplete=true + outputTranscription.finished=true without turnComplete -> completes ~300ms and keeps WebSocket open.
+            val turn1Chunks = mutableListOf<PcmChunk>()
+            val t1Job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = "It was a dark night.", voiceId = "Charon")
+                ).collect { turn1Chunks += it }
+            }
+            runCurrent()
+            createdSessions.single().emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(
+                                Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(byteArrayOf(11, 12))))
+                            )
+                        ),
+                        outputTranscription = TranscriptionData(text = "It was a dark night.", finished = true),
+                        generationComplete = true,
+                        turnComplete = false
+                    )
+                )
+            )
+            runCurrent()
+            assertTrue("Should still wait briefly after generationComplete for stray tail packets", turn1Chunks.isEmpty())
+
+            advanceTimeBy(350L)
+            runCurrent()
+            t1Job.join()
+
+            assertFalse(fallbackCalled)
+            assertEquals(1, turn1Chunks.size)
+            assertEquals(11.toByte(), turn1Chunks[0].data[0])
+            assertEquals(1, createdSessions.size)
+            assertEquals(0, createdSessions.single().disconnectCount)
+            assertEquals(0, live.sessionRotationCount)
+
+            // Turn 2: reuses exact same WebSocket; delayed stray turnComplete from turn 1 arrives first and must be ignored.
+            val turn2Chunks = mutableListOf<PcmChunk>()
+            val t2Job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = "Then the bell rang.", voiceId = "Charon")
+                ).collect { turn2Chunks += it }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+            assertEquals(2, createdSessions.single().sentMessages.size)
+
+            // Delayed turnComplete from turn 1 arrives before turn 2 emits anything -> must NOT abort turn 2!
+            createdSessions.single().emitServerMessage(
+                LiveServerMessage.ServerContentMessage(ServerContentData(turnComplete = true))
+            )
+            runCurrent()
+            assertFalse("Stray turnComplete from turn 1 must be consumed without terminating turn 2", t2Job.isCompleted)
+            assertTrue(turn2Chunks.isEmpty())
+
+            // Now turn 2 emits its own audio + transcript + turnComplete -> succeeds on same session.
+            createdSessions.single().emitServerMessage(
+                audioServerMessage(
+                    pcmBytes = byteArrayOf(21, 22),
+                    transcript = "Then the bell rang.",
+                    turnComplete = true
+                )
+            )
+            runCurrent()
+            t2Job.join()
+
+            assertFalse(fallbackCalled)
+            assertEquals(1, createdSessions.size)
+            assertEquals(1, turn2Chunks.size)
+            assertEquals(21.toByte(), turn2Chunks[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `sole Live candidate failing softly once retries on fresh Live session without TTS fallback`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        var fallbackCalled = false
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackCalled = true
+                return flowOf(PcmChunk(byteArrayOf(99), 24000, 1))
+            }
+        }
+        val tracker = GeminiQuotaTracker().apply {
+            recordHttpError("gemini-2.5-flash-native-audio-dialog", 404, "not found")
+            recordHttpError("gemini-3-flash-live", 404, "not found")
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" },
+            quotaTracker = tracker
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            val received = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = "The lighthouse beam swept across the harbor.", voiceId = "Charon")
+                ).collect { received += it }
+            }
+
+            // Pass 1 on sole candidate (gemini-3.8-live) fails softly with mismatched transcript -> rotated.
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(
+                    pcmBytes = byteArrayOf(5, 6),
+                    transcript = "Completely unrelated hallucination",
+                    turnComplete = true
+                )
+            )
+            runCurrent()
+
+            // Soft-retry opens a fresh session on gemini-3.8-live and succeeds WITHOUT falling back to TTS.
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertFalse(fallbackCalled)
+
+            createdSessions[1].emitServerMessage(
+                audioServerMessage(
+                    pcmBytes = byteArrayOf(7, 8),
+                    transcript = "The lighthouse beam swept across the harbor.",
+                    turnComplete = true
+                )
+            )
+            runCurrent()
+            job.join()
+
+            assertFalse(fallbackCalled)
+            assertEquals(1, received.size)
+            assertEquals(7.toByte(), received[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `hasRepeatedSentenceOrPhrase catches 1-word repeats fuzzy ASR drift contraction drift partial echoes clause repeats and restarts`() {
+        // 1-word final sentence repeat in multi-sentence turn
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "I looked at him. Run.",
+                "I looked at him. Run. Run."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "I looked at him. Run. Run.",
+                "I looked at him. Run. Run."
+            )
+        )
+
+        // Fuzzy ASR spelling drift across repeated sentence
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Bihyung smiled coldly.",
+                "Bihyung smiled coldly. Bihyoung smiled coldly."
+            )
+        )
+
+        // Contraction expansion drift across repeated sentence
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "I'm ready.",
+                "I'm ready. I am ready."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "I'm ready.",
+                "I am ready."
+            )
+        )
+
+        // Partial trailing echo
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "I opened the door. Nobody was inside.",
+                "I opened the door. Nobody was inside. Nobody was."
+            )
+        )
+
+        // Comma-joined clause repeat
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "He stepped back, then turned around.",
+                "He stepped back, then turned around, then turned around."
+            )
+        )
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "He stepped back and waited.",
+                "He stepped back and waited, stepped back and waited."
+            )
+        )
+
+        // False-start restart mid-sentence
+        assertTrue(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "We had to survive the first scenario.",
+                "We had to survive— We had to survive the first scenario."
+            )
+        )
+
+        // Existing legitimate repeat negative cases must stay false
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Wait for me! Wait for me!",
+                "Wait for me! Wait for me!"
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "She'd gone home. She'd gone home.",
+                "She had gone home. She had gone home."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Bye-bye.",
+                "Bye, bye."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Mr. Kim walked out, and it was raining.",
+                "Mr. Kim walked out. And it was raining."
+            )
+        )
+        assertFalse(
+            GeminiLiveEngine.hasRepeatedSentenceOrPhrase(
+                "Mr. Kim didn't walk out, and it was raining.",
+                "Mr. Kim did not walk out. And it was raining."
+            )
+        )
+    }
+
+    @Test
+    fun `compressExcessiveInternalSilence shortens long internal stalls smoothly while preserving normal pauses and tiny chunks`() {
+        fun encodeSamples(samples: ShortArray): ByteArray {
+            val out = ByteArray(samples.size * 2)
+            for (i in samples.indices) {
+                val s = samples[i].toInt()
+                out[i * 2] = (s and 0xFF).toByte()
+                out[i * 2 + 1] = ((s ushr 8) and 0xFF).toByte()
+            }
+            return out
+        }
+
+        // Tiny synthetic chunk stays untouched.
+        val tiny = listOf(PcmChunk(byteArrayOf(1, 2, 3, 4), sampleRate = 24000, channels = 1))
+        assertEquals(tiny, GeminiLiveEngine.compressExcessiveInternalSilence(tiny))
+
+        // Normal 400ms internal pause (9,600 frames <= 750ms) stays untouched.
+        val normalSamples = ShortArray(12_000 + 9_600 + 12_000) { i ->
+            when {
+                i < 12_000 || i >= 21_600 -> (4000.0 * Math.sin(i * 0.08)).toInt().toShort()
+                else -> 0
+            }
+        }
+        val normalChunks = listOf(PcmChunk(encodeSamples(normalSamples), sampleRate = 24000, channels = 1))
+        assertEquals(normalChunks, GeminiLiveEngine.compressExcessiveInternalSilence(normalChunks))
+
+        // 500ms speech + 2,500ms low-floor internal silence stall + 500ms speech -> compressed to ~420ms silence with no glitch!
+        val speechFrames = 12_000
+        val stallFrames = 60_000
+        val totalFrames = speechFrames + stallFrames + speechFrames
+        val stallSamples = ShortArray(totalFrames) { i ->
+            when {
+                i < speechFrames -> {
+                    val env = if (i >= speechFrames - 480) (speechFrames - i) / 480.0 else 1.0
+                    (5000.0 * env * Math.sin(i * 0.08)).toInt().toShort()
+                }
+                i >= speechFrames + stallFrames -> {
+                    val offset = i - (speechFrames + stallFrames)
+                    val env = if (offset < 480) offset / 480.0 else 1.0
+                    (5000.0 * env * Math.sin(i * 0.08)).toInt().toShort()
+                }
+                else -> if (i % 2 == 0) 80 else -80
+            }
+        }
+        val stallBytes = encodeSamples(stallSamples)
+        val splitPoint = 30_000 * 2
+        val stallChunks = listOf(
+            PcmChunk(stallBytes.copyOfRange(0, splitPoint), sampleRate = 24000, channels = 1),
+            PcmChunk(stallBytes.copyOfRange(splitPoint, stallBytes.size), sampleRate = 24000, channels = 1)
+        )
+
+        val compressed = GeminiLiveEngine.compressExcessiveInternalSilence(stallChunks)
+        assertEquals(1, compressed.size)
+        assertFalse("Compressed PCM must have no glitch or click", GeminiLiveEngine.hasPcmGlitch(compressed))
+
+        // Expected silence compressed from 2,500ms (60,000 frames) down to 420ms (10,080 frames), removing ~49,920 frames.
+        val compressedFrames = compressed.single().data.size / 2
+        val expectedApproxFrames = totalFrames - (stallFrames - 10_080)
+        assertTrue(
+            "Expected compressed frame count around $expectedApproxFrames, got $compressedFrames",
+            compressedFrames in (expectedApproxFrames - 200)..(expectedApproxFrames + 200)
+        )
+    }
+
+    @Test
+    fun `empty-transcript duration sanity guard rejects 20-word turn with 500ms audio and retries cleanly`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        var fallbackCalled = false
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackCalled = true
+                return flowOf(PcmChunk(byteArrayOf(99), 24000, 1))
+            }
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        fun smoothToneBytes(durationMs: Int): ByteArray {
+            val frames = 24 * durationMs
+            val out = ByteArray(frames * 2)
+            for (i in 0 until frames) {
+                val sample = (4000.0 * Math.sin(i * 0.08)).toInt()
+                out[i * 2] = (sample and 0xFF).toByte()
+                out[i * 2 + 1] = ((sample ushr 8) and 0xFF).toByte()
+            }
+            return out
+        }
+
+        val twentyWords = "One two three four five six seven eight nine ten " +
+            "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty."
+        val short500ms = smoothToneBytes(500)
+        val valid3000ms = smoothToneBytes(3_000)
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            val received = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(
+                    SynthesisRequest(text = twentyWords, voiceId = "Charon")
+                ).collect { received += it }
+            }
+
+            // Candidate 0 emits 500ms audio with empty transcript (< 2,000ms minimum for 20 words) -> rejected!
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(pcmBytes = short500ms, transcript = null, turnComplete = true)
+            )
+            runCurrent()
+
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertTrue(received.isEmpty())
+
+            // Candidate 1 emits 3,000ms audio with empty transcript -> passes duration sanity check and emits!
+            createdSessions[1].emitServerMessage(
+                audioServerMessage(pcmBytes = valid3000ms, transcript = null, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertFalse(fallbackCalled)
+            assertEquals(valid3000ms.size, received.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `partial mid-stream transcript waits up to 4500ms while generationComplete without finished finalizes at 500ms`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(
+            dispatcher = dispatcher,
+            bufferAndVerifyTurns = true
+        )
+        try {
+            // 1. Mid-stream partial transcript (< 85% of 10 words) without generationComplete waits past 2,600ms up to 4,500ms.
+            val tenWords = "One two three four five six seven eight nine ten."
+            val chunks1 = mutableListOf<PcmChunk>()
+            val j1 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = tenWords, voiceId = "Charon")).collect { chunks1 += it }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(byteArrayOf(11, 12), transcript = "One two three", turnComplete = false)
+            )
+            runCurrent()
+            advanceTimeBy(3_000L)
+            runCurrent()
+            assertFalse("Mid-stream <85% transcript must not time out at 2,500ms", j1.isCompleted)
+
+            // Remaining transcript arrives at 3,000ms -> now >= 85% caught up, finalizes on 2,500ms post-audio idle timeout.
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(byteArrayOf(13, 14), transcript = " four five six seven eight nine ten.", turnComplete = false)
+            )
+            runCurrent()
+            advanceTimeBy(2_600L)
+            runCurrent()
+            j1.join()
+            assertEquals(2, chunks1.size)
+
+            // 2. generationComplete=true without transcription.finished finalizes after 500ms idle and reuses session.
+            val chunks2 = mutableListOf<PcmChunk>()
+            val j2 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Short line.", voiceId = "Charon")).collect { chunks2 += it }
+            }
+            runCurrent()
+            createdSessions[1].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(byteArrayOf(21, 22)))))
+                        ),
+                        outputTranscription = TranscriptionData(text = "Short line.", finished = null),
+                        generationComplete = true,
+                        turnComplete = false
+                    )
+                )
+            )
+            runCurrent()
+            advanceTimeBy(350L)
+            runCurrent()
+            assertFalse("Without finished=true should wait up to 500ms", j2.isCompleted)
+
+            advanceTimeBy(200L)
+            runCurrent()
+            j2.join()
+            assertEquals(1, chunks2.size)
+            assertEquals(0, createdSessions[1].disconnectCount)
+        } finally {
+            live.close()
+        }
     }
 }
