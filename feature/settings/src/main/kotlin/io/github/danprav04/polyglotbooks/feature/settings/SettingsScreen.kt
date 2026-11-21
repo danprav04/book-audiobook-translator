@@ -218,6 +218,7 @@ fun SettingsScreen(
                 onOpenVoicePicker = { showVoicePickerDialog = true },
                 onDuckLevelChange = viewModel::setDuckLevel,
                 onCacheLimitChange = viewModel::setCacheLimitBytes,
+                onLivePreloadChunksChange = viewModel::setLivePreloadChunks,
                 onEchoChange = viewModel::setEchoTargetLanguage
             )
 
@@ -524,7 +525,7 @@ private fun FreeTierQuotaSection(
             Text(
                 text = "• Automatic chapter batching & on-device disk caching minimize repeat API calls.\n" +
                     "• Text requests rotate across Flash Lite (gemini-3.5-flash-lite, gemini-3.1-flash-lite) and Gemma 4 (31B/26B — 30 RPM / 14.4K RPD) on 429 limits.\n" +
-                    "• Narration prefers Live Audio (gemini-2.5-flash-native-audio-dialog 1M TPM, gemini-3.8-live, gemini-3-flash-live — Unlimited RPM/RPD) to avoid exhausting the gemini-3.8-flash-tts 3 RPM / 10 RPD cap.",
+                    "• Narration prefers Live Audio (gemini-3.1-flash-live-preview, gemini-2.5-flash-native-audio-latest, gemini-3.8-live — Unlimited RPM/RPD) to avoid exhausting the gemini-3.8-flash-tts 3 RPM / 10 RPD cap.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -806,6 +807,7 @@ private fun AudioAndStorageSection(
     onOpenVoicePicker: () -> Unit,
     onDuckLevelChange: (Float) -> Unit,
     onCacheLimitChange: (Long) -> Unit,
+    onLivePreloadChunksChange: (Int) -> Unit,
     onEchoChange: (Boolean) -> Unit
 ) {
     Card(
@@ -948,6 +950,37 @@ private fun AudioAndStorageSection(
                 )
                 Text(
                     text = "Translated audio is cached locally for instant back-seeks. Oldest segments are evicted when limit is reached.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            // Live Preload Buffer slider (1 to 8 chunks, default 3)
+            Column {
+                val chunkLabel = if (uiState.livePreloadChunks == 1) "chunk" else "chunks"
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Live Preload Buffer",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = "${uiState.livePreloadChunks} $chunkLabel",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+                Slider(
+                    value = uiState.livePreloadChunks.toFloat(),
+                    onValueChange = { onLivePreloadChunksChange(it.roundToInt()) },
+                    valueRange = 1f..8f,
+                    steps = 6
+                )
+                Text(
+                    text = "Chunks cached before Live playback starts (default: 3). Higher values prevent mid-chapter pauses on slower connections.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

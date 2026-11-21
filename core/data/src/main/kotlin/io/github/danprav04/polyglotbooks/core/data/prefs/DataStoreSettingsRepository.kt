@@ -105,6 +105,11 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override val livePreloadChunks: Flow<Int> = dataStore.data.map { preferences ->
+        (preferences[KEY_LIVE_PRELOAD_CHUNKS] ?: DEFAULT_LIVE_PRELOAD_CHUNKS)
+            .coerceIn(MIN_LIVE_PRELOAD_CHUNKS, MAX_LIVE_PRELOAD_CHUNKS)
+    }
+
     override suspend fun saveApiKey(key: String) {
         secureKeyStore.saveApiKey(key)
         apiKeyVersion.update { it + 1L }
@@ -252,6 +257,13 @@ class DataStoreSettingsRepository(
         }
     }
 
+    override suspend fun setLivePreloadChunks(chunks: Int) {
+        val clamped = chunks.coerceIn(MIN_LIVE_PRELOAD_CHUNKS, MAX_LIVE_PRELOAD_CHUNKS)
+        dataStore.edit { preferences ->
+            preferences[KEY_LIVE_PRELOAD_CHUNKS] = clamped
+        }
+    }
+
     companion object {
         val KEY_TARGET_LANGUAGE = stringPreferencesKey("target_language_code")
         val KEY_CACHE_LIMIT_BYTES = longPreferencesKey("cache_limit_bytes")
@@ -267,6 +279,7 @@ class DataStoreSettingsRepository(
         val KEY_READER_FONT_SIZE_SP = intPreferencesKey("reader_font_size_sp")
         val KEY_READER_FONT_FAMILY = stringPreferencesKey("reader_font_family")
         val KEY_DEFAULT_NARRATOR_VOICE_ID = stringPreferencesKey("default_narrator_voice_id")
+        val KEY_LIVE_PRELOAD_CHUNKS = intPreferencesKey("live_preload_chunks")
 
         val KEY_USAGE_LIVE_TRANSLATE = doublePreferencesKey("usage_live_translate_minutes")
         val KEY_USAGE_TTS = doublePreferencesKey("usage_tts_minutes")
@@ -282,6 +295,9 @@ class DataStoreSettingsRepository(
         const val DEFAULT_READER_FONT_SIZE_SP: Int = 18
         const val DEFAULT_READER_FONT_FAMILY: String = "Serif"
         const val DEFAULT_NARRATOR_VOICE_ID: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+        const val MIN_LIVE_PRELOAD_CHUNKS: Int = 1
+        const val MAX_LIVE_PRELOAD_CHUNKS: Int = 8
+        const val DEFAULT_LIVE_PRELOAD_CHUNKS: Int = 3
 
         fun modelRoleKey(role: ModelRole) = stringPreferencesKey("model_role_${role.name}")
     }

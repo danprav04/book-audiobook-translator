@@ -14,6 +14,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateEntity
 import io.github.danprav04.polyglotbooks.core.data.db.TtsSegmentEntity
+import io.github.danprav04.polyglotbooks.core.data.prefs.DataStoreSettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -226,6 +227,7 @@ class FakeSettingsRepository : SettingsRepository {
     private val _targetLanguage = MutableStateFlow(LanguageCode.ENGLISH)
     private val _readerNarrationEngine = MutableStateFlow("GEMINI_FLASH_TTS")
     private val _defaultNarratorVoiceId = MutableStateFlow(GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID)
+    private val _livePreloadChunks = MutableStateFlow(DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS)
     private val _readerReadTranslated = MutableStateFlow(false)
     private val _readerNarrationSpeed = MutableStateFlow(1.0f)
     private val _readerTheme = MutableStateFlow("LIGHT")
@@ -242,6 +244,7 @@ class FakeSettingsRepository : SettingsRepository {
     override val lastOpenedBookId: Flow<String?> = _lastOpenedBookId
     override val readerNarrationEngine: Flow<String> = _readerNarrationEngine
     override val defaultNarratorVoiceId: Flow<String> = _defaultNarratorVoiceId
+    override val livePreloadChunks: Flow<Int> = _livePreloadChunks
     override val readerReadTranslated: Flow<Boolean> = _readerReadTranslated
     override val readerNarrationSpeed: Flow<Float> = _readerNarrationSpeed
     override val readerTheme: Flow<String> = _readerTheme
@@ -270,6 +273,12 @@ class FakeSettingsRepository : SettingsRepository {
     }
     override suspend fun setDefaultNarratorVoiceId(voiceId: String) {
         _defaultNarratorVoiceId.value = voiceId
+    }
+    override suspend fun setLivePreloadChunks(chunks: Int) {
+        _livePreloadChunks.value = chunks.coerceIn(
+            DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS,
+            DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+        )
     }
     override suspend fun setReaderReadTranslated(readTranslated: Boolean) {
         _readerReadTranslated.value = readTranslated

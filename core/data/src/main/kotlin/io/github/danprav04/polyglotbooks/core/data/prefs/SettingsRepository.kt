@@ -45,6 +45,8 @@ interface SettingsRepository {
         get() = flowOf("Serif")
     val defaultNarratorVoiceId: Flow<String>
         get() = flowOf(GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID)
+    val livePreloadChunks: Flow<Int>
+        get() = flowOf(DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS)
 
     suspend fun saveApiKey(key: String)
     suspend fun clearApiKey()
@@ -72,5 +74,6 @@ interface SettingsRepository {
     suspend fun setReaderFontSizeSp(sizeSp: Int) {}
     suspend fun setReaderFontFamily(family: String) {}
     suspend fun setDefaultNarratorVoiceId(voiceId: String) {}
+    suspend fun setLivePreloadChunks(chunks: Int) {}
 }
 

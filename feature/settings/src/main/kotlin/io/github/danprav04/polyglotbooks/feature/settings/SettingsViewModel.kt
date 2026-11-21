@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
+import io.github.danprav04.polyglotbooks.core.data.prefs.DataStoreSettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -44,6 +45,7 @@ data class SettingsUiState(
     val cacheLimitBytes: Long = 1024L * 1024L * 1024L, // 1 GB
     val echoTargetLanguage: Boolean = false,
     val defaultNarratorVoiceId: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID,
+    val livePreloadChunks: Int = DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS,
     val playingPreviewVoiceId: String? = null,
     val previewErrorMessage: String? = null,
     val featureUsageStats: FeatureUsageStats = FeatureUsageStats(),
@@ -88,18 +90,24 @@ class SettingsViewModel @Inject constructor(
             cacheLimitBytes = cache,
             echoTargetLanguage = echo,
             usageStats = FeatureUsageStats(),
-            defaultNarratorVoiceId = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
+            defaultNarratorVoiceId = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID,
+            livePreloadChunks = DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS
         )
     }
 
     private val repoSettings = combine(
         baseRepoSettings,
         settingsRepository.featureUsageStats,
-        settingsRepository.defaultNarratorVoiceId
-    ) { base, usage, narratorVoice ->
+        settingsRepository.defaultNarratorVoiceId,
+        settingsRepository.livePreloadChunks
+    ) { base, usage, narratorVoice, livePreload ->
         base.copy(
             usageStats = usage,
-            defaultNarratorVoiceId = narratorVoice
+            defaultNarratorVoiceId = narratorVoice,
+            livePreloadChunks = livePreload.coerceIn(
+                DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS,
+                DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+            )
         )
     }
 
@@ -144,6 +152,7 @@ class SettingsViewModel @Inject constructor(
             cacheLimitBytes = repo.cacheLimitBytes,
             echoTargetLanguage = repo.echoTargetLanguage,
             defaultNarratorVoiceId = repo.defaultNarratorVoiceId,
+            livePreloadChunks = repo.livePreloadChunks,
             playingPreviewVoiceId = playingPreviewVoiceId,
             previewErrorMessage = previewError,
             featureUsageStats = repo.usageStats,
@@ -164,7 +173,8 @@ class SettingsViewModel @Inject constructor(
         val cacheLimitBytes: Long,
         val echoTargetLanguage: Boolean,
         val usageStats: FeatureUsageStats,
-        val defaultNarratorVoiceId: String
+        val defaultNarratorVoiceId: String,
+        val livePreloadChunks: Int
     )
 
     private data class InternalSettings(
@@ -340,6 +350,17 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
+    fun setLivePreloadChunks(chunks: Int) {
+        viewModelScope.launch {
+            settingsRepository.setLivePreloadChunks(
+                chunks.coerceIn(
+                    DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS,
+                    DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+                )
+            )
+        }
+    }
+
     fun setFreeTier(isFreeTier: Boolean) {
         viewModelScope.launch {
             settingsRepository.setFreeTier(isFreeTier)
@@ -378,11 +399,11 @@ class SettingsViewModel @Inject constructor(
                 role = ModelRole.LIVE_NARRATION,
                 catalog = catalog,
                 preferredOrder = listOf(
-                    "gemini-2.5-flash-native-audio-dialog",
-                    "gemini-3.8-live",
-                    "gemini-3-flash-live"
+                    "gemini-3.1-flash-live-preview",
+                    "gemini-2.5-flash-native-audio-latest",
+                    "gemini-3.8-live"
                 ),
-                fallback = "gemini-2.5-flash-native-audio-dialog",
+                fallback = "gemini-3.1-flash-live-preview",
                 prefixMatchFallback = "gemini-2.5-flash-native-audio"
             )
             val bestLiveTranslate = selectBestFreeTierModel(

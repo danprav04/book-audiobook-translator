@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.feature.settings
 
 import app.cash.turbine.test
 import io.github.danprav04.polyglotbooks.core.audio.VoicePreviewPlayer
+import io.github.danprav04.polyglotbooks.core.data.prefs.DataStoreSettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.prefs.FeatureUsageStats
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
@@ -52,6 +53,7 @@ class SettingsViewModelTest {
     private val duckLevelFlow = MutableStateFlow(0.15f)
     private val echoTargetLanguageFlow = MutableStateFlow(false)
     private val defaultNarratorVoiceIdFlow = MutableStateFlow("Charon")
+    private val livePreloadChunksFlow = MutableStateFlow(DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS)
     private val featureUsageStatsFlow = MutableStateFlow(FeatureUsageStats())
 
     @Before
@@ -66,6 +68,7 @@ class SettingsViewModelTest {
             coEvery { duckLevel } returns duckLevelFlow
             coEvery { echoTargetLanguage } returns echoTargetLanguageFlow
             coEvery { defaultNarratorVoiceId } returns defaultNarratorVoiceIdFlow
+            coEvery { livePreloadChunks } returns livePreloadChunksFlow
             coEvery { featureUsageStats } returns featureUsageStatsFlow
         }
 
@@ -110,6 +113,7 @@ class SettingsViewModelTest {
         assertEquals(1024L * 1024L * 1024L, state.cacheLimitBytes)
         assertFalse(state.echoTargetLanguage)
         assertEquals("Charon", state.defaultNarratorVoiceId)
+        assertEquals(DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS, state.livePreloadChunks)
         assertNull(state.playingPreviewVoiceId)
         assertNull(state.previewErrorMessage)
         assertEquals(DefaultModels.map, state.modelPerRole)
@@ -307,7 +311,7 @@ class SettingsViewModelTest {
         coVerify { settingsRepository.setFreeTier(true) }
         coVerify { settingsRepository.setModel(ModelRole.TEXT_TRANSLATION, "gemini-3.5-flash-lite") }
         coVerify { settingsRepository.setModel(ModelRole.TEXT_ANALYSIS, "gemini-3.5-flash-lite") }
-        coVerify { settingsRepository.setModel(ModelRole.LIVE_NARRATION, "gemini-2.5-flash-native-audio-dialog") }
+        coVerify { settingsRepository.setModel(ModelRole.LIVE_NARRATION, "gemini-3.1-flash-live-preview") }
         coVerify { settingsRepository.setModel(ModelRole.LIVE_TRANSLATE, "gemini-3.5-live-translate-preview") }
         assertEquals("Applied free-tier multi-model preset", viewModel.uiState.value.userMessage)
 
@@ -395,7 +399,8 @@ class SettingsViewModelTest {
         assertFalse(textModels.contains("gemini-2.0-flash"))
 
         val liveModels = viewModel.getRecommendedModelsForRole(ModelRole.LIVE_NARRATION)
-        assertTrue(liveModels.contains("gemini-2.5-flash-native-audio-dialog"))
+        assertTrue(liveModels.contains("gemini-3.1-flash-live-preview"))
+        assertTrue(liveModels.contains("gemini-2.5-flash-native-audio-latest"))
         assertTrue(liveModels.contains("gemini-custom-live-audio"))
     }
 
@@ -477,5 +482,28 @@ class SettingsViewModelTest {
         advanceUntilIdle()
         assertEquals(1, fakePreviewPlayer.stopCount)
         assertNull(viewModel.uiState.value.playingPreviewVoiceId)
+    }
+
+    @Test
+    fun testSetLivePreloadChunksClampsAndPersists() = runTest {
+        val viewModel = createViewModel()
+        advanceUntilIdle()
+        assertEquals(3, viewModel.uiState.value.livePreloadChunks)
+
+        viewModel.setLivePreloadChunks(0)
+        advanceUntilIdle()
+        coVerify { settingsRepository.setLivePreloadChunks(1) }
+
+        viewModel.setLivePreloadChunks(5)
+        advanceUntilIdle()
+        coVerify { settingsRepository.setLivePreloadChunks(5) }
+
+        viewModel.setLivePreloadChunks(20)
+        advanceUntilIdle()
+        coVerify { settingsRepository.setLivePreloadChunks(8) }
+
+        livePreloadChunksFlow.value = 6
+        advanceUntilIdle()
+        assertEquals(6, viewModel.uiState.value.livePreloadChunks)
     }
 }
