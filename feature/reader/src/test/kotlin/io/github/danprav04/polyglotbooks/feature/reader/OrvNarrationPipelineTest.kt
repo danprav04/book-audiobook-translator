@@ -152,7 +152,7 @@ class OrvNarrationPipelineTest {
     // =========================================================================
 
     @Test
-    fun `omitted turnComplete finalizes via generationComplete and reuses single WebSocket across 6 ORV paragraphs`() = runTest {
+    fun `omitted turnComplete finalizes via generationComplete and rotates cleanly per generationComplete-only turn`() = runTest {
         val tempDir = Files.createTempDirectory("orv-omitted-turn-complete").toFile()
         try {
             val sixParagraphs = chapter1Paragraphs()
@@ -175,10 +175,6 @@ class OrvNarrationPipelineTest {
                 val sentText = extractPromptText(conn.decodeClientMessage(rawJson))
                 val b64 = Base64.getEncoder().encodeToString(turnPcms[turnIndex])
 
-                if (turnIndex == 1) {
-                    // Delayed stray turnComplete from turn 0 arriving right as turn 1 starts.
-                    conn.sendServerJson("""{"serverContent":{"turnComplete":true}}""")
-                }
                 conn.sendServerJson(
                     """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$b64"}}]},"outputTranscription":{"text":${jsonEscape(sentText)},"finished":true},"generationComplete":true}}"""
                 )
@@ -209,7 +205,7 @@ class OrvNarrationPipelineTest {
                 runCurrent()
                 advanceUntilIdle()
 
-                assertEquals("Must reuse a single WebSocket across all 6 turns", 1, server.connections.size)
+                assertEquals("Must rotate cleanly per generationComplete-only turn to avoid server barge-in", 6, server.connections.size)
                 assertEquals(6, server.clientContentMessages.size)
                 assertEquals(0, fallbackEngine.requests.size)
                 assertNull(manager.sessionState.value.statusMessage)
@@ -390,9 +386,13 @@ class OrvNarrationPipelineTest {
             )
 
             subCases.forEachIndexed { idx, mode ->
+                val soleLiveModel = io.github.danprav04.polyglotbooks.core.model.DefaultModels.get(
+                    io.github.danprav04.polyglotbooks.core.model.ModelRole.LIVE_NARRATION
+                )
                 val tracker = GeminiQuotaTracker().apply {
-                    recordHttpError("gemini-2.5-flash-native-audio-dialog", 404, "not found")
-                    recordHttpError("gemini-3-flash-live", 404, "not found")
+                    liveAudioCandidatePool(soleLiveModel)
+                        .filter { it != soleLiveModel }
+                        .forEach { recordHttpError(it, 404, "not found") }
                 }
                 val cleanPcm = generateSineWavePcm(
                     totalFrames = 14_400,
@@ -470,9 +470,12 @@ class OrvNarrationPipelineTest {
                     advanceUntilIdle()
 
                     assertEquals("[$mode] must retry once on fresh Live session", 2, server.connections.size)
+                    val soleLiveModelExpected = io.github.danprav04.polyglotbooks.core.model.DefaultModels.get(
+                        io.github.danprav04.polyglotbooks.core.model.ModelRole.LIVE_NARRATION
+                    )
                     assertTrue(
-                        "[$mode] must use sole Live model gemini-3.8-live on both attempts",
-                        server.setupMessages.all { it.setup.model.endsWith("gemini-3.8-live") }
+                        "[$mode] must use sole Live model $soleLiveModelExpected on both attempts",
+                        server.setupMessages.all { it.setup.model.endsWith(soleLiveModelExpected) }
                     )
                     assertEquals("[$mode] must NEVER fall back to device TTS", 0, fallbackEngine.requests.size)
                     assertNull("[$mode] statusMessage must remain null", manager.sessionState.value.statusMessage)
@@ -494,9 +497,13 @@ class OrvNarrationPipelineTest {
             val allowP2Live = CompletableDeferred<Unit>()
             var statusWhileFallbackActive: String? = null
 
+            val soleLiveModel4b = io.github.danprav04.polyglotbooks.core.model.DefaultModels.get(
+                io.github.danprav04.polyglotbooks.core.model.ModelRole.LIVE_NARRATION
+            )
             val tracker4b = GeminiQuotaTracker().apply {
-                recordHttpError("gemini-2.5-flash-native-audio-dialog", 404, "not found")
-                recordHttpError("gemini-3-flash-live", 404, "not found")
+                liveAudioCandidatePool(soleLiveModel4b)
+                    .filter { it != soleLiveModel4b }
+                    .forEach { recordHttpError(it, 404, "not found") }
             }
 
             val outageServer = FakeWireGeminiLiveServer(this) { conn, testScope, rawJson ->
@@ -1213,6 +1220,8 @@ class OrvNarrationPipelineTest {
             .flatMap { it.parts }
             .mapNotNull { it.text }
             .joinToString("\n")
+            .removePrefix("<read>")
+            .removeSuffix("</read>")
 
     // =========================================================================
     // PCM waveform synthesis & inspection helpers

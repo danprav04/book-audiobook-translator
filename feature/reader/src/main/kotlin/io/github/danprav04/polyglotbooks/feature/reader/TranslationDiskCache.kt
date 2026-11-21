@@ -118,6 +118,20 @@ class TranslationDiskCache(
         }
     }
 
+    fun hasAudioSegment(
+        engineTag: String,
+        voiceId: String,
+        style: String?,
+        text: String
+    ): Boolean {
+        if (text.isBlank()) return false
+        synchronized(lock) {
+            val key = audioCacheKey(engineTag, voiceId, style, text)
+            val file = File(audioDir, "$key.pcm")
+            return file.exists() && file.isFile && file.length() > 8L
+        }
+    }
+
     fun loadAudioSegment(
         engineTag: String,
         voiceId: String,

@@ -61,6 +61,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicInteger
 import io.github.danprav04.polyglotbooks.feature.narration.NarrationEngine as FeatureNarrationEngine
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -1924,7 +1925,7 @@ class ReaderNarrationSessionManagerTest {
             assertTrue(session.systemInstruction.contains("Lockdown traps Alice in the lower corridor."))
             assertFalse(session.systemInstruction.contains("Later chapter spoiler."))
             assertTrue(session.systemInstruction.contains("quiet, urgent command"))
-            assertEquals(allTexts, session.prompts)
+            assertEquals(allTexts.map { "<read>$it</read>" }, session.prompts)
         } finally {
             tempDir.deleteRecursively()
         }
@@ -2487,6 +2488,250 @@ class ReaderNarrationSessionManagerTest {
             assertFalse(quotaTracker.isTtsQuotaLikelyExhausted())
             assertEquals("Non-quota error must latch sessionEngineFailedTts on first failure", 1, ttsCallCount)
             assertEquals(2, systemCallCount)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `gemini live preloads configured livePreloadChunks before first player write and caches under V5 for pause-resume`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-preload-setting").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+                setDefaultNarratorVoiceId("Zephyr")
+                setLivePreloadChunks(2)
+            }
+            val texts = listOf(
+                "Zero paragraph preloaded.",
+                "First paragraph preloaded.",
+                "Second paragraph synthesized later.",
+                "Third paragraph synthesized last."
+            )
+            val gateFor2 = CompletableDeferred<Unit>()
+            val synthesized = mutableListOf<String>()
+            var playerWritesWhen2Reached = -1
+
+            val pcmForText: (String) -> ByteArray = { text ->
+                val tag = texts.indexOf(text).coerceAtLeast(0) + 11
+                ByteArray(2_400) { tag.toByte() }
+            }
+
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession = object : LiveSession {
+                    private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 32)
+                    override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                    private var connected = false
+                    override val isConnected: Boolean get() = connected
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        connected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        val clientMsg = message as? LiveClientMessage.ClientContentMessage ?: return
+                        val promptText = clientMsg.clientContent.turns.orEmpty()
+                            .flatMap { it.parts }
+                            .mapNotNull { it.text }
+                            .joinToString("\n")
+                        val matched = texts.first { promptText.contains(it) }
+                        if (matched == texts[2]) {
+                            gateFor2.await()
+                        }
+                        synthesized += matched
+                        val b64 = Base64.getEncoder().encodeToString(pcmForText(matched))
+                        _incoming.emit(
+                            LiveServerMessage.ServerContentMessage(
+                                ServerContentData(
+                                    modelTurn = ModelTurn(
+                                        parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", b64)))
+                                    ),
+                                    outputTranscription = TranscriptionData(matched),
+                                    turnComplete = true
+                                )
+                            )
+                        )
+                    }
+
+                    override suspend fun disconnect() {
+                        connected = false
+                    }
+                }
+            }
+
+            lateinit var player: RecordingPcmPlayer
+            player = RecordingPcmPlayer(onWrite = { _ -> })
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("preload-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = diskCache
+                playerFactory = { player }
+            }
+            runCurrent()
+            assertEquals(2, manager.sessionState.value.livePreloadChunks)
+
+            manager.startOrResume(
+                bookId = "book-preload-test",
+                bookTitle = "Preload Test",
+                paragraphs = texts.mapIndexed { idx, txt ->
+                    ReaderParagraph(idx, "p$idx", txt, "epubcfi(/6/2!/4/2/${idx + 1}:0)")
+                }
+            )
+            runCurrent()
+
+            // First 2 chunks are synthesized and cached BEFORE chunk 2 completes; player starts playing chunks 0..1 while chunk 2 waits.
+            assertEquals(listOf(texts[0], texts[1]), synthesized)
+            playerWritesWhen2Reached = player.writtenChunks.size
+            assertEquals(2, playerWritesWhen2Reached)
+
+            // Pause before chunks 2..3 finish; verify chunks 0..1 are cached under GEMINI_LIVE_V5 on disk.
+            manager.pause()
+            runCurrent()
+            assertNotNull(diskCache.loadAudioSegment("GEMINI_LIVE_V5", "Zephyr", null, texts[0]))
+            assertNotNull(diskCache.loadAudioSegment("GEMINI_LIVE_V5", "Zephyr", null, texts[1]))
+
+            // Stop session and re-start from paragraph 0 after releasing gateFor2: chunks 0 & 1 come from disk cache (0 new synthesis calls!).
+            manager.stop()
+            runCurrent()
+            gateFor2.complete(Unit)
+            synthesized.clear()
+            player.writtenChunks.clear()
+            manager.startOrResume(
+                bookId = "book-preload-test",
+                bookTitle = "Preload Test",
+                paragraphs = texts.mapIndexed { idx, txt ->
+                    ReaderParagraph(idx, "p$idx", txt, "epubcfi(/6/2!/4/2/${idx + 1}:0)")
+                },
+                activeParagraphIndex = 0
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertEquals("Only uncached chunks 2 and 3 should synthesize on resume", listOf(texts[2], texts[3]), synthesized)
+            assertEquals(4, player.writtenChunks.size)
+            texts.forEachIndexed { idx, txt ->
+                assertTrue("Chunk $idx must play in exact order", player.writtenChunks[idx].data.contentEquals(pcmForText(txt)))
+            }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `gemini live completion resets active session so subsequent startOrResume from paragraph 0 replays full chapter from cache`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-replay-completion").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val texts = listOf("First line.", "Second line.", "Third line.")
+            fun pcmForText(text: String): ByteArray {
+                val tag = (texts.indexOf(text).coerceAtLeast(0) + 11).toByte()
+                return ByteArray(960) { tag }
+            }
+
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+                setDefaultNarratorVoiceId("Zephyr")
+                setLivePreloadChunks(2)
+            }
+            val synthCount = AtomicInteger(0)
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession = object : LiveSession {
+                    private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
+                    override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                    private var connected = false
+                    override val isConnected: Boolean get() = connected
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        connected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        val clientMsg = message as? LiveClientMessage.ClientContentMessage ?: return
+                        val promptText = clientMsg.clientContent.turns.orEmpty()
+                            .flatMap { it.parts }
+                            .mapNotNull { it.text }
+                            .joinToString("\n")
+                        val matched = texts.first { promptText.contains(it) }
+                        synthCount.incrementAndGet()
+                        val b64 = Base64.getEncoder().encodeToString(pcmForText(matched))
+                        _incoming.emit(
+                            LiveServerMessage.ServerContentMessage(
+                                ServerContentData(
+                                    modelTurn = ModelTurn(
+                                        parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", b64)))
+                                    ),
+                                    outputTranscription = TranscriptionData(matched),
+                                    turnComplete = true
+                                )
+                            )
+                        )
+                    }
+
+                    override suspend fun disconnect() {
+                        connected = false
+                    }
+                }
+            }
+
+            val player = RecordingPcmPlayer(onWrite = { _ -> })
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("replay-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = diskCache
+                playerFactory = { player }
+            }
+            runCurrent()
+
+            val paragraphs = texts.mapIndexed { idx, txt ->
+                ReaderParagraph(idx, "p$idx", txt, "epubcfi(/6/2!/4/2/${idx + 1}:0)")
+            }
+            manager.startOrResume(
+                bookId = "book-replay-complete",
+                bookTitle = "Replay Book",
+                paragraphs = paragraphs,
+                activeParagraphIndex = 0
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertFalse(manager.sessionState.value.isPlaying)
+            assertFalse(manager.sessionState.value.isActiveSession)
+            assertNull(manager.sessionState.value.highlightedCfi)
+            assertEquals(3, player.writtenChunks.size)
+            assertEquals(3, synthCount.get())
+
+            player.writtenChunks.clear()
+            manager.startOrResume(
+                bookId = "book-replay-complete",
+                bookTitle = "Replay Book",
+                paragraphs = paragraphs,
+                activeParagraphIndex = 0
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertFalse(manager.sessionState.value.isPlaying)
+            assertFalse(manager.sessionState.value.isActiveSession)
+            assertEquals("Replaying from paragraph 0 must synthesize 0 new chunks", 3, synthCount.get())
+            assertEquals("All 3 paragraphs must replay from index 0", 3, player.writtenChunks.size)
+            texts.forEachIndexed { idx, txt ->
+                assertTrue(player.writtenChunks[idx].data.contentEquals(pcmForText(txt)))
+            }
         } finally {
             tempDir.deleteRecursively()
         }

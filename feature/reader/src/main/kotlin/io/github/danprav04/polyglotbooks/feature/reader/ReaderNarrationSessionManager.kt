@@ -15,6 +15,7 @@ import io.github.danprav04.polyglotbooks.core.data.db.CharacterEntity
 import io.github.danprav04.polyglotbooks.core.data.db.NarrationDao
 import io.github.danprav04.polyglotbooks.core.data.db.NarrationLineEntity
 import io.github.danprav04.polyglotbooks.core.data.db.PlaybackStateDao
+import io.github.danprav04.polyglotbooks.core.data.prefs.DataStoreSettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.prefs.SettingsRepository
 import io.github.danprav04.polyglotbooks.core.data.security.SecureKeyStore
 import io.github.danprav04.polyglotbooks.core.gemini.GeminiQuotaTracker
@@ -125,6 +126,7 @@ data class ReaderNarrationSessionState(
     val isBilingualEnabled: Boolean = false,
     val narrationEngine: NarrationEngine = NarrationEngine.GEMINI_FLASH_TTS,
     val defaultNarratorVoiceId: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID,
+    val livePreloadChunks: Int = DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS,
     val narrateTranslatedText: Boolean = false,
     val targetLanguage: LanguageCode = LanguageCode.SPANISH,
     val playbackSpeed: Float = 1.0f,
@@ -413,6 +415,17 @@ class ReaderNarrationSessionManager @Inject constructor(
                     }
                 }
             }
+            launch {
+                repo.livePreloadChunks.collect { chunks ->
+                    val clamped = chunks.coerceIn(
+                        DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS,
+                        DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+                    )
+                    if (_sessionState.value.livePreloadChunks != clamped) {
+                        _sessionState.update { it.copy(livePreloadChunks = clamped) }
+                    }
+                }
+            }
         }
     }
 
@@ -633,7 +646,8 @@ class ReaderNarrationSessionManager @Inject constructor(
         _sessionState.update {
             it.copy(
                 isPlaying = false,
-                isBuffering = false
+                isBuffering = false,
+                statusMessage = if (it.statusMessage?.startsWith("Preparing audio") == true) null else it.statusMessage
             )
         }
         pushExternalState()
@@ -712,6 +726,20 @@ class ReaderNarrationSessionManager @Inject constructor(
         }
         if (prev != engine && _sessionState.value.isPlaying) {
             startNarrationFromCurrent()
+        }
+    }
+
+    fun setLivePreloadChunks(chunks: Int) {
+        val clamped = chunks.coerceIn(
+            DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS,
+            DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+        )
+        _sessionState.update { it.copy(livePreloadChunks = clamped) }
+        applicationScope.launch(NonCancellable) {
+            try {
+                settingsRepository?.setLivePreloadChunks(clamped)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -1787,8 +1815,279 @@ class ReaderNarrationSessionManager @Inject constructor(
                                 }
                             }
                         }
+                    } else if (engineChoice == NarrationEngine.GEMINI_LIVE) {
+                        // Decoupled cache-first Live pipeline:
+                        // 1) ChapterAudioPreloader synthesizes & atomically caches verified Live audio
+                        //    to TranslationDiskCache (preloading initial `livePreloadChunks`, then rolling ahead).
+                        // 2) Ordered Cache-Backed Player consumes completed segments strictly in order.
+                        kotlinx.coroutines.coroutineScope {
+                            val preloader = ChapterAudioPreloader(
+                                chunks = chunks,
+                                initialPreloadChunks = _sessionState.value.livePreloadChunks,
+                                cacheTagForChunk = { chunk ->
+                                    val langSuffix = chunk.languageCode?.takeIf { it.isNotBlank() }?.let { "_$it" }.orEmpty()
+                                    "$GEMINI_LIVE_CACHE_TAG_PREFIX$langSuffix"
+                                },
+                                diskCache = diskCache,
+                                maxCacheBytes = maxCacheBytes,
+                                isCurrentGeneration = { isCurrentGen() },
+                                onCacheHit = { _, _ -> clearFallbackStatusIfLiveRecovered(myGeneration) },
+                                synthesizeUncached = { chunkIdx, chunk ->
+                                    val resolved = PunctuationDialogueHelper.resolve(chunk.text, chunk.style)
+                                    when (resolved.kind) {
+                                        PunctuationDialogueHelper.PunctuationKind.EMPTY -> {
+                                            PreloadedAudioSegment(
+                                                chunkIndex = chunkIdx,
+                                                chunk = chunk,
+                                                pcmBytes = ByteArray(0),
+                                                sampleRate = 24_000,
+                                                channels = 1,
+                                                fromCache = false,
+                                                usedLiveEngine = false,
+                                                usedFallback = false
+                                            )
+                                        }
+                                        PunctuationDialogueHelper.PunctuationKind.SILENT_DIVIDER -> {
+                                            PreloadedAudioSegment(
+                                                chunkIndex = chunkIdx,
+                                                chunk = chunk,
+                                                pcmBytes = ByteArray(4_800),
+                                                sampleRate = 24_000,
+                                                channels = 1,
+                                                fromCache = false,
+                                                usedLiveEngine = false,
+                                                usedFallback = false
+                                            )
+                                        }
+                                        else -> {
+                                            val req = toSynthesisRequest(chunk)
+                                            val pcmBuf = ByteArrayOutputStream()
+                                            var sr = 24_000
+                                            var ch = 1
+                                            var emitted = false
+                                            val thisTurnFallback = AtomicBoolean(false)
+                                            activeTurnFallbackFlag.set(thisTurnFallback)
+                                            try {
+                                                val session = ensureLiveSession(trackedFallback)
+                                                session.synthesizeTurnStreaming(req).collect { pcm ->
+                                                    if (pcm.data.isNotEmpty()) {
+                                                        emitted = true
+                                                        sr = pcm.sampleRate
+                                                        ch = pcm.channels
+                                                        pcmBuf.write(pcm.data)
+                                                    }
+                                                }
+                                                if (!emitted) {
+                                                    thisTurnFallback.set(true)
+                                                    trackedFallback.synthesize(req).collect { pcm ->
+                                                        if (pcm.data.isNotEmpty()) {
+                                                            emitted = true
+                                                            sr = pcm.sampleRate
+                                                            ch = pcm.channels
+                                                            pcmBuf.write(pcm.data)
+                                                        }
+                                                    }
+                                                }
+                                            } catch (ce: CancellationException) {
+                                                throw ce
+                                            } catch (e: Exception) {
+                                                DiagnosticLogBuffer.record(
+                                                    tag = "ReaderSession",
+                                                    message = "Live preload turn failed at para=${chunk.leadIndex}; recovering via fallback",
+                                                    level = "WARN",
+                                                    throwable = e
+                                                )
+                                                val stale = streamingLiveSession
+                                                streamingLiveSession = null
+                                                try {
+                                                    withContext(NonCancellable) { stale?.close() }
+                                                } catch (_: Throwable) {
+                                                }
+                                                if (!emitted) {
+                                                    thisTurnFallback.set(true)
+                                                    trackedFallback.synthesize(req).collect { pcm ->
+                                                        if (pcm.data.isNotEmpty()) {
+                                                            emitted = true
+                                                            sr = pcm.sampleRate
+                                                            ch = pcm.channels
+                                                            pcmBuf.write(pcm.data)
+                                                        }
+                                                    }
+                                                }
+                                            } finally {
+                                                activeTurnFallbackFlag.compareAndSet(thisTurnFallback, null)
+                                            }
+
+                                            val bytes = pcmBuf.toByteArray()
+                                            val usedLive = emitted && !thisTurnFallback.get() && bytes.isNotEmpty()
+                                            if (usedLive) {
+                                                clearFallbackStatusIfLiveRecovered(myGeneration)
+                                                recordAudioUsage(isLive = true, byteCount = bytes.size, sampleRate = sr, channels = ch)
+                                            }
+                                            PreloadedAudioSegment(
+                                                chunkIndex = chunkIdx,
+                                                chunk = chunk,
+                                                pcmBytes = bytes,
+                                                sampleRate = sr,
+                                                channels = ch,
+                                                fromCache = false,
+                                                usedLiveEngine = usedLive,
+                                                usedFallback = thisTurnFallback.get()
+                                            )
+                                        }
+                                    }
+                                }
+                            )
+
+                            try {
+                                preloader.start(this, ioDispatcher)
+
+                                // Phase 1: Cache initial buffer chunks before beginning ordered playback.
+                                val targetCount = preloader.initialTargetCount
+                                val needsInitialPreload = !preloader.areInitialChunksCachedOnDisk()
+                                if (needsInitialPreload && targetCount > 0 && isCurrentGen()) {
+                                    _sessionState.update { state ->
+                                        if (playbackGenerationId.get() != myGeneration) state
+                                        else state.copy(
+                                            isBuffering = true,
+                                            statusMessage = if (state.statusMessage == null || state.statusMessage.startsWith("Preparing audio")) {
+                                                "Preparing audio (0/$targetCount)..."
+                                            } else {
+                                                state.statusMessage
+                                            }
+                                        )
+                                    }
+                                    pushExternalState()
+                                }
+                                preloader.awaitInitialPreload { ready, target ->
+                                    if (needsInitialPreload && ready < target && isCurrentGen()) {
+                                        _sessionState.update { state ->
+                                            if (playbackGenerationId.get() != myGeneration) state
+                                            else if (state.statusMessage == null || state.statusMessage.startsWith("Preparing audio")) {
+                                                state.copy(statusMessage = "Preparing audio ($ready/$target)...")
+                                            } else {
+                                                state
+                                            }
+                                        }
+                                    }
+                                }
+                                if (!isCurrentGen()) return@coroutineScope
+                                if (needsInitialPreload) {
+                                    _sessionState.update { state ->
+                                        if (playbackGenerationId.get() != myGeneration) state
+                                        else if (state.statusMessage?.startsWith("Preparing audio") == true) {
+                                            state.copy(statusMessage = null)
+                                        } else {
+                                            state
+                                        }
+                                    }
+                                }
+
+                                // Phase 2: Ordered cache-backed player consumes completed segments strictly in order.
+                                for (chunkIdx in chunks.indices) {
+                                    if (!isCurrentGen()) break
+                                    val chunk = chunks[chunkIdx]
+                                    if (!preloader.isSegmentReady(chunkIdx) && (!activeTracksFrames || player.bufferedMs <= 0L)) {
+                                        if (awaitingNextAudioSinceMs == 0L) {
+                                            awaitingNextAudioSinceMs = clock()
+                                        }
+                                        _sessionState.update {
+                                            if (playbackGenerationId.get() != myGeneration) it
+                                            else it.copy(isBuffering = true)
+                                        }
+                                        pushExternalState()
+                                    }
+
+                                    val segment = preloader.awaitSegment(chunkIdx) ?: break
+                                    if (!isCurrentGen()) break
+                                    if (segment.pcmBytes.isEmpty()) continue
+
+                                    lastWrittenCfiForChapter = chunk.allCfis.lastOrNull() ?: chunk.leadCfi
+                                    val timings = _sessionState.value.paragraphTimings
+                                    val timing = timings.firstOrNull { it.paragraphIndex == chunk.leadIndex }
+                                    val startChapterMs = timing?.startMs ?: _sessionState.value.chapterPositionMs
+                                    val estMs = timing?.durationMs ?: 1_200L
+                                    val startPosMs = (player as? AudioTrackPcmPlayer)?.refreshPosition()
+                                        ?: player.currentPositionMs.value
+
+                                    if (!activeTracksFrames) {
+                                        _sessionState.update {
+                                            if (playbackGenerationId.get() != myGeneration) it
+                                            else it.copy(
+                                                activeParagraphIndex = chunk.leadIndex,
+                                                highlightedCfi = chunk.leadCfi,
+                                                chapterPositionMs = startChapterMs,
+                                                bookPositionMs = computeChapterStartInBookMs(it) + startChapterMs,
+                                                isBuffering = false
+                                            )
+                                        }
+                                        pushExternalState()
+                                        persistCurrentProgress(_sessionState.value.bookId, chunk.leadCfi)
+                                        activeChunkContext = ActiveChunkTickerContext(
+                                            chunk = chunk,
+                                            player = player,
+                                            playerStartPosMs = startPosMs,
+                                            chapterStartMs = startChapterMs,
+                                            chunkEstimatedMs = estMs,
+                                            chapterIndex = chapterIdx,
+                                            chapterStartInBookMs = computeChapterStartInBookMs(_sessionState.value)
+                                        )
+                                    } else if (_sessionState.value.isBuffering) {
+                                        _sessionState.update {
+                                            if (playbackGenerationId.get() != myGeneration) it
+                                            else it.copy(isBuffering = false)
+                                        }
+                                        pushExternalState()
+                                    }
+
+                                    val reconfigured = configureFormatIfNeeded(segment.sampleRate, segment.channels)
+                                    if (reconfigured) {
+                                        activeChunkContext = activeChunkContext?.copy(playerStartPosMs = 0L)
+                                    }
+                                    val baseFrame = player.totalFramesWritten
+                                    val bytesPerFrame = (segment.channels.coerceAtLeast(1) * 2).coerceAtLeast(2)
+                                    val segmentFrames = (segment.pcmBytes.size / bytesPerFrame).toLong()
+                                    val span = SegmentFrameSpan(
+                                        chapterIndex = chapterIdx,
+                                        paragraphIndex = chunk.leadIndex,
+                                        cfi = chunk.leadCfi,
+                                        startFrame = baseFrame,
+                                        endFrame = baseFrame + segmentFrames,
+                                        sampleRate = segment.sampleRate.takeIf { it > 0 } ?: configuredSampleRate,
+                                        chapterStartMs = startChapterMs,
+                                        estimatedDurationMs = estMs
+                                    )
+                                    timelineSpans.add(span)
+                                    applyMeasuredDurationToSpans(chapterIdx, listOf(span))
+
+                                    awaitingNextAudioSinceMs = 0L
+                                    if (player.supportsFrameTracking) {
+                                        activeTracksFrames = true
+                                    }
+                                    player.write(PcmChunk(segment.pcmBytes, segment.sampleRate, segment.channels))
+                                    player.onUtteranceEnd()
+                                    if (player.supportsFrameTracking || player.totalFramesWritten > 0L || player.playbackHeadPositionFrames() > 0L) {
+                                        activeTracksFrames = true
+                                    }
+                                    if (!activeTracksFrames && segment.sampleRate > 0 && segment.channels > 0) {
+                                        val measuredMs = (segment.pcmBytes.size.toLong() * 1000L) / (segment.sampleRate * segment.channels * 2L)
+                                        if (measuredMs > 0L) {
+                                            applyMeasuredDurationToChunk(chunk, measuredMs)
+                                        }
+                                    }
+                                    awaitingNextAudioSinceMs = if (chunkIdx < chunks.lastIndex && !preloader.isSegmentReady(chunkIdx + 1)) {
+                                        clock()
+                                    } else {
+                                        0L
+                                    }
+                                }
+                            } finally {
+                                awaitingNextAudioSinceMs = 0L
+                                preloader.close()
+                            }
+                        }
                     } else {
-                        // Producer-consumer multi-turn streaming pipeline (GEMINI_LIVE & SYSTEM_TTS, up to 4-turn lookahead).
+                        // Producer-consumer streaming pipeline for SYSTEM_TTS.
                         kotlinx.coroutines.coroutineScope {
                             val events = Channel<LiveStreamEvent>(Channel.UNLIMITED)
                             val turnCredits = Semaphore(permits = 5)
@@ -1800,90 +2099,10 @@ class ReaderNarrationSessionManager @Inject constructor(
                                         val chunk = chunks[chunkIdx]
                                         events.send(LiveStreamEvent.BeginTurn(chunkIdx, chunk))
 
-                                        val langSuffix = chunk.languageCode?.takeIf { it.isNotBlank() }?.let { "_$it" }.orEmpty()
                                         val req = toSynthesisRequest(chunk)
-                                        if (engineChoice == NarrationEngine.SYSTEM_TTS) {
-                                            systemFallback.synthesize(req).collect { pcm ->
-                                                if (pcm.data.isNotEmpty()) {
-                                                    events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
-                                                }
-                                            }
-                                        } else {
-                                            val liveTag = "$GEMINI_LIVE_CACHE_TAG_PREFIX$langSuffix"
-                                            val cached = diskCache?.loadAudioSegment(liveTag, chunk.voiceId, chunk.style, chunk.text)
-                                            if (cached != null) {
-                                                clearFallbackStatusIfLiveRecovered(myGeneration)
-                                                events.send(
-                                                    LiveStreamEvent.AudioChunk(
-                                                        chunkIdx,
-                                                        PcmChunk(cached.pcmBytes, cached.sampleRate, cached.channels)
-                                                    )
-                                                )
-                                            } else {
-                                                val pcmBuf = ByteArrayOutputStream()
-                                                var sr = 24000
-                                                var ch = 1
-                                                var emitted = false
-                                                val thisTurnFallback = AtomicBoolean(false)
-                                                activeTurnFallbackFlag.set(thisTurnFallback)
-                                                try {
-                                                    val session = ensureLiveSession(trackedFallback)
-                                                    session.synthesizeTurnStreaming(req).collect { pcm ->
-                                                        if (pcm.data.isNotEmpty()) {
-                                                            emitted = true
-                                                            sr = pcm.sampleRate
-                                                            ch = pcm.channels
-                                                            if (!thisTurnFallback.get()) {
-                                                                pcmBuf.write(pcm.data)
-                                                            }
-                                                            events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
-                                                        }
-                                                    }
-                                                    if (emitted && !thisTurnFallback.get()) {
-                                                        clearFallbackStatusIfLiveRecovered(myGeneration)
-                                                        val bytes = pcmBuf.toByteArray()
-                                                        recordAudioUsage(isLive = true, byteCount = bytes.size, sampleRate = sr, channels = ch)
-                                                        if (diskCache != null) {
-                                                            this@coroutineScope.launch(ioDispatcher) {
-                                                                diskCache.saveAudioSegment(
-                                                                    engineTag = liveTag,
-                                                                    voiceId = chunk.voiceId,
-                                                                    style = chunk.style,
-                                                                    text = chunk.text,
-                                                                    sampleRate = sr,
-                                                                    channels = ch,
-                                                                    pcmBytes = bytes,
-                                                                    maxBytes = maxCacheBytes
-                                                                )
-                                                            }
-                                                        }
-                                                    }
-                                                } catch (ce: CancellationException) {
-                                                    throw ce
-                                                } catch (e: Exception) {
-                                                    DiagnosticLogBuffer.record(
-                                                        tag = "ReaderSession",
-                                                        message = "Live streaming turn failed at para=${chunk.leadIndex}; recovering via fallback",
-                                                        level = "WARN",
-                                                        throwable = e
-                                                    )
-                                                    val stale = streamingLiveSession
-                                                    streamingLiveSession = null
-                                                    try {
-                                                        withContext(NonCancellable) { stale?.close() }
-                                                    } catch (_: Throwable) {
-                                                    }
-                                                    if (!emitted) {
-                                                        trackedFallback.synthesize(req).collect { pcm ->
-                                                            if (pcm.data.isNotEmpty()) {
-                                                                emitted = true
-                                                                events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
-                                                            }
-                                                        }
-                                                    }
-                                                } finally {
-                                                    activeTurnFallbackFlag.compareAndSet(thisTurnFallback, null)
-                                                }
+                                        systemFallback.synthesize(req).collect { pcm ->
+                                            if (pcm.data.isNotEmpty()) {
+                                                events.send(LiveStreamEvent.AudioChunk(chunkIdx, pcm))
                                             }
                                         }
                                         events.send(LiveStreamEvent.EndTurn(chunkIdx, chunk))
@@ -2086,8 +2305,11 @@ class ReaderNarrationSessionManager @Inject constructor(
                         _sessionState.update {
                             if (playbackGenerationId.get() != myGeneration) it
                             else it.copy(
+                                isActiveSession = false,
                                 isPlaying = false,
                                 isBuffering = false,
+                                activeParagraphIndex = it.paragraphs.lastIndex.coerceAtLeast(0),
+                                highlightedCfi = null,
                                 chapterPositionMs = it.chapterDurationMs,
                                 bookPositionMs = it.bookDurationMs,
                                 errorMessage = null
@@ -3875,7 +4097,7 @@ class ReaderNarrationSessionManager @Inject constructor(
 
     companion object {
         internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V4"
-        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V4"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V5"
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =
