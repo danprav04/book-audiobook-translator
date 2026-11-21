@@ -11,8 +11,10 @@ import io.mockk.verify
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.WebSocket
@@ -567,5 +569,122 @@ class OkHttpLiveSessionTest {
             assertTrue(e.message.orEmpty().contains("code=1011"))
         }
         session.disconnect()
+    }
+
+    @Test
+    fun testServerOnClosing1000AfterSetupCompleteSignalsFailureFailFast() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val sockets = mutableListOf<WebSocket>()
+        val listeners = mutableListOf<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), any()) } answers {
+            val ws = mockk<WebSocket>(relaxed = true)
+            sockets.add(ws)
+            listeners.add(secondArg())
+            ws
+        }
+
+        val session = OkHttpLiveSession(mockClient, maxReconnectAttempts = 2)
+        session.connect(
+            "fake-key",
+            SetupConfig(model = "models/gemini-3.8-live", sessionResumption = SessionResumptionConfig())
+        )
+        listeners[0].onOpen(sockets[0], mockk(relaxed = true))
+        listeners[0].onMessage(sockets[0], """{"setupComplete":{}}""")
+        assertTrue(session.isSetupComplete)
+
+        listeners[0].onClosing(sockets[0], 1000, "Server closed normally")
+        assertEquals(1, listeners.size)
+        assertFalse(session.isConnected)
+
+        try {
+            session.incomingMessages.first { false }
+            fail("Expected IOException when server initiates close 1000")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("code=1000"))
+        }
+    }
+
+    @Test
+    fun testServerOnClosed1000WithoutPriorOnClosingSignalsFailure() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(mockClient)
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val listener = listenerSlot.captured
+        listener.onOpen(mockWebSocket, mockk(relaxed = true))
+        listener.onMessage(mockWebSocket, """{"setupComplete":{}}""")
+
+        listener.onClosed(mockWebSocket, 1000, "EOF")
+        assertFalse(session.isConnected)
+
+        try {
+            session.incomingMessages.first { false }
+            fail("Expected IOException when onClosed fires without prior onClosing")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("code=1000"))
+        }
+    }
+
+    @Test
+    fun testManualDisconnectFollowedByOnClosingAndOnClosedDoesNotEmitFailure() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(mockClient)
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val listener = listenerSlot.captured
+        listener.onOpen(mockWebSocket, mockk(relaxed = true))
+        listener.onMessage(mockWebSocket, """{"setupComplete":{}}""")
+
+        session.disconnect()
+        listener.onClosing(mockWebSocket, 1000, "Client disconnect")
+        listener.onClosed(mockWebSocket, 1000, "Client disconnect")
+
+        val failureOrTimeout = withTimeoutOrNull(100L) {
+            session.incomingMessages.first { false }
+        }
+        assertEquals(null, failureOrTimeout)
+    }
+
+    @Test
+    fun testTimedOutConnectCausesSendToFailFastWithoutDoubleWaiting() = runTest {
+        val mockClient = mockk<OkHttpClient>()
+        val mockWebSocket = mockk<WebSocket>(relaxed = true)
+        val listenerSlot = slot<WebSocketListener>()
+
+        every { mockClient.newWebSocket(any<Request>(), capture(listenerSlot)) } returns mockWebSocket
+
+        val session = OkHttpLiveSession(
+            okHttpClient = mockClient,
+            connectTimeoutMs = 50L,
+            awaitSetupCompleteBeforeSend = true
+        )
+        session.connect("fake-key", SetupConfig(model = "models/gemini-3.8-live"))
+        val afterConnectMs = currentTime
+        assertTrue(afterConnectMs >= 50L)
+
+        try {
+            session.send(
+                LiveClientMessage.ClientContentMessage(
+                    ClientContentData(
+                        turns = listOf(ContentTurn(role = "user", parts = listOf(Part(text = "Hello")))),
+                        turnComplete = true
+                    )
+                )
+            )
+            fail("Expected send() to fail fast after connect timeout")
+        } catch (e: IOException) {
+            assertTrue(e.message.orEmpty().contains("Timed out connecting"))
+            assertEquals("send() must fail immediately without a second timeout wait", afterConnectMs, currentTime)
+        }
+        verify { mockWebSocket.close(1000, any()) }
     }
 }

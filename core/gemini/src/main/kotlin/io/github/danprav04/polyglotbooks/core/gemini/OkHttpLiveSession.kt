@@ -23,6 +23,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Production implementation of [LiveSession] using OkHttp WebSocket connecting to the Gemini Live API.
@@ -94,6 +95,9 @@ class OkHttpLiveSession(
     private var isManualDisconnect = false
 
     @Volatile
+    private var connectWaitTimedOut = false
+
+    @Volatile
     private var hasEverOpened = false
 
     @Volatile
@@ -121,6 +125,7 @@ class OkHttpLiveSession(
         _failures.resetReplayCache()
         _lastError = null
         isManualDisconnect = false
+        connectWaitTimedOut = false
         hasEverOpened = false
         reconnectAttempts = 0
         DiagnosticLogBuffer.record(TAG, "Connecting Live session (model=${setup.model})")
@@ -129,8 +134,12 @@ class OkHttpLiveSession(
         if (signal.isCompleted) {
             signal.await()
         } else if (connectTimeoutMs > 0) {
-            withTimeoutOrNull(connectTimeoutMs) {
+            val openedInTime = withTimeoutOrNull(connectTimeoutMs) {
                 signal.await()
+                true
+            }
+            if (openedInTime == null) {
+                connectWaitTimedOut = true
             }
         }
     }
@@ -159,6 +168,7 @@ class OkHttpLiveSession(
         val connectionId = ++activeConnectionId
         val signal = CompletableDeferred<Unit>()
         val setupSignal = CompletableDeferred<Unit>()
+        val closeNotified = AtomicBoolean(false)
         openDeferred = signal
         setupCompleteDeferred = setupSignal
 
@@ -166,6 +176,7 @@ class OkHttpLiveSession(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (connectionId != activeConnectionId) return
                 this@OkHttpLiveSession.webSocket = webSocket
+                connectWaitTimedOut = false
                 _isConnected = true
                 hasEverOpened = true
                 logD("WebSocket opened. Sending setup...")
@@ -187,7 +198,6 @@ class OkHttpLiveSession(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (connectionId != activeConnectionId) return
-                logD("WebSocket closing: $code / $reason")
                 val setupWasComplete = _isSetupComplete
                 _isConnected = false
                 _isSetupComplete = false
@@ -195,7 +205,8 @@ class OkHttpLiveSession(
                     webSocket.close(code, reason)
                 } catch (_: Throwable) {
                 }
-                if (code != 1000 && !isManualDisconnect) {
+                if (!isManualDisconnect) {
+                    logW("WebSocket closing by server: code=$code, reason=$reason")
                     val err = IOException("WebSocket closed unexpectedly: code=$code, reason=$reason")
                     if (!signal.isCompleted) {
                         signal.completeExceptionally(err)
@@ -203,11 +214,39 @@ class OkHttpLiveSession(
                     if (!setupSignal.isCompleted) {
                         setupSignal.completeExceptionally(err)
                     }
-                    handleUnexpectedDisconnect(
-                        cause = err,
-                        setupWasComplete = setupWasComplete,
-                        closeCode = code
-                    )
+                    if (closeNotified.compareAndSet(false, true)) {
+                        if (code != 1000) {
+                            handleUnexpectedDisconnect(
+                                cause = err,
+                                setupWasComplete = setupWasComplete,
+                                closeCode = code
+                            )
+                        } else {
+                            _failures.tryEmit(err)
+                        }
+                    }
+                } else {
+                    logD("WebSocket closing: $code / $reason")
+                    if (!setupSignal.isCompleted) {
+                        setupSignal.completeExceptionally(IOException("WebSocket closed: code=$code, reason=$reason"))
+                    }
+                }
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (connectionId != activeConnectionId) return
+                _isConnected = false
+                _isSetupComplete = false
+                if (!isManualDisconnect && closeNotified.compareAndSet(false, true)) {
+                    logW("WebSocket closed by server: code=$code, reason=$reason")
+                    val err = IOException("WebSocket closed by server: code=$code, reason=$reason")
+                    if (!signal.isCompleted) {
+                        signal.completeExceptionally(err)
+                    }
+                    if (!setupSignal.isCompleted) {
+                        setupSignal.completeExceptionally(err)
+                    }
+                    _failures.tryEmit(err)
                 } else if (!setupSignal.isCompleted) {
                     setupSignal.completeExceptionally(IOException("WebSocket closed: code=$code, reason=$reason"))
                 }
@@ -243,6 +282,7 @@ class OkHttpLiveSession(
                     setupSignal.completeExceptionally(failure)
                 }
                 if (!isManualDisconnect) {
+                    closeNotified.set(true)
                     handleUnexpectedDisconnect(
                         cause = failure,
                         setupWasComplete = setupWasComplete,
@@ -378,11 +418,17 @@ class OkHttpLiveSession(
 
     override suspend fun send(message: LiveClientMessage) {
         val pendingOpen = openDeferred
-        if (!_isConnected && pendingOpen != null && !pendingOpen.isCompleted && connectTimeoutMs > 0) {
-            withTimeoutOrNull(connectTimeoutMs) {
-                try {
-                    pendingOpen.await()
-                } catch (_: Throwable) {
+        if (!_isConnected && pendingOpen != null && !pendingOpen.isCompleted) {
+            if (connectWaitTimedOut && awaitSetupCompleteBeforeSend) {
+                closeCurrentSocketQuietly()
+                throw IOException("Timed out connecting Gemini Live WebSocket")
+            }
+            if (connectTimeoutMs > 0) {
+                withTimeoutOrNull(connectTimeoutMs) {
+                    try {
+                        pendingOpen.await()
+                    } catch (_: Throwable) {
+                    }
                 }
             }
         }
@@ -416,6 +462,7 @@ class OkHttpLiveSession(
                     }
                 }
                 if (completedInTime == null) {
+                    closeCurrentSocketQuietly()
                     throw IOException("Timed out waiting for Gemini Live setupComplete")
                 }
             }
