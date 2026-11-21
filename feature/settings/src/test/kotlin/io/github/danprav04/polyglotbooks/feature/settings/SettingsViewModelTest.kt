@@ -488,22 +488,22 @@ class SettingsViewModelTest {
     fun testSetLivePreloadChunksClampsAndPersists() = runTest {
         val viewModel = createViewModel()
         advanceUntilIdle()
-        assertEquals(3, viewModel.uiState.value.livePreloadChunks)
+        assertEquals(6, viewModel.uiState.value.livePreloadChunks)
 
         viewModel.setLivePreloadChunks(0)
         advanceUntilIdle()
         coVerify { settingsRepository.setLivePreloadChunks(1) }
 
-        viewModel.setLivePreloadChunks(5)
+        viewModel.setLivePreloadChunks(12)
         advanceUntilIdle()
-        coVerify { settingsRepository.setLivePreloadChunks(5) }
+        coVerify { settingsRepository.setLivePreloadChunks(12) }
 
-        viewModel.setLivePreloadChunks(20)
+        viewModel.setLivePreloadChunks(25)
         advanceUntilIdle()
-        coVerify { settingsRepository.setLivePreloadChunks(8) }
+        coVerify { settingsRepository.setLivePreloadChunks(20) }
 
-        livePreloadChunksFlow.value = 6
+        livePreloadChunksFlow.value = 15
         advanceUntilIdle()
-        assertEquals(6, viewModel.uiState.value.livePreloadChunks)
+        assertEquals(15, viewModel.uiState.value.livePreloadChunks)
     }
 }

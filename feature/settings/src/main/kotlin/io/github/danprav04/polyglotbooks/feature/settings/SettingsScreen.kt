@@ -80,6 +80,7 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.danprav04.polyglotbooks.core.data.BugReportClipboardHelper
+import io.github.danprav04.polyglotbooks.core.data.prefs.DataStoreSettingsRepository
 import io.github.danprav04.polyglotbooks.core.gemini.ModelCatalog
 import io.github.danprav04.polyglotbooks.core.gemini.ModelQuotaSnapshot
 import io.github.danprav04.polyglotbooks.core.model.BugReportContextFormatter
@@ -955,8 +956,11 @@ private fun AudioAndStorageSection(
                 )
             }
 
-            // Live Preload Buffer slider (1 to 8 chunks, default 3)
+            // Live Preload Buffer slider (1 to 20 chunks, default 6)
             Column {
+                val minPreload = DataStoreSettingsRepository.MIN_LIVE_PRELOAD_CHUNKS
+                val maxPreload = DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS
+                val defaultPreload = DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS
                 val chunkLabel = if (uiState.livePreloadChunks == 1) "chunk" else "chunks"
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -974,13 +978,13 @@ private fun AudioAndStorageSection(
                     )
                 }
                 Slider(
-                    value = uiState.livePreloadChunks.toFloat(),
+                    value = uiState.livePreloadChunks.coerceIn(minPreload, maxPreload).toFloat(),
                     onValueChange = { onLivePreloadChunksChange(it.roundToInt()) },
-                    valueRange = 1f..8f,
-                    steps = 6
+                    valueRange = minPreload.toFloat()..maxPreload.toFloat(),
+                    steps = (maxPreload - minPreload - 1).coerceAtLeast(0)
                 )
                 Text(
-                    text = "Chunks cached before Live playback starts (default: 3). Higher values prevent mid-chapter pauses on slower connections.",
+                    text = "Chunks cached before Live playback starts ($minPreload–$maxPreload, default: $defaultPreload). Higher values prevent mid-chapter pauses on slower connections.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
