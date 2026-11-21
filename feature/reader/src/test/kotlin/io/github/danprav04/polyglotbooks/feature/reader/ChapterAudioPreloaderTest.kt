@@ -293,7 +293,7 @@ class ChapterAudioPreloaderTest {
 
                 var preloadDone = false
                 val waiter = launch(dispatcher) {
-                    preloader.awaitInitialPreload(maxWaitAfterFirstReadyMs = 5_000L) { ready, target ->
+                    preloader.awaitInitialPreload(maxWaitPerRemainingChunkMs = 5_000L) { ready, target ->
                         progressEvents += ready to target
                     }
                     preloadDone = true
@@ -323,6 +323,73 @@ class ChapterAudioPreloaderTest {
                     assertNotNull(seg)
                     assertArrayEquals(fakePcmFor(i), seg!!.pcmBytes)
                 }
+                preloader.close()
+            }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `awaitInitialPreload completes 6-chunk preload when each chunk finishes within per-chunk patience timeout`() = runTest {
+        val tempDir = Files.createTempDirectory("preloader-per-chunk-patience").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val chunks = (0 until 8).map { makeChunk(it) }
+            val gates = List(chunks.size) { CompletableDeferred<Unit>() }
+            val progressEvents = mutableListOf<Pair<Int, Int>>()
+
+            coroutineScope {
+                val preloader = ChapterAudioPreloader(
+                    chunks = chunks,
+                    initialPreloadChunks = 6,
+                    cacheTagForChunk = { "GEMINI_LIVE_V6" },
+                    diskCache = diskCache,
+                    maxCacheBytes = TranslationDiskCache.DEFAULT_MAX_AUDIO_BYTES,
+                    isCurrentGeneration = { true },
+                    synthesizeUncached = { idx, chunk ->
+                        gates[idx].await()
+                        PreloadedAudioSegment(
+                            chunkIndex = idx,
+                            chunk = chunk,
+                            pcmBytes = fakePcmFor(idx),
+                            sampleRate = 24_000,
+                            channels = 1,
+                            fromCache = false,
+                            usedLiveEngine = true,
+                            usedFallback = false
+                        )
+                    }
+                )
+                preloader.start(this, dispatcher)
+                gates[0].complete(Unit)
+
+                var preloadDone = false
+                val waiter = launch(dispatcher) {
+                    preloader.awaitInitialPreload(maxWaitPerRemainingChunkMs = 5_000L) { ready, target ->
+                        progressEvents += ready to target
+                    }
+                    preloadDone = true
+                }
+                runCurrent()
+                assertFalse("Preload must still wait after chunk 0", preloadDone)
+
+                // Each of chunks 1..5 takes 3,000ms (15,000ms total > 5,000ms single-chunk timeout).
+                for (i in 1..5) {
+                    advanceTimeBy(3_000L)
+                    runCurrent()
+                    assertFalse("Chunk $i should still be waited on within per-chunk patience", preloadDone)
+                    gates[i].complete(Unit)
+                    runCurrent()
+                }
+
+                assertTrue("All 6 initial chunks must finish preloading cleanly", preloadDone)
+                waiter.join()
+                assertEquals(
+                    listOf(1 to 6, 2 to 6, 3 to 6, 4 to 6, 5 to 6, 6 to 6),
+                    progressEvents
+                )
                 preloader.close()
             }
         } finally {

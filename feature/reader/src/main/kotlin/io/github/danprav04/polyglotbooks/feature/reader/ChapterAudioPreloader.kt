@@ -182,43 +182,45 @@ internal class ChapterAudioPreloader(
 
     /**
      * Suspends until the initial [initialTargetCount] chunks are synthesized/cached and ready for
-     * ordered playback (or until [maxWaitAfterFirstReadyMs] elapses after the first playable chunk
-     * is ready), invoking [onProgress] as each chunk becomes ready.
+     * ordered playback (or until waiting on a remaining initial chunk exceeds
+     * [maxWaitPerRemainingChunkMs] after the first playable chunk is ready), invoking [onProgress]
+     * as each chunk becomes ready.
      */
     suspend fun awaitInitialPreload(
-        maxWaitAfterFirstReadyMs: Long? = null,
+        maxWaitPerRemainingChunkMs: Long? = null,
         onProgress: (ready: Int, target: Int) -> Unit = { _, _ -> }
     ) {
-        var hasPlayableReady = false
         var readyCount = 0
         for (idx in 0 until initialTargetCount) {
             if (!isCurrentGeneration() || closed.get()) break
             val seg = slots[idx].await() ?: break
             if (seg.pcmBytes.isEmpty()) continue
-            hasPlayableReady = true
             readyCount++
             onProgress(idx + 1, initialTargetCount)
 
-            if (maxWaitAfterFirstReadyMs != null &&
-                maxWaitAfterFirstReadyMs > 0L &&
+            if (maxWaitPerRemainingChunkMs != null &&
+                maxWaitPerRemainingChunkMs > 0L &&
                 idx + 1 < initialTargetCount
             ) {
-                val completedRemaining = withTimeoutOrNull(maxWaitAfterFirstReadyMs) {
-                    for (remIdx in (idx + 1) until initialTargetCount) {
-                        if (!isCurrentGeneration() || closed.get()) break
-                        val remSeg = slots[remIdx].await() ?: break
-                        if (remSeg.pcmBytes.isEmpty()) continue
-                        readyCount++
-                        onProgress(remIdx + 1, initialTargetCount)
+                for (remIdx in (idx + 1) until initialTargetCount) {
+                    if (!isCurrentGeneration() || closed.get()) break
+                    var remSeg: PreloadedAudioSegment? = null
+                    val completedInTime = withTimeoutOrNull(maxWaitPerRemainingChunkMs) {
+                        remSeg = slots[remIdx].await()
+                        true
+                    } != null
+                    if (!completedInTime) {
+                        DiagnosticLogBuffer.record(
+                            tag = "ChapterAudioPreloader",
+                            message = "Initial preload stalled waiting >${maxWaitPerRemainingChunkMs}ms for chunk ${remIdx + 1}/$initialTargetCount ($readyCount ready); starting playback while preloader continues",
+                            level = "WARN"
+                        )
+                        break
                     }
-                    true
-                }
-                if (completedRemaining == null) {
-                    DiagnosticLogBuffer.record(
-                        tag = "ChapterAudioPreloader",
-                        message = "Initial preload timed out after ${maxWaitAfterFirstReadyMs}ms with $readyCount/$initialTargetCount chunks ready; starting playback while preloader continues",
-                        level = "WARN"
-                    )
+                    val readySeg = remSeg ?: break
+                    if (readySeg.pcmBytes.isEmpty()) continue
+                    readyCount++
+                    onProgress(remIdx + 1, initialTargetCount)
                 }
                 break
             }
