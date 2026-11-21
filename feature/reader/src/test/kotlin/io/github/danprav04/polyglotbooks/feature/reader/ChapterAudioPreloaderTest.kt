@@ -7,6 +7,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -249,6 +250,80 @@ class ChapterAudioPreloaderTest {
                 assertArrayEquals(fakePcmFor(3), seg3.pcmBytes)
                 assertEquals(listOf(2, 3), pass2Uncached)
                 pass2.close()
+            }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `awaitInitialPreload proceeds once first chunk is ready if remaining initial chunks stall past patience timeout`() = runTest {
+        val tempDir = Files.createTempDirectory("preloader-patience-timeout").toFile()
+        try {
+            val diskCache = TranslationDiskCache(tempDir)
+            val dispatcher = StandardTestDispatcher(testScheduler)
+            val chunks = (0 until 5).map { makeChunk(it) }
+            val gates = List(chunks.size) { CompletableDeferred<Unit>() }
+            val progressEvents = mutableListOf<Pair<Int, Int>>()
+
+            coroutineScope {
+                val preloader = ChapterAudioPreloader(
+                    chunks = chunks,
+                    initialPreloadChunks = 3,
+                    cacheTagForChunk = { "GEMINI_LIVE_V6" },
+                    diskCache = diskCache,
+                    maxCacheBytes = TranslationDiskCache.DEFAULT_MAX_AUDIO_BYTES,
+                    isCurrentGeneration = { true },
+                    synthesizeUncached = { idx, chunk ->
+                        gates[idx].await()
+                        PreloadedAudioSegment(
+                            chunkIndex = idx,
+                            chunk = chunk,
+                            pcmBytes = fakePcmFor(idx),
+                            sampleRate = 24_000,
+                            channels = 1,
+                            fromCache = false,
+                            usedLiveEngine = true,
+                            usedFallback = false
+                        )
+                    }
+                )
+                preloader.start(this, dispatcher)
+                gates[0].complete(Unit)
+
+                var preloadDone = false
+                val waiter = launch(dispatcher) {
+                    preloader.awaitInitialPreload(maxWaitAfterFirstReadyMs = 5_000L) { ready, target ->
+                        progressEvents += ready to target
+                    }
+                    preloadDone = true
+                }
+                runCurrent()
+                assertFalse("Should wait briefly for chunks 1..2 while within patience timeout", preloadDone)
+                assertEquals(listOf(1 to 3), progressEvents)
+
+                advanceTimeBy(4_000L)
+                runCurrent()
+                assertFalse("Still within 5,000ms patience timeout", preloadDone)
+
+                advanceTimeBy(1_100L)
+                runCurrent()
+                assertTrue("Must proceed to playback after 5,000ms once chunk 0 is ready", preloadDone)
+                waiter.join()
+
+                val seg0 = preloader.awaitSegment(0)
+                assertNotNull(seg0)
+                assertArrayEquals(fakePcmFor(0), seg0!!.pcmBytes)
+
+                // Remaining chunks continue synthesizing in background and deliver in exact order when unblocked.
+                for (i in 1 until chunks.size) gates[i].complete(Unit)
+                advanceUntilIdle()
+                for (i in 1 until chunks.size) {
+                    val seg = preloader.awaitSegment(i)
+                    assertNotNull(seg)
+                    assertArrayEquals(fakePcmFor(i), seg!!.pcmBytes)
+                }
+                preloader.close()
             }
         } finally {
             tempDir.deleteRecursively()

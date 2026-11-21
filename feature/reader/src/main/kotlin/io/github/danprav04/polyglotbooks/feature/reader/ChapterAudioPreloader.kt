@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 
 internal data class PreloadedAudioSegment(
@@ -181,14 +182,46 @@ internal class ChapterAudioPreloader(
 
     /**
      * Suspends until the initial [initialTargetCount] chunks are synthesized/cached and ready for
-     * ordered playback, invoking [onProgress] as each chunk becomes ready.
+     * ordered playback (or until [maxWaitAfterFirstReadyMs] elapses after the first playable chunk
+     * is ready), invoking [onProgress] as each chunk becomes ready.
      */
-    suspend fun awaitInitialPreload(onProgress: (ready: Int, target: Int) -> Unit = { _, _ -> }) {
+    suspend fun awaitInitialPreload(
+        maxWaitAfterFirstReadyMs: Long? = null,
+        onProgress: (ready: Int, target: Int) -> Unit = { _, _ -> }
+    ) {
+        var hasPlayableReady = false
+        var readyCount = 0
         for (idx in 0 until initialTargetCount) {
             if (!isCurrentGeneration() || closed.get()) break
             val seg = slots[idx].await() ?: break
             if (seg.pcmBytes.isEmpty()) continue
+            hasPlayableReady = true
+            readyCount++
             onProgress(idx + 1, initialTargetCount)
+
+            if (maxWaitAfterFirstReadyMs != null &&
+                maxWaitAfterFirstReadyMs > 0L &&
+                idx + 1 < initialTargetCount
+            ) {
+                val completedRemaining = withTimeoutOrNull(maxWaitAfterFirstReadyMs) {
+                    for (remIdx in (idx + 1) until initialTargetCount) {
+                        if (!isCurrentGeneration() || closed.get()) break
+                        val remSeg = slots[remIdx].await() ?: break
+                        if (remSeg.pcmBytes.isEmpty()) continue
+                        readyCount++
+                        onProgress(remIdx + 1, initialTargetCount)
+                    }
+                    true
+                }
+                if (completedRemaining == null) {
+                    DiagnosticLogBuffer.record(
+                        tag = "ChapterAudioPreloader",
+                        message = "Initial preload timed out after ${maxWaitAfterFirstReadyMs}ms with $readyCount/$initialTargetCount chunks ready; starting playback while preloader continues",
+                        level = "WARN"
+                    )
+                }
+                break
+            }
         }
     }
 

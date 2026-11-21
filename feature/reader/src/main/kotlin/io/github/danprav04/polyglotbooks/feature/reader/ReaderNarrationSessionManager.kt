@@ -1867,6 +1867,28 @@ class ReaderNarrationSessionManager @Inject constructor(
                                             var emitted = false
                                             val thisTurnFallback = AtomicBoolean(false)
                                             activeTurnFallbackFlag.set(thisTurnFallback)
+                                            suspend fun collectTrackedFallback() {
+                                                thisTurnFallback.set(true)
+                                                try {
+                                                    trackedFallback.synthesize(req).collect { pcm ->
+                                                        if (pcm.data.isNotEmpty()) {
+                                                            emitted = true
+                                                            sr = pcm.sampleRate
+                                                            ch = pcm.channels
+                                                            pcmBuf.write(pcm.data)
+                                                        }
+                                                    }
+                                                } catch (ce: CancellationException) {
+                                                    throw ce
+                                                } catch (fallbackErr: Throwable) {
+                                                    DiagnosticLogBuffer.record(
+                                                        tag = "ReaderSession",
+                                                        message = "Fallback synthesis failed at para=${chunk.leadIndex}; skipping chunk",
+                                                        level = "WARN",
+                                                        throwable = fallbackErr
+                                                    )
+                                                }
+                                            }
                                             try {
                                                 val session = ensureLiveSession(trackedFallback)
                                                 session.synthesizeTurnStreaming(req).collect { pcm ->
@@ -1878,15 +1900,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                     }
                                                 }
                                                 if (!emitted) {
-                                                    thisTurnFallback.set(true)
-                                                    trackedFallback.synthesize(req).collect { pcm ->
-                                                        if (pcm.data.isNotEmpty()) {
-                                                            emitted = true
-                                                            sr = pcm.sampleRate
-                                                            ch = pcm.channels
-                                                            pcmBuf.write(pcm.data)
-                                                        }
-                                                    }
+                                                    collectTrackedFallback()
                                                 }
                                             } catch (ce: CancellationException) {
                                                 throw ce
@@ -1904,15 +1918,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                                                 } catch (_: Throwable) {
                                                 }
                                                 if (!emitted) {
-                                                    thisTurnFallback.set(true)
-                                                    trackedFallback.synthesize(req).collect { pcm ->
-                                                        if (pcm.data.isNotEmpty()) {
-                                                            emitted = true
-                                                            sr = pcm.sampleRate
-                                                            ch = pcm.channels
-                                                            pcmBuf.write(pcm.data)
-                                                        }
-                                                    }
+                                                    collectTrackedFallback()
                                                 }
                                             } finally {
                                                 activeTurnFallbackFlag.compareAndSet(thisTurnFallback, null)
@@ -1959,7 +1965,9 @@ class ReaderNarrationSessionManager @Inject constructor(
                                     }
                                     pushExternalState()
                                 }
-                                preloader.awaitInitialPreload { ready, target ->
+                                preloader.awaitInitialPreload(
+                                    maxWaitAfterFirstReadyMs = INITIAL_PRELOAD_AFTER_FIRST_TIMEOUT_MS
+                                ) { ready, target ->
                                     if (needsInitialPreload && ready < target && isCurrentGen()) {
                                         _sessionState.update { state ->
                                             if (playbackGenerationId.get() != myGeneration) state
@@ -2332,6 +2340,7 @@ class ReaderNarrationSessionManager @Inject constructor(
                         it.copy(
                             isPlaying = false,
                             isBuffering = false,
+                            statusMessage = if (it.statusMessage?.startsWith("Preparing audio") == true) null else it.statusMessage,
                             errorMessage = formatConciseError(e, "Narration failed")
                         )
                     }
@@ -2363,7 +2372,11 @@ class ReaderNarrationSessionManager @Inject constructor(
                     abandonAudioFocus()
                     _sessionState.update {
                         if (playbackGenerationId.get() != myGeneration) it
-                        else it.copy(isPlaying = false, isBuffering = false)
+                        else it.copy(
+                            isPlaying = false,
+                            isBuffering = false,
+                            statusMessage = if (it.statusMessage?.startsWith("Preparing audio") == true) null else it.statusMessage
+                        )
                     }
                     pushExternalState()
                 }
@@ -4097,7 +4110,8 @@ class ReaderNarrationSessionManager @Inject constructor(
 
     companion object {
         internal const val GEMINI_TTS_CACHE_TAG_PREFIX = "GEMINI_TTS_V4"
-        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V5"
+        internal const val GEMINI_LIVE_CACHE_TAG_PREFIX = "GEMINI_LIVE_V6"
+        private const val INITIAL_PRELOAD_AFTER_FIRST_TIMEOUT_MS = 30_000L
         private val defaultPlayerFactoryRef: () -> PcmPlayer = { AudioTrackPcmPlayer() }
         private val DIALOGUE_QUOTE_CHARS = setOf('"', '“', '”', '«', '»', '「', '」', '『', '』')
         private const val REPORTING_VERBS_PATTERN =

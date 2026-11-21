@@ -71,6 +71,7 @@ class OrvNarrationPipelineTest {
     fun `real wire JSON handles large Base64 PCM frames and empty transcription or unknown envelopes with zero errors`() = runTest {
         val tempDir = Files.createTempDirectory("orv-wire-regression").toFile()
         try {
+            val sourceParagraph = chapter1Paragraphs().first { it.contains("three ways to survive", ignoreCase = true) }
             val frame1Pcm = generateSineWavePcm(
                 totalFrames = 14_700, // 29,400 bytes -> 39,200 Base64 chars (~39.2 KB)
                 startFrameOffset = 0,
@@ -81,15 +82,22 @@ class OrvNarrationPipelineTest {
                 totalFrames = 16_800, // 33,600 bytes -> 44,800 Base64 chars (~44.8 KB)
                 startFrameOffset = 14_700,
                 fadeInFrames = 0,
+                fadeOutFrames = 0
+            )
+            val remainingFrames = ((sourceParagraph.length * 1_200) - (14_700 + 16_800)).coerceAtLeast(16_800)
+            val frame3Pcm = generateSineWavePcm(
+                totalFrames = remainingFrames,
+                startFrameOffset = 14_700 + 16_800,
+                fadeInFrames = 0,
                 fadeOutFrames = 240
             )
             val frame1B64 = Base64.getEncoder().encodeToString(frame1Pcm)
             val frame2B64 = Base64.getEncoder().encodeToString(frame2Pcm)
+            val frame3B64 = Base64.getEncoder().encodeToString(frame3Pcm)
             assertTrue("Frame 1 Base64 should be 35KB-46KB, was ${frame1B64.length}", frame1B64.length in 35_000..46_000)
             assertTrue("Frame 2 Base64 should be 35KB-46KB, was ${frame2B64.length}", frame2B64.length in 35_000..46_000)
 
-            val expectedCombinedPcm = frame1Pcm + frame2Pcm
-            val sourceParagraph = chapter1Paragraphs().first { it.contains("three ways to survive", ignoreCase = true) }
+            val expectedCombinedPcm = frame1Pcm + frame2Pcm + frame3Pcm
 
             val server = FakeWireGeminiLiveServer(this) { conn, _, rawJson ->
                 val sentText = extractPromptText(conn.decodeClientMessage(rawJson))
@@ -102,7 +110,7 @@ class OrvNarrationPipelineTest {
                     """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$frame2B64"}}]},"outputTranscription":{"text":${jsonEscape(sentText)}}}}"""
                 )
                 conn.sendServerJson(
-                    """{"serverContent":{"outputTranscription":{"finished":true},"generationComplete":true,"turnComplete":true}}"""
+                    """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$frame3B64"}}]},"outputTranscription":{"finished":true},"generationComplete":true,"turnComplete":true}}"""
                 )
             }
 
@@ -160,13 +168,8 @@ class OrvNarrationPipelineTest {
                 .take(6)
             assertEquals(6, sixParagraphs.size)
 
-            val turnPcms = sixParagraphs.indices.map { idx ->
-                generateSineWavePcm(
-                    totalFrames = 9_600 + idx * 480,
-                    freqHz = 220.0 + idx * 30.0,
-                    fadeInFrames = 240,
-                    fadeOutFrames = 240
-                )
+            val turnPcms = sixParagraphs.mapIndexed { idx, para ->
+                generateSpeechPcmForText(para, freqHz = 220.0 + idx * 30.0)
             }
 
             val turnCounter = AtomicInteger(0)
@@ -281,9 +284,9 @@ class OrvNarrationPipelineTest {
             }
             assertEquals(11, spokenTexts.size)
 
-            val normalTurnPcm = generateSineWavePcm(totalFrames = 12_000, fadeInFrames = 240, fadeOutFrames = 240)
+            val freezeSpeechMs = (spokenTexts.first().length * 25 + 500).coerceAtLeast(2_000)
             val frozenTurnPcm = buildSpeechWithInternalFreezePcm(
-                speechMs = 500,
+                speechMs = freezeSpeechMs,
                 freezeMs = 3_000
             )
             val freezeTargetIdx = 0
@@ -292,7 +295,7 @@ class OrvNarrationPipelineTest {
             val gauntletServer = FakeWireGeminiLiveServer(this) { conn, _, rawJson ->
                 val idx = sentTurnCounter.getAndIncrement()
                 val sentText = extractPromptText(conn.decodeClientMessage(rawJson))
-                val pcmToSend = if (idx == freezeTargetIdx) frozenTurnPcm else normalTurnPcm
+                val pcmToSend = if (idx == freezeTargetIdx) frozenTurnPcm else generateSpeechPcmForText(sentText)
                 val b64 = Base64.getEncoder().encodeToString(pcmToSend)
                 conn.sendServerJson(
                     """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$b64"}}]},"outputTranscription":{"text":${jsonEscape(sentText)},"finished":true},"turnComplete":true}}"""
@@ -394,11 +397,9 @@ class OrvNarrationPipelineTest {
                         .filter { it != soleLiveModel }
                         .forEach { recordHttpError(it, 404, "not found") }
                 }
-                val cleanPcm = generateSineWavePcm(
-                    totalFrames = 14_400,
-                    freqHz = 260.0 + idx * 40.0,
-                    fadeInFrames = 240,
-                    fadeOutFrames = 240
+                val cleanPcm = generateSpeechPcmForText(
+                    text = testLines[idx],
+                    freqHz = 260.0 + idx * 40.0
                 )
                 val badPartialPcm = generateSineWavePcm(
                     totalFrames = 7_200,
@@ -406,7 +407,9 @@ class OrvNarrationPipelineTest {
                     fadeInFrames = 240,
                     fadeOutFrames = 240
                 )
-                val glitchedPcm = generateGlitchedPcm(totalFrames = 14_400)
+                val glitchedPcm = generateGlitchedPcm(
+                    totalFrames = (testLines[idx].length * 1_200).coerceAtLeast(14_400)
+                )
 
                 val attempts = AtomicInteger(0)
                 val server = FakeWireGeminiLiveServer(this) { conn, testScope, rawJson ->
@@ -491,7 +494,7 @@ class OrvNarrationPipelineTest {
             val p1Text = "Paragraph one suffers a sustained Live outage across all retry attempts."
             val p2Text = "Paragraph two restores Gemini Live and clears the fallback status banner."
             val deviceFallbackPcm = generateSineWavePcm(totalFrames = 4_800, freqHz = 180.0, fadeInFrames = 120, fadeOutFrames = 120)
-            val liveRecoveredPcm = generateSineWavePcm(totalFrames = 12_000, freqHz = 320.0, fadeInFrames = 240, fadeOutFrames = 240)
+            val liveRecoveredPcm = generateSpeechPcmForText(p2Text, freqHz = 320.0)
 
             val p2GateReached = CompletableDeferred<Unit>()
             val allowP2Live = CompletableDeferred<Unit>()
@@ -635,17 +638,13 @@ class OrvNarrationPipelineTest {
             )
 
             cases.forEachIndexed { idx, testCase ->
-                val badAttemptPcm = generateSineWavePcm(
-                    totalFrames = 14_400,
-                    freqHz = 520.0,
-                    fadeInFrames = 240,
-                    fadeOutFrames = 240
+                val badAttemptPcm = generateSpeechPcmForText(
+                    text = testCase.sourceParagraph,
+                    freqHz = 520.0
                 )
-                val cleanAttemptPcm = generateSineWavePcm(
-                    totalFrames = 14_400,
-                    freqHz = 240.0 + idx * 20.0,
-                    fadeInFrames = 240,
-                    fadeOutFrames = 240
+                val cleanAttemptPcm = generateSpeechPcmForText(
+                    text = testCase.sourceParagraph,
+                    freqHz = 240.0 + idx * 20.0
                 )
 
                 val attemptCounter = AtomicInteger(0)
@@ -804,9 +803,9 @@ class OrvNarrationPipelineTest {
 
         val tempDir = Files.createTempDirectory("orv-ch15-slice").toFile()
         try {
-            val turnPcm = generateSineWavePcm(totalFrames = 9_600, fadeInFrames = 240, fadeOutFrames = 240)
             val server = FakeWireGeminiLiveServer(this) { conn, _, rawJson ->
                 val sentText = extractPromptText(conn.decodeClientMessage(rawJson))
+                val turnPcm = generateSpeechPcmForText(sentText)
                 val b64 = Base64.getEncoder().encodeToString(turnPcm)
                 conn.sendServerJson(
                     """{"serverContent":{"modelTurn":{"parts":[{"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"$b64"}}]},"outputTranscription":{"text":${jsonEscape(sentText)},"finished":true},"turnComplete":true}}"""
@@ -1226,6 +1225,14 @@ class OrvNarrationPipelineTest {
     // =========================================================================
     // PCM waveform synthesis & inspection helpers
     // =========================================================================
+
+    private fun generateSpeechPcmForText(text: String, freqHz: Double = 220.0): ByteArray =
+        generateSineWavePcm(
+            totalFrames = (text.length * 1_200).coerceAtLeast(12_000),
+            freqHz = freqHz,
+            fadeInFrames = 240,
+            fadeOutFrames = 240
+        )
 
     private fun generateSineWavePcm(
         totalFrames: Int,

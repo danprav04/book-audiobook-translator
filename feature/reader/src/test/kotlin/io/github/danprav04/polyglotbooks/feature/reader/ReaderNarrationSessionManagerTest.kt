@@ -743,7 +743,7 @@ class ReaderNarrationSessionManagerTest {
             val p0Text = "First live paragraph."
             val p1Text = "Second live paragraph."
             val sentTexts = mutableListOf<String>()
-            val pcmBase64 = Base64.getEncoder().encodeToString(ByteArray(4800) { 0x15 })
+            val pcmBase64 = Base64.getEncoder().encodeToString(ByteArray(48_000) { 0x15 })
             val fakeSession = object : LiveSession {
                 private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
                 override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
@@ -1459,7 +1459,7 @@ class ReaderNarrationSessionManagerTest {
             }
             val p0Text = "First sentence survives a mid-turn interruption cleanly."
             val partialBadBytes = byteArrayOf(0x01, 0x02, 0x03, 0x04)
-            val goodBytes = ByteArray(2400) { 0x2A }
+            val goodBytes = ByteArray(96_000) { 0x2A }
             val partialB64 = Base64.getEncoder().encodeToString(partialBadBytes)
             val goodB64 = Base64.getEncoder().encodeToString(goodBytes)
             var sessionCreateCount = 0
@@ -1817,7 +1817,7 @@ class ReaderNarrationSessionManagerTest {
                 val prompts: MutableList<String> = mutableListOf()
             )
             val sessionRecords = mutableListOf<SessionRecord>()
-            val pcmBase64 = Base64.getEncoder().encodeToString(ByteArray(4800) { 0x15 })
+            val pcmBase64 = Base64.getEncoder().encodeToString(ByteArray(48_000) { 0x15 })
 
             val factory = object : LiveSessionFactory {
                 override fun create(): LiveSession = create(reconnectOnGoAway = true)
@@ -2085,7 +2085,7 @@ class ReaderNarrationSessionManagerTest {
             val p0Text = "Paragraph zero fails all Live attempts."
             val p1Text = "Paragraph one recovers cleanly on Gemini Live."
             val deviceFallbackPcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
-            val liveRecoveredPcm = ByteArray(2400) { 0x33 }
+            val liveRecoveredPcm = ByteArray(96_000) { 0x33 }
             val liveRecoveredB64 = Base64.getEncoder().encodeToString(liveRecoveredPcm)
 
             val p1ReachedLive = CompletableDeferred<Unit>()
@@ -2515,7 +2515,7 @@ class ReaderNarrationSessionManagerTest {
 
             val pcmForText: (String) -> ByteArray = { text ->
                 val tag = texts.indexOf(text).coerceAtLeast(0) + 11
-                ByteArray(2_400) { tag.toByte() }
+                ByteArray(72_000) { tag.toByte() }
             }
 
             val factory = object : LiveSessionFactory {
@@ -2592,11 +2592,11 @@ class ReaderNarrationSessionManagerTest {
             playerWritesWhen2Reached = player.writtenChunks.size
             assertEquals(2, playerWritesWhen2Reached)
 
-            // Pause before chunks 2..3 finish; verify chunks 0..1 are cached under GEMINI_LIVE_V5 on disk.
+            // Pause before chunks 2..3 finish; verify chunks 0..1 are cached under GEMINI_LIVE_CACHE_TAG_PREFIX on disk.
             manager.pause()
             runCurrent()
-            assertNotNull(diskCache.loadAudioSegment("GEMINI_LIVE_V5", "Zephyr", null, texts[0]))
-            assertNotNull(diskCache.loadAudioSegment("GEMINI_LIVE_V5", "Zephyr", null, texts[1]))
+            assertNotNull(diskCache.loadAudioSegment(ReaderNarrationSessionManager.GEMINI_LIVE_CACHE_TAG_PREFIX, "Zephyr", null, texts[0]))
+            assertNotNull(diskCache.loadAudioSegment(ReaderNarrationSessionManager.GEMINI_LIVE_CACHE_TAG_PREFIX, "Zephyr", null, texts[1]))
 
             // Stop session and re-start from paragraph 0 after releasing gateFor2: chunks 0 & 1 come from disk cache (0 new synthesis calls!).
             manager.stop()
@@ -2633,7 +2633,7 @@ class ReaderNarrationSessionManagerTest {
             val texts = listOf("First line.", "Second line.", "Third line.")
             fun pcmForText(text: String): ByteArray {
                 val tag = (texts.indexOf(text).coerceAtLeast(0) + 11).toByte()
-                return ByteArray(960) { tag }
+                return ByteArray(24_000) { tag }
             }
 
             val settingsRepo = FakeSettingsRepository().apply {
@@ -2732,6 +2732,120 @@ class ReaderNarrationSessionManagerTest {
             texts.forEachIndexed { idx, txt ->
                 assertTrue(player.writtenChunks[idx].data.contentEquals(pcmForText(txt)))
             }
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `gemini live fallback exception on one chunk skips only that chunk continues playback and clears Preparing audio banner`() = runTest {
+        val tempDir = Files.createTempDirectory("reader-live-fallback-skip").toFile()
+        try {
+            val texts = listOf(
+                "Paragraph zero fails Live and fallback.",
+                "Paragraph one plays cleanly.",
+                "Paragraph two plays cleanly."
+            )
+            fun pcmFor(text: String): ByteArray {
+                val tag = (texts.indexOf(text).coerceAtLeast(0) + 21).toByte()
+                return ByteArray(48_000) { tag }
+            }
+
+            val settingsRepo = FakeSettingsRepository().apply {
+                setReaderNarrationEngine(NarrationEngine.GEMINI_LIVE.name)
+                setDefaultNarratorVoiceId("Zephyr")
+                setLivePreloadChunks(3)
+            }
+            val throwingFallback = object : FeatureNarrationEngine {
+                override val id = EngineId.SYSTEM_TTS
+                override val capabilities = testCapabilities(streaming = false)
+                override suspend fun voices(): List<VoiceInfo> = emptyList()
+                override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> = flow {
+                    throw IllegalStateException("Device TTS crashed")
+                }
+            }
+            val factory = object : LiveSessionFactory {
+                override fun create(): LiveSession = create(reconnectOnGoAway = true)
+                override fun create(reconnectOnGoAway: Boolean): LiveSession = object : LiveSession {
+                    private val _incoming = MutableSharedFlow<LiveServerMessage>(extraBufferCapacity = 16)
+                    override val incomingMessages: Flow<LiveServerMessage> = _incoming.asSharedFlow()
+                    private var connected = false
+                    override val isConnected: Boolean get() = connected
+
+                    override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                        connected = true
+                    }
+
+                    override suspend fun send(message: LiveClientMessage) {
+                        val clientMsg = message as? LiveClientMessage.ClientContentMessage ?: return
+                        val promptText = clientMsg.clientContent.turns.orEmpty()
+                            .flatMap { it.parts }
+                            .mapNotNull { it.text }
+                            .joinToString("\n")
+                        if (promptText.contains(texts[0])) {
+                            _incoming.emit(
+                                LiveServerMessage.ErrorMessage(
+                                    LiveErrorData(code = 400, message = "Bad request")
+                                )
+                            )
+                        } else {
+                            val matched = texts.first { promptText.contains(it) }
+                            val b64 = Base64.getEncoder().encodeToString(pcmFor(matched))
+                            _incoming.emit(
+                                LiveServerMessage.ServerContentMessage(
+                                    ServerContentData(
+                                        modelTurn = ModelTurn(
+                                            parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", b64)))
+                                        ),
+                                        outputTranscription = TranscriptionData(matched),
+                                        turnComplete = true
+                                    )
+                                )
+                            )
+                        }
+                    }
+
+                    override suspend fun disconnect() {
+                        connected = false
+                    }
+                }
+            }
+
+            val player = RecordingPcmPlayer(onWrite = { _ -> })
+            val manager = ReaderNarrationSessionManager(
+                bookDao = FakeBookDao(),
+                chapterDao = FakeChapterDao(),
+                settingsRepository = settingsRepo,
+                secureKeyStore = FakeSecureKeyStore("fallback-skip-key"),
+                liveSessionFactory = factory,
+                applicationScope = backgroundScope
+            ).apply {
+                ioDispatcher = StandardTestDispatcher(testScheduler)
+                testDiskCache = TranslationDiskCache(tempDir)
+                playerFactory = { player }
+                systemTtsFactory = { throwingFallback }
+            }
+            runCurrent()
+
+            manager.startOrResume(
+                bookId = "book-fallback-skip",
+                bookTitle = "Fallback Skip Book",
+                paragraphs = texts.mapIndexed { idx, txt ->
+                    ReaderParagraph(idx, "p$idx", txt, "epubcfi(/6/2!/4/2/${idx + 1}:0)")
+                }
+            )
+            runCurrent()
+            advanceUntilIdle()
+
+            assertFalse(manager.sessionState.value.isPlaying)
+            assertNull(manager.sessionState.value.errorMessage)
+            assertFalse(
+                "Preparing audio banner must never remain stuck",
+                manager.sessionState.value.statusMessage?.startsWith("Preparing audio") == true
+            )
+            assertEquals(2, player.writtenChunks.size)
+            assertTrue(player.writtenChunks[0].data.contentEquals(pcmFor(texts[1])))
+            assertTrue(player.writtenChunks[1].data.contentEquals(pcmFor(texts[2])))
         } finally {
             tempDir.deleteRecursively()
         }
