@@ -29,12 +29,14 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.IOException
 import java.util.Base64
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -1320,7 +1322,7 @@ class GeminiLiveEngineStreamingTest {
         val twentyWords = "One two three four five six seven eight nine ten " +
             "eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty."
         val short500ms = smoothToneBytes(500)
-        val valid3000ms = smoothToneBytes(3_000)
+        val valid5000ms = smoothToneBytes(5_000)
 
         val dispatcher = StandardTestDispatcher(testScheduler)
         val live = engine.openStreamingSession(
@@ -1335,7 +1337,7 @@ class GeminiLiveEngineStreamingTest {
                 ).collect { received += it }
             }
 
-            // Candidate 0 emits 500ms audio with empty transcript (< 2,000ms minimum for 20 words) -> rejected!
+            // Candidate 0 emits 500ms audio with empty transcript (< 4,256ms minimum for 112 effective chars) -> rejected!
             runCurrent()
             createdSessions[0].emitServerMessage(
                 audioServerMessage(pcmBytes = short500ms, transcript = null, turnComplete = true)
@@ -1346,15 +1348,15 @@ class GeminiLiveEngineStreamingTest {
             assertEquals(1, createdSessions[0].disconnectCount)
             assertTrue(received.isEmpty())
 
-            // Candidate 1 emits 3,000ms audio with empty transcript -> passes duration sanity check and emits!
+            // Candidate 1 emits 5,000ms audio with empty transcript -> passes duration sanity check and emits!
             createdSessions[1].emitServerMessage(
-                audioServerMessage(pcmBytes = valid3000ms, transcript = null, turnComplete = true)
+                audioServerMessage(pcmBytes = valid5000ms, transcript = null, turnComplete = true)
             )
             runCurrent()
             job.join()
 
             assertFalse(fallbackCalled)
-            assertEquals(valid3000ms.size, received.sumOf { it.data.size })
+            assertEquals(valid5000ms.size, received.sumOf { it.data.size })
         } finally {
             live.close()
         }
@@ -1710,6 +1712,412 @@ class GeminiLiveEngineStreamingTest {
 
             assertEquals(cleanRetryPcm.size, collected.sumOf { it.data.size })
             assertEquals(4000.toByte(), (collected.first().data[0].toInt() or (collected.first().data[1].toInt() shl 8)).let { (it and 0xFF).toByte() })
+        } finally {
+            live.close()
+        }
+    }
+
+    private fun encodeToneBytes(durationMs: Int, freqStep: Double = 0.08, amp: Double = 4_500.0): ByteArray {
+        val frames = 24 * durationMs
+        val out = ByteArray(frames * 2)
+        for (i in 0 until frames) {
+            val sample = (amp * Math.sin(i * freqStep)).toInt().coerceIn(-32_768, 32_767)
+            out[i * 2] = (sample and 0xFF).toByte()
+            out[i * 2 + 1] = ((sample ushr 8) and 0xFF).toByte()
+        }
+        return out
+    }
+
+    @Test
+    fun `truncated multi-sentence turn with empty transcript and 2s audio is rejected and retried cleanly`() = runTest {
+        val longParagraph = "From the end of my childhood all the way to adulthood—a long journey spanning over ten years. " +
+            "I felt a mixture of desolation that a world was coming to an end along with a sense of fulfillment from finally reaching the end."
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val truncated2s = encodeToneBytes(2_000)
+            val full10s = encodeToneBytes(10_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = longParagraph, voiceId = "Zephyr")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(pcmBytes = truncated2s, transcript = null, turnComplete = true)
+            )
+            runCurrent()
+
+            assertTrue("Truncated 2s audio with empty transcript must reject and rotate", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertTrue(collected.isEmpty())
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(pcmBytes = full10s, transcript = null, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(full10s.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `truncated multi-sentence turn with matching transcript and 2s audio is rejected and retried cleanly`() = runTest {
+        val longParagraph = "From the end of my childhood all the way to adulthood—a long journey spanning over ten years. " +
+            "I felt a mixture of desolation that a world was coming to an end along with a sense of fulfillment from finally reaching the end."
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val truncated2s = encodeToneBytes(2_000)
+            val full8s = encodeToneBytes(8_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = longParagraph, voiceId = "Leda")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(pcmBytes = truncated2s, transcript = longParagraph, turnComplete = true)
+            )
+            runCurrent()
+
+            assertTrue("Truncated 2s audio even with matching transcript must reject and rotate", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertTrue(collected.isEmpty())
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(pcmBytes = full8s, transcript = longParagraph, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(full8s.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `truncated speech padded with long internal silence and trailing pop is rejected by audio health check`() {
+        val source = "He stared down at the crowded subway platform with quiet astonishment."
+        val wordCount = source.split(Regex("\\s+")).size
+        val speechPrefix = encodeToneBytes(250)
+        val silenceGap = ByteArray(24_000 * 2 * 45 / 10) // 4.5s digital silence
+        val trailingPop = encodeToneBytes(50)
+        val paddedTruncated = speechPrefix + silenceGap + trailingPop
+
+        assertFalse(
+            "Raw span is 4.8s, but effective spoken duration (~720ms) is below minimum with transcript",
+            GeminiLiveEngine.isBufferedAudioHealthy(
+                bufferedChunks = listOf(PcmChunk(paddedTruncated, 24_000, 1)),
+                collectedAnyAudio = true,
+                isExpressivePunctuation = false,
+                outputTranscript = source,
+                sourceWordCount = wordCount,
+                cleanModel = "gemini-3.8-live",
+                sourceText = source
+            )
+        )
+        assertFalse(
+            "Raw span is 4.8s, but effective spoken duration (~720ms) is below minimum without transcript",
+            GeminiLiveEngine.isBufferedAudioHealthy(
+                bufferedChunks = listOf(PcmChunk(paddedTruncated, 24_000, 1)),
+                collectedAnyAudio = true,
+                isExpressivePunctuation = false,
+                outputTranscript = "",
+                sourceWordCount = wordCount,
+                cleanModel = "gemini-3.8-live",
+                sourceText = source
+            )
+        )
+    }
+
+    @Test
+    fun `generationComplete with partial transcript waits past 400ms up to 2000ms for trailing audio and transcript`() = runTest {
+        val paragraph = "Three Ways to Survive in a Ruined World had finally reached its long-awaited conclusion on my old smartphone screen."
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        var fallbackCalled = false
+        val fallbackEngine = object : NarrationEngine {
+            override val id = EngineId.SYSTEM_TTS
+            override val capabilities = EngineCapabilities(false, false, false, 24_000)
+            override suspend fun voices(): List<VoiceInfo> = emptyList()
+            override fun synthesize(request: SynthesisRequest): Flow<PcmChunk> {
+                fallbackCalled = true
+                return flowOf(PcmChunk(byteArrayOf(99), 24_000, 1))
+            }
+        }
+        val engine = GeminiLiveEngine(
+            fallbackEngine = fallbackEngine,
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val part1Audio = encodeToneBytes(1_500)
+            val part2Audio = encodeToneBytes(2_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = paragraph, voiceId = "Zephyr")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(
+                                Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(part1Audio)))
+                            )
+                        ),
+                        outputTranscription = TranscriptionData("Three Ways to Survive", finished = false),
+                        generationComplete = true,
+                        turnComplete = false
+                    )
+                )
+            )
+            runCurrent()
+            advanceTimeBy(600L)
+            runCurrent()
+            assertFalse("Must wait past 400ms when transcript and audio are still incomplete", job.isCompleted)
+            assertTrue(collected.isEmpty())
+
+            advanceTimeBy(300L)
+            createdSessions[0].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(
+                                Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(part2Audio)))
+                            )
+                        ),
+                        outputTranscription = TranscriptionData(
+                            " in a Ruined World had finally reached its long-awaited conclusion on my old smartphone screen.",
+                            finished = true
+                        ),
+                        turnComplete = true
+                    )
+                )
+            )
+            runCurrent()
+            job.join()
+
+            assertFalse(fallbackCalled)
+            assertEquals(1, createdSessions.size)
+            assertEquals(part1Audio.size + part2Audio.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `silent hang after SetupComplete times out at 12s first-audio timeout instead of waiting 71s`() = runTest {
+        val paragraph400Chars = List(80) { "word" }.joinToString(" ")
+        val createdAtMs = mutableListOf<Long>()
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                createdAtMs += currentTime
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val validPcm = encodeToneBytes(11_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = paragraph400Chars, voiceId = "Charon")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+
+            advanceTimeBy(12_100L)
+            runCurrent()
+            assertTrue("Expected rotation at ~12s first-audio timeout, got ${createdSessions.size} sessions", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertTrue("Second session must open before 20s (got ${createdAtMs[1]}ms)", createdAtMs[1] < 20_000L)
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(pcmBytes = validPcm, transcript = paragraph400Chars, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(validPcm.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `zero-audio generationComplete fails fast in 2s instead of waiting 12s or full turn timeout`() = runTest {
+        val paragraph400Chars = List(80) { "word" }.joinToString(" ")
+        val createdAtMs = mutableListOf<Long>()
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                createdAtMs += currentTime
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val validPcm = encodeToneBytes(11_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = paragraph400Chars, voiceId = "Charon")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(generationComplete = true, turnComplete = false)
+                )
+            )
+            runCurrent()
+
+            advanceTimeBy(2_100L)
+            runCurrent()
+            assertTrue("Expected fail-fast rotation in ~2s for zero-audio generationComplete", createdSessions.size >= 2)
+            assertTrue("Second session must open well under 5s (got ${createdAtMs[1]}ms)", createdAtMs[1] < 5_000L)
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(pcmBytes = validPcm, transcript = paragraph400Chars, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(validPcm.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `mid-stream runaway active audio exceeding maxActiveMs aborts immediately without waiting for turnComplete`() = runTest {
+        val shortLine = "Short four word line."
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val halfRunaway = encodeToneBytes(4_500)
+            val cleanRetryPcm = encodeToneBytes(1_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = shortLine, voiceId = "Zephyr")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+
+            createdSessions[0].emitServerMessage(audioServerMessage(halfRunaway, turnComplete = false))
+            runCurrent()
+            assertEquals("4.5s active audio <= 8s limit must not abort yet", 1, createdSessions.size)
+
+            createdSessions[0].emitServerMessage(audioServerMessage(halfRunaway, turnComplete = false))
+            runCurrent()
+            assertTrue("9s active audio (> 8s max for 4 words) must abort mid-stream immediately", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(cleanRetryPcm, transcript = shortLine, turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(cleanRetryPcm.size, collected.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `pre-turn stream failure between connect and executeTurnOnCurrentSession fails fast without hanging`() = runTest {
+        var sessionIdx = 0
+        val createdSessions = mutableListOf<LiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                val idx = sessionIdx++
+                if (idx == 0) {
+                    object : LiveSession {
+                        override val incomingMessages: Flow<LiveServerMessage> = kotlinx.coroutines.flow.flow {
+                            throw IOException("Immediate WebSocket close code=1000")
+                        }
+                        override var isConnected: Boolean = false
+                            private set
+                        override suspend fun connect(apiKey: String, setup: SetupConfig) {
+                            isConnected = true
+                        }
+                        override suspend fun send(message: LiveClientMessage) {}
+                        override suspend fun disconnect() {
+                            isConnected = false
+                        }
+                    }.also { createdSessions += it }
+                } else {
+                    FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+                }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val cleanPcm = encodeToneBytes(1_000)
+            val collected = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Short clean line.", voiceId = "Charon")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+
+            assertEquals("Pre-turn failure must immediately rotate without waiting for timeout", 0L, currentTime)
+            assertEquals(2, createdSessions.size)
+
+            val healthy = createdSessions[1] as FakeReplayLiveSession
+            healthy.emitServerMessage(
+                audioServerMessage(cleanPcm, transcript = "Short clean line.", turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(cleanPcm.size, collected.sumOf { it.data.size })
         } finally {
             live.close()
         }

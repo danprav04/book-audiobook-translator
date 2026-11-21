@@ -166,6 +166,7 @@ class GeminiLiveEngine(
         private val turnMutex = Mutex()
         private val activeChannelRef = AtomicReference<Channel<TurnEvent>?>(null)
         private val needsRotationFlag = AtomicBoolean(false)
+        private val sessionStreamFailure = AtomicReference<Throwable?>(null)
 
         private var liveSession: LiveSession? = null
         private var readerJob: Job? = null
@@ -299,8 +300,10 @@ class GeminiLiveEngine(
                 }
                 val countingRotation = hasOpenedAnySession
                 var rotatedThisTurn = false
+                var generationAttempts = 0
                 val softFailedCandidates = mutableListOf<String>()
                 for (candidateModel in orderedCandidates) {
+                    if (generationAttempts >= MAX_LIVE_GENERATION_ATTEMPTS_PER_TURN) break
                     val attempt = attemptCandidateOnFreshSession(
                         liveSessionFactory = factory,
                         apiKey = apiKey,
@@ -316,13 +319,16 @@ class GeminiLiveEngine(
                         emitChunk = { chunk -> emit(chunk) }
                     )
                     rotatedThisTurn = rotatedThisTurn || attempt.rotatedThisTurn
+                    if (attempt.consumedGenerationAttempt) {
+                        generationAttempts++
+                    }
                     if (attempt.emittedAnyAudio) {
                         return@withLock
                     }
                 }
 
                 // 2b. Bounded soft-failure retry on the top still-available candidate before TTS fallback.
-                if (softFailedCandidates.isNotEmpty()) {
+                if (softFailedCandidates.isNotEmpty() && generationAttempts < MAX_LIVE_GENERATION_ATTEMPTS_PER_TURN) {
                     val retryOrder = buildList {
                         val verified = lastVerifiedModel?.takeIf { it in softFailedCandidates }
                         if (verified != null) add(verified)
@@ -332,7 +338,11 @@ class GeminiLiveEngine(
                     }
                     var softRetryAttempts = 0
                     for (retryModel in retryOrder) {
-                        if (softRetryAttempts >= MAX_SOFT_RETRY_ATTEMPTS) break
+                        if (softRetryAttempts >= MAX_SOFT_RETRY_ATTEMPTS ||
+                            generationAttempts >= MAX_LIVE_GENERATION_ATTEMPTS_PER_TURN
+                        ) {
+                            break
+                        }
                         if (quotaTracker != null && !quotaTracker.isModelAvailable(retryModel)) {
                             continue
                         }
@@ -357,6 +367,9 @@ class GeminiLiveEngine(
                             emitChunk = { chunk -> emit(chunk) }
                         )
                         rotatedThisTurn = rotatedThisTurn || retryAttempt.rotatedThisTurn
+                        if (retryAttempt.consumedGenerationAttempt) {
+                            generationAttempts++
+                        }
                         if (retryAttempt.emittedAnyAudio) {
                             return@withLock
                         }
@@ -413,7 +426,11 @@ class GeminiLiveEngine(
             emitChunk: suspend (PcmChunk) -> Unit
         ): CandidateAttemptResult {
             if (quotaTracker != null && !quotaTracker.isModelAvailable(candidateModel)) {
-                return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = false)
+                return CandidateAttemptResult(
+                    emittedAnyAudio = false,
+                    rotatedThisTurn = false,
+                    consumedGenerationAttempt = false
+                )
             }
 
             val openStatus = openCandidateSessionLocked(
@@ -431,7 +448,11 @@ class GeminiLiveEngine(
                 ) {
                     softFailedCandidates += candidateModel
                 }
-                return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = false)
+                return CandidateAttemptResult(
+                    emittedAnyAudio = false,
+                    rotatedThisTurn = false,
+                    consumedGenerationAttempt = (openStatus == OpenCandidateStatus.SOFT_FAILURE)
+                )
             }
 
             var rotatedNow = false
@@ -441,7 +462,11 @@ class GeminiLiveEngine(
             }
 
             val active = liveSession
-                ?: return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = rotatedNow)
+                ?: return CandidateAttemptResult(
+                    emittedAnyAudio = false,
+                    rotatedThisTurn = rotatedNow,
+                    consumedGenerationAttempt = true
+                )
             val outcome = executeTurnOnCurrentSession(
                 session = active,
                 cleanModel = candidateModel,
@@ -457,7 +482,11 @@ class GeminiLiveEngine(
                 if (outcome.rotateAfterTurn) {
                     needsRotationFlag.set(true)
                 }
-                return CandidateAttemptResult(emittedAnyAudio = true, rotatedThisTurn = rotatedNow)
+                return CandidateAttemptResult(
+                    emittedAnyAudio = true,
+                    rotatedThisTurn = rotatedNow,
+                    consumedGenerationAttempt = true
+                )
             }
 
             if (softFailedCandidates != null &&
@@ -467,7 +496,11 @@ class GeminiLiveEngine(
                 softFailedCandidates += candidateModel
             }
             closeCurrentLiveSessionLocked()
-            return CandidateAttemptResult(emittedAnyAudio = false, rotatedThisTurn = rotatedNow)
+            return CandidateAttemptResult(
+                emittedAnyAudio = false,
+                rotatedThisTurn = rotatedNow,
+                consumedGenerationAttempt = true
+            )
         }
 
         private suspend fun openCandidateSessionLocked(
@@ -511,6 +544,7 @@ class GeminiLiveEngine(
                 )
 
                 needsRotationFlag.set(false)
+                sessionStreamFailure.set(null)
                 candidateReader = launchSessionReader(session, cleanModel)
                 session.connect(apiKey, setup)
 
@@ -571,6 +605,7 @@ class GeminiLiveEngine(
                             level = "ERROR",
                             throwable = error
                         )
+                        sessionStreamFailure.compareAndSet(null, error)
                         needsRotationFlag.set(true)
                         activeChannelRef.get()?.trySend(TurnEvent.StreamFailed(error))
                     }
@@ -677,162 +712,253 @@ class GeminiLiveEngine(
             var timedOut = false
             var hardModelError = false
             var bufferedTotalBytes = 0
+            var bufferedTotalFrames = 0L
+            var firstActiveFrameSeen = -1L
+            var lastActiveFrameSeen = -1L
+            var lastChunkSampleRate = 24000
+            var lastChunkChannels = 1
             var consecutiveSilentFrames = 0L
             var abortedMidStreamDeadAir = false
+            var abortedMidStreamRunaway = false
+
+            fun recordStreamFailure(error: Throwable) {
+                previousTurnEndedWithoutTurnComplete = false
+                inferErrorCode(error)?.let { code ->
+                    if (code in HARD_MODEL_ERROR_CODES) {
+                        hardModelError = true
+                    }
+                    quotaTracker?.recordHttpError(
+                        modelId = cleanModel,
+                        httpCode = code,
+                        responseBody = error.message.orEmpty()
+                    )
+                }
+                failed = true
+            }
 
             try {
-                session.send(
-                    LiveClientMessage.ClientContentMessage(
-                        ClientContentData(
-                            turns = listOf(
-                                ContentTurn(
-                                    role = "user",
-                                    parts = listOf(Part(text = formatTurnPrompt(request.text)))
-                                )
-                            ),
-                            turnComplete = true
+                val preSendFailure = sessionStreamFailure.get()
+                if (preSendFailure != null) {
+                    recordStreamFailure(preSendFailure)
+                } else {
+                    session.send(
+                        LiveClientMessage.ClientContentMessage(
+                            ClientContentData(
+                                turns = listOf(
+                                    ContentTurn(
+                                        role = "user",
+                                        parts = listOf(Part(text = formatTurnPrompt(request.text)))
+                                    )
+                                ),
+                                turnComplete = true
+                            )
                         )
                     )
-                )
-
-                while (true) {
-                    val stepTimeoutMs = when {
-                        !collectedAnyAudio -> timeoutMs
-                        sawGenerationComplete && sawTranscriptionFinished ->
-                            minOf(timeoutMs, POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS)
-                        sawGenerationComplete ->
-                            minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
-                        transcriptBuilder.isEmpty() || sourceWordCount <= 0 ||
-                            countWords(transcriptBuilder.toString()) * 100 >= sourceWordCount * 85 ->
-                            minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
-                        else ->
-                            minOf(timeoutMs, MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS)
-                    }
-                    val event = withTimeoutOrNull(stepTimeoutMs) {
-                        turnChannel.receive()
-                    }
-                    if (event == null) {
-                        if (!collectedAnyAudio) {
-                            timedOut = true
-                            DiagnosticLogBuffer.record(
-                                "GeminiLiveEngine",
-                                "Live turn timed out after ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=false)",
-                                level = "WARN"
-                            )
-                        } else {
-                            idleTimedOutAfterAudio = true
-                            idleStepTimeoutMs = stepTimeoutMs
-                        }
-                        break
-                    }
-                    when (event) {
-                        is TurnEvent.AudioChunk -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            collectedAnyAudio = true
-                            if (bufferedChunks != null) {
-                                bufferedChunks.add(event.chunk)
-                                if (!isExpressivePunctuation) {
-                                    bufferedTotalBytes += event.chunk.data.size
-                                    consecutiveSilentFrames = updateTrailingSilentFrames(
-                                        priorSilentFrames = consecutiveSilentFrames,
-                                        chunk = event.chunk
-                                    )
-                                    val chunkSampleRate = event.chunk.sampleRate.takeIf { it > 0 } ?: 24000
-                                    val silentMs = (consecutiveSilentFrames * 1000L) / chunkSampleRate
-                                    if (bufferedTotalBytes > 256 && silentMs > MAX_EDGE_SILENCE_BEFORE_REJECT_MS) {
+                    val postSendFailure = sessionStreamFailure.get()
+                    if (postSendFailure != null) {
+                        recordStreamFailure(postSendFailure)
+                    } else {
+                        val finishedWithinDeadline = withTimeoutOrNull(timeoutMs) {
+                            while (true) {
+                                val stepTimeoutMs = when {
+                                    !collectedAnyAudio && sawGenerationComplete ->
+                                        minOf(timeoutMs, POST_GENERATION_INCOMPLETE_IDLE_TIMEOUT_MS)
+                                    !collectedAnyAudio ->
+                                        minOf(timeoutMs, FIRST_AUDIO_TIMEOUT_MS)
+                                    sawGenerationComplete -> {
+                                        val transcriptWords = if (transcriptBuilder.isEmpty()) 0 else countWords(transcriptBuilder.toString())
+                                        val transcriptCaughtUp = isExpressivePunctuation ||
+                                            sourceWordCount <= 0 ||
+                                            (transcriptWords > 0 && transcriptWords * 100 >= sourceWordCount * 85)
+                                        val audioMeetsMinSoFar = bufferedChunks == null ||
+                                            isExpressivePunctuation ||
+                                            bufferedTotalBytes <= 256 ||
+                                            (firstActiveFrameSeen >= 0L &&
+                                                ((lastActiveFrameSeen - firstActiveFrameSeen + 1L) * 1000L) / lastChunkSampleRate >=
+                                                minExpectedSpokenDurationMs(
+                                                    sourceText = request.text,
+                                                    sourceWordCount = sourceWordCount,
+                                                    hasTranscript = transcriptWords > 0
+                                                ))
+                                        when {
+                                            sawTranscriptionFinished && transcriptCaughtUp && audioMeetsMinSoFar ->
+                                                minOf(timeoutMs, POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS)
+                                            transcriptCaughtUp && audioMeetsMinSoFar ->
+                                                minOf(timeoutMs, POST_GENERATION_IDLE_TIMEOUT_MS)
+                                            else ->
+                                                minOf(timeoutMs, POST_GENERATION_INCOMPLETE_IDLE_TIMEOUT_MS)
+                                        }
+                                    }
+                                    transcriptBuilder.isEmpty() || sourceWordCount <= 0 ||
+                                        countWords(transcriptBuilder.toString()) * 100 >= sourceWordCount * 85 ->
+                                        minOf(timeoutMs, POST_AUDIO_IDLE_TIMEOUT_MS)
+                                    else ->
+                                        minOf(timeoutMs, MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS)
+                                }
+                                val event = withTimeoutOrNull(stepTimeoutMs) {
+                                    turnChannel.receive()
+                                }
+                                if (event == null) {
+                                    if (!collectedAnyAudio) {
+                                        timedOut = true
                                         DiagnosticLogBuffer.record(
                                             "GeminiLiveEngine",
-                                            "Aborted dead-air stall mid-stream (${silentMs}ms continuous silence) on model=$cleanModel; rotating session",
+                                            "Live turn timed out after ${stepTimeoutMs}ms awaiting audio (model=$cleanModel, chars=${request.text.length}, genComplete=$sawGenerationComplete)",
                                             level = "WARN"
                                         )
+                                    } else {
+                                        idleTimedOutAfterAudio = true
+                                        idleStepTimeoutMs = stepTimeoutMs
+                                    }
+                                    break
+                                }
+                                when (event) {
+                                    is TurnEvent.AudioChunk -> {
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        collectedAnyAudio = true
+                                        if (bufferedChunks != null) {
+                                            bufferedChunks.add(event.chunk)
+                                            if (!isExpressivePunctuation) {
+                                                bufferedTotalBytes += event.chunk.data.size
+                                                val chunkChannels = event.chunk.channels.coerceAtLeast(1)
+                                                val chunkSampleRate = event.chunk.sampleRate.takeIf { it > 0 } ?: 24000
+                                                val chunkBytesPerFrame = chunkChannels * 2
+                                                val chunkFrames = (event.chunk.data.size / chunkBytesPerFrame).toLong()
+                                                lastChunkSampleRate = chunkSampleRate
+                                                lastChunkChannels = chunkChannels
+                                                if (chunkFrames > 0L) {
+                                                    var firstLocalActive = -1L
+                                                    var lastLocalActive = -1L
+                                                    val d = event.chunk.data
+                                                    for (f in 0 until chunkFrames.toInt()) {
+                                                        if (isFrameActive(d, f * chunkBytesPerFrame, chunkChannels)) {
+                                                            if (firstLocalActive < 0L) firstLocalActive = f.toLong()
+                                                            lastLocalActive = f.toLong()
+                                                        }
+                                                    }
+                                                    if (firstLocalActive >= 0L) {
+                                                        if (firstActiveFrameSeen < 0L) {
+                                                            firstActiveFrameSeen = bufferedTotalFrames + firstLocalActive
+                                                        }
+                                                        lastActiveFrameSeen = bufferedTotalFrames + lastLocalActive
+                                                        consecutiveSilentFrames = (chunkFrames - 1L) - lastLocalActive
+                                                    } else {
+                                                        consecutiveSilentFrames += chunkFrames
+                                                    }
+                                                    bufferedTotalFrames += chunkFrames
+                                                }
+                                                val silentMs = (consecutiveSilentFrames * 1000L) / chunkSampleRate
+                                                if (bufferedTotalBytes > 256 && silentMs > MAX_EDGE_SILENCE_BEFORE_REJECT_MS) {
+                                                    DiagnosticLogBuffer.record(
+                                                        "GeminiLiveEngine",
+                                                        "Aborted dead-air stall mid-stream (${silentMs}ms continuous silence) on model=$cleanModel; rotating session",
+                                                        level = "WARN"
+                                                    )
+                                                    needsRotationFlag.set(true)
+                                                    abortedMidStreamDeadAir = true
+                                                    failed = true
+                                                    break
+                                                }
+                                                if (bufferedTotalBytes > 256 && sourceWordCount > 0 && firstActiveFrameSeen >= 0L) {
+                                                    val activeSpanMs = ((lastActiveFrameSeen - firstActiveFrameSeen + 1L) * 1000L) / chunkSampleRate
+                                                    val maxActiveMs = maxActiveDurationMs(sourceWordCount)
+                                                    if (activeSpanMs > maxActiveMs) {
+                                                        DiagnosticLogBuffer.record(
+                                                            "GeminiLiveEngine",
+                                                            "Aborted runaway active audio mid-stream (${activeSpanMs}ms > max=${maxActiveMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
+                                                            level = "WARN"
+                                                        )
+                                                        needsRotationFlag.set(true)
+                                                        abortedMidStreamRunaway = true
+                                                        failed = true
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            emittedAnyAudio = true
+                                            emitChunk(event.chunk)
+                                        }
+                                    }
+                                    is TurnEvent.Transcript -> {
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        appendTranscriptFragment(transcriptBuilder, event.text)
+                                    }
+                                    is TurnEvent.TranscriptionFinished -> {
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        sawTranscriptionFinished = true
+                                    }
+                                    is TurnEvent.GenerationComplete -> {
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        sawGenerationComplete = true
+                                    }
+                                    is TurnEvent.TurnComplete -> {
+                                        if (!collectedAnyAudio &&
+                                            transcriptBuilder.isEmpty() &&
+                                            !sawGenerationComplete &&
+                                            previousTurnEndedWithoutTurnComplete
+                                        ) {
+                                            // Consume ONE stray turnComplete from the prior turn that finalized on generationComplete.
+                                            previousTurnEndedWithoutTurnComplete = false
+                                            continue
+                                        }
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        completedTurn = true
+                                        break
+                                    }
+                                    is TurnEvent.TurnInterrupted -> {
+                                        if (!collectedAnyAudio &&
+                                            transcriptBuilder.isEmpty() &&
+                                            !sawGenerationComplete &&
+                                            previousTurnEndedWithoutTurnComplete &&
+                                            !consumedPriorInterruptedAck
+                                        ) {
+                                            // Expected barge-in ACK from a prior generationComplete-finalized turn
+                                            // on a reused WebSocket. Keep previousTurnEndedWithoutTurnComplete = true
+                                            // so the paired TurnComplete arriving moments later is also consumed.
+                                            consumedPriorInterruptedAck = true
+                                            DiagnosticLogBuffer.record(
+                                                "GeminiLiveEngine",
+                                                "Consumed prior-turn barge-in interrupted ACK on reused session (model=$cleanModel)",
+                                                level = "INFO"
+                                            )
+                                            continue
+                                        }
+                                        previousTurnEndedWithoutTurnComplete = false
                                         needsRotationFlag.set(true)
-                                        abortedMidStreamDeadAir = true
+                                        DiagnosticLogBuffer.record(
+                                            "GeminiLiveEngine",
+                                            "Live turn interrupted by server on model=$cleanModel; rotating session",
+                                            level = "WARN"
+                                        )
+                                        interrupted = true
                                         failed = true
                                         break
                                     }
+                                    is TurnEvent.ServerError -> {
+                                        previousTurnEndedWithoutTurnComplete = false
+                                        if (event.code in HARD_MODEL_ERROR_CODES) {
+                                            hardModelError = true
+                                        }
+                                        failed = true
+                                        break
+                                    }
+                                    is TurnEvent.StreamFailed -> {
+                                        recordStreamFailure(event.error)
+                                        break
+                                    }
                                 }
-                            } else {
-                                emittedAnyAudio = true
-                                emitChunk(event.chunk)
                             }
+                            true
                         }
-                        is TurnEvent.Transcript -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            appendTranscriptFragment(transcriptBuilder, event.text)
-                        }
-                        is TurnEvent.TranscriptionFinished -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            sawTranscriptionFinished = true
-                        }
-                        is TurnEvent.GenerationComplete -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            sawGenerationComplete = true
-                        }
-                        is TurnEvent.TurnComplete -> {
-                            if (!collectedAnyAudio &&
-                                transcriptBuilder.isEmpty() &&
-                                !sawGenerationComplete &&
-                                previousTurnEndedWithoutTurnComplete
-                            ) {
-                                // Consume ONE stray turnComplete from the prior turn that finalized on generationComplete.
-                                previousTurnEndedWithoutTurnComplete = false
-                                continue
-                            }
-                            previousTurnEndedWithoutTurnComplete = false
-                            completedTurn = true
-                            break
-                        }
-                        is TurnEvent.TurnInterrupted -> {
-                            if (!collectedAnyAudio &&
-                                transcriptBuilder.isEmpty() &&
-                                !sawGenerationComplete &&
-                                previousTurnEndedWithoutTurnComplete &&
-                                !consumedPriorInterruptedAck
-                            ) {
-                                // Expected barge-in ACK from a prior generationComplete-finalized turn
-                                // on a reused WebSocket. Keep previousTurnEndedWithoutTurnComplete = true
-                                // so the paired TurnComplete arriving moments later is also consumed.
-                                consumedPriorInterruptedAck = true
-                                DiagnosticLogBuffer.record(
-                                    "GeminiLiveEngine",
-                                    "Consumed prior-turn barge-in interrupted ACK on reused session (model=$cleanModel)",
-                                    level = "INFO"
-                                )
-                                continue
-                            }
-                            previousTurnEndedWithoutTurnComplete = false
+                        if (finishedWithinDeadline == null) {
+                            timedOut = true
                             needsRotationFlag.set(true)
                             DiagnosticLogBuffer.record(
                                 "GeminiLiveEngine",
-                                "Live turn interrupted by server on model=$cleanModel; rotating session",
+                                "Live turn exceeded overall deadline of ${timeoutMs}ms (model=$cleanModel, chars=${request.text.length}, collectedAudio=$collectedAnyAudio)",
                                 level = "WARN"
                             )
-                            interrupted = true
-                            failed = true
-                            break
-                        }
-                        is TurnEvent.ServerError -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            if (event.code in HARD_MODEL_ERROR_CODES) {
-                                hardModelError = true
-                            }
-                            failed = true
-                            break
-                        }
-                        is TurnEvent.StreamFailed -> {
-                            previousTurnEndedWithoutTurnComplete = false
-                            inferErrorCode(event.error)?.let { code ->
-                                if (code in HARD_MODEL_ERROR_CODES) {
-                                    hardModelError = true
-                                }
-                                quotaTracker?.recordHttpError(
-                                    modelId = cleanModel,
-                                    httpCode = code,
-                                    responseBody = event.error.message.orEmpty()
-                                )
-                            }
-                            failed = true
-                            break
                         }
                     }
                 }
@@ -885,19 +1011,20 @@ class GeminiLiveEngine(
             } else {
                 countSwallowedSourceWords(request.text, outputTranscript, ignoredTailWords = tailGraceWords)
             }
-            val durationOk = !abortedMidStreamDeadAir && isBufferedAudioHealthy(
+            val durationOk = !abortedMidStreamDeadAir && !abortedMidStreamRunaway && isBufferedAudioHealthy(
                 bufferedChunks = bufferedChunks,
                 collectedAnyAudio = collectedAnyAudio,
                 isExpressivePunctuation = isExpressivePunctuation,
                 outputTranscript = outputTranscript,
                 sourceWordCount = sourceWordCount,
-                cleanModel = cleanModel
+                cleanModel = cleanModel,
+                sourceText = request.text
             )
             val transcriptOk = outputTranscript.isEmpty() ||
                 expressiveTranscriptAcceptable ||
                 (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase &&
                     swallowedWords <= allowedSwallowedWords(sourceWordCount))
-            if (!abortedMidStreamDeadAir && !transcriptOk) {
+            if (!abortedMidStreamDeadAir && !abortedMidStreamRunaway && !transcriptOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
                     "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, swallowed=$swallowedWords) on model=$cleanModel; rotating session",
@@ -913,9 +1040,14 @@ class GeminiLiveEngine(
                     // ("interrupted: true") or audio-history TPM bloat.
                     completedTurn = true
                     needsRotationFlag.set(true)
+                    val bufferedAudioMs = if (bufferedChunks != null && lastChunkSampleRate > 0) {
+                        (bufferedTotalFrames * 1000L) / lastChunkSampleRate
+                    } else {
+                        0L
+                    }
                     DiagnosticLogBuffer.record(
                         "GeminiLiveEngine",
-                        "Live turn finalized after generationComplete (${idleStepTimeoutMs}ms idle, txFinished=$sawTranscriptionFinished, model=$cleanModel, chars=${request.text.length}); rotating session for next turn",
+                        "Live turn finalized after generationComplete (${idleStepTimeoutMs}ms idle, txFinished=$sawTranscriptionFinished, model=$cleanModel, chars=${request.text.length}, audioMs=${bufferedAudioMs}ms, txWords=$outputWordCount/$sourceWordCount); rotating session for next turn",
                         level = if (similarityOk) "INFO" else "WARN"
                     )
                 } else {
@@ -934,13 +1066,18 @@ class GeminiLiveEngine(
                 }
             }
 
-            val audioGlitch = bufferedChunks != null && collectedAnyAudio && !isExpressivePunctuation &&
-                completedTurn && !failed &&
-                hasPcmGlitch(bufferedChunks)
+            val glitchReason = if (bufferedChunks != null && collectedAnyAudio && !isExpressivePunctuation &&
+                completedTurn && !failed
+            ) {
+                detectPcmGlitchReason(bufferedChunks)
+            } else {
+                null
+            }
+            val audioGlitch = glitchReason != null
             if (audioGlitch) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Detected mid-speech audio glitch (dropout/click) in Live turn on model=$cleanModel; regenerating",
+                    "Detected mid-speech audio glitch (dropout/click, reason=$glitchReason) in Live turn on model=$cleanModel; regenerating",
                     level = "WARN"
                 )
             }
@@ -988,6 +1125,7 @@ class GeminiLiveEngine(
             charsInSession = 0
             previousTurnEndedWithoutTurnComplete = false
             needsRotationFlag.set(false)
+            sessionStreamFailure.set(null)
             activeChannelRef.set(null)
             withContext(NonCancellable) {
                 oldReader?.cancel()
@@ -1020,7 +1158,8 @@ class GeminiLiveEngine(
 
     private data class CandidateAttemptResult(
         val emittedAnyAudio: Boolean,
-        val rotatedThisTurn: Boolean
+        val rotatedThisTurn: Boolean,
+        val consumedGenerationAttempt: Boolean = false
     )
 
     private data class TurnOutcome(
@@ -1070,8 +1209,19 @@ class GeminiLiveEngine(
             return
         }
         try {
-            val catalog = modelCatalogService.listModels(apiKey)
-            quotaTracker.markCatalogLoadedForKey(apiKey, catalog.models)
+            val catalog = withTimeoutOrNull(CATALOG_LOAD_TIMEOUT_MS) {
+                modelCatalogService.listModels(apiKey)
+            }
+            if (catalog != null) {
+                quotaTracker.markCatalogLoadedForKey(apiKey, catalog.models)
+            } else {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Model catalog load timed out after ${CATALOG_LOAD_TIMEOUT_MS}ms; using built-in Live candidate pool",
+                    level = "WARN"
+                )
+                quotaTracker.markCatalogLoadedForKey(apiKey, emptyList())
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (_: Throwable) {
@@ -1128,11 +1278,17 @@ class GeminiLiveEngine(
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
+        private const val FIRST_AUDIO_TIMEOUT_MS = 12_000L
         private const val POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS = 250L
         private const val POST_GENERATION_IDLE_TIMEOUT_MS = 400L
+        private const val POST_GENERATION_INCOMPLETE_IDLE_TIMEOUT_MS = 2_000L
         private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_500L
         private const val MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS = 4_500L
+        private const val CATALOG_LOAD_TIMEOUT_MS = 4_000L
+        private const val MAX_LIVE_GENERATION_ATTEMPTS_PER_TURN = 4
         private const val MAX_SOFT_RETRY_ATTEMPTS = 1
+        internal const val MIN_EMPTY_TRANSCRIPT_MS_PER_EFFECTIVE_CHAR = 38L
+        internal const val MIN_VERIFIED_TRANSCRIPT_MS_PER_EFFECTIVE_CHAR = 28L
         private val HARD_MODEL_ERROR_CODES = setOf(400, 401, 403, 404, 429, 1007, 1008)
         private const val MIN_TRIM_DURATION_MS = 300L
         private const val LEAD_SILENCE_THRESHOLD_MS = 180L
@@ -1335,19 +1491,17 @@ class GeminiLiveEngine(
         }
 
         /**
-         * Detects model-side audio defects inside a buffered 16-bit PCM turn: abrupt waveform
-         * discontinuities (clicks from dropped samples) and short digital-silence dropouts that
-         * begin and end abruptly in loud speech (the "word cut in half / stutter" artifact).
-         * Natural pauses decay smoothly, so they are not flagged.
+         * Detects model-side audio defects inside a buffered 16-bit PCM turn and returns a human-readable
+         * reason string when found, or `null` if clean.
          */
-        internal fun hasPcmGlitch(chunks: List<PcmChunk>): Boolean {
-            if (chunks.isEmpty()) return false
+        internal fun detectPcmGlitchReason(chunks: List<PcmChunk>): String? {
+            if (chunks.isEmpty()) return null
             val channels = chunks.first().channels.coerceAtLeast(1)
             val sampleRate = chunks.first().sampleRate.takeIf { it > 0 } ?: 24000
             val bytesPerFrame = channels * 2
             val total = chunks.sumOf { it.data.size }
             val frames = total / bytesPerFrame
-            if (frames < 2) return false
+            if (frames < 2) return null
             val pcm = ByteArray(total)
             var off = 0
             for (c in chunks) { c.data.copyInto(pcm, off); off += c.data.size }
@@ -1361,21 +1515,31 @@ class GeminiLiveEngine(
             while (f < frames) {
                 val prev = at(f - 1)
                 val cur = at(f)
-                if (abs(cur - prev) > GLITCH_JUMP_THRESHOLD) return true
+                val diff = abs(cur - prev)
+                if (diff > GLITCH_JUMP_THRESHOLD) return "jump(diff=$diff)"
                 if (cur == 0 && abs(prev) > GLITCH_EDGE_AMPLITUDE) {
                     var end = f
                     while (end < frames && at(end) == 0) end++
                     val run = end - f
                     if (run in minDropout..maxDropout && end < frames && abs(at(end)) > GLITCH_EDGE_AMPLITUDE) {
-                        return true
+                        val ms = (run * 1000L) / sampleRate
+                        return "dropout(ms=$ms,prev=$prev,next=${at(end)})"
                     }
                     f = end
                     continue
                 }
                 f++
             }
-            return false
+            return null
         }
+
+        /**
+         * Detects model-side audio defects inside a buffered 16-bit PCM turn: abrupt waveform
+         * discontinuities (clicks from dropped samples) and short digital-silence dropouts that
+         * begin and end abruptly in loud speech (the "word cut in half / stutter" artifact).
+         * Natural pauses decay smoothly, so they are not flagged.
+         */
+        internal fun hasPcmGlitch(chunks: List<PcmChunk>): Boolean = detectPcmGlitchReason(chunks) != null
 
         internal fun formatTurnPrompt(text: String): String = "<read>$text</read>"
 
@@ -1410,13 +1574,90 @@ class GeminiLiveEngine(
             return priorSilentFrames + frameCount.toLong()
         }
 
+        internal fun maxActiveDurationMs(sourceWordCount: Int): Long =
+            maxOf(8_000L, sourceWordCount * 1_500L)
+
+        internal fun computeEffectiveLatinCharCount(text: String): Int {
+            var count = 0
+            for (ch in text) {
+                if (!ch.isLetterOrDigit()) continue
+                val code = ch.code
+                val isCjkOrKanaOrHangul = code in 0x3040..0x30FF ||
+                    code in 0x3400..0x4DBF ||
+                    code in 0x4E00..0x9FFF ||
+                    code in 0xAC00..0xD7AF ||
+                    code in 0xF900..0xFAFF
+                count += if (isCjkOrKanaOrHangul) 4 else 1
+            }
+            return count
+        }
+
+        internal fun minExpectedSpokenDurationMs(
+            sourceText: String,
+            sourceWordCount: Int,
+            hasTranscript: Boolean
+        ): Long {
+            val effectiveChars = if (sourceText.isNotBlank()) {
+                computeEffectiveLatinCharCount(sourceText)
+            } else {
+                sourceWordCount * 5
+            }
+            return if (!hasTranscript) {
+                if (effectiveChars < 15 && sourceWordCount < 4) {
+                    150L
+                } else {
+                    (effectiveChars * MIN_EMPTY_TRANSCRIPT_MS_PER_EFFECTIVE_CHAR).coerceIn(300L, 35_000L)
+                }
+            } else {
+                if (effectiveChars < 20) {
+                    150L
+                } else {
+                    (effectiveChars * MIN_VERIFIED_TRANSCRIPT_MS_PER_EFFECTIVE_CHAR).coerceIn(300L, 30_000L)
+                }
+            }
+        }
+
+        internal fun measureEffectiveSpokenDurationMs(
+            chunks: List<PcmChunk>,
+            firstActiveFrame: Long,
+            lastActiveFrame: Long,
+            sampleRate: Int,
+            channels: Int,
+            bytesPerFrame: Int
+        ): Long {
+            if (sampleRate <= 0 || lastActiveFrame < firstActiveFrame) return 0L
+            val maxSilenceFrames = (sampleRate.toLong() * COMPRESSED_INTERNAL_SILENCE_MS) / 1000L
+            var countedFrames = 0L
+            var silenceRunFrames = 0L
+            var globalFrame = 0L
+            scan@ for (chunk in chunks) {
+                val d = chunk.data
+                var off = 0
+                while (off + bytesPerFrame <= d.size) {
+                    if (globalFrame > lastActiveFrame) break@scan
+                    if (globalFrame >= firstActiveFrame) {
+                        if (isFrameActive(d, off, channels)) {
+                            countedFrames += 1L + minOf(silenceRunFrames, maxSilenceFrames)
+                            silenceRunFrames = 0L
+                        } else {
+                            silenceRunFrames++
+                        }
+                    }
+                    off += bytesPerFrame
+                    globalFrame++
+                }
+            }
+            return (countedFrames * 1000L) / sampleRate
+        }
+
         internal fun isBufferedAudioHealthy(
             bufferedChunks: List<PcmChunk>?,
             collectedAnyAudio: Boolean,
             isExpressivePunctuation: Boolean,
             outputTranscript: String,
             sourceWordCount: Int,
-            cleanModel: String
+            cleanModel: String,
+            sourceText: String = ""
         ): Boolean {
             if (bufferedChunks == null || !collectedAnyAudio || isExpressivePunctuation || sourceWordCount <= 0) {
                 return true
@@ -1475,7 +1716,7 @@ class GeminiLiveEngine(
                 return false
             }
 
-            val maxActiveMs = maxOf(8_000L, sourceWordCount * 1_500L)
+            val maxActiveMs = maxActiveDurationMs(sourceWordCount)
             if (activeDurationMs > maxActiveMs) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
@@ -1485,20 +1726,26 @@ class GeminiLiveEngine(
                 return false
             }
 
-            if (outputTranscript.isEmpty()) {
-                val minActiveMs = if (sourceWordCount < 6) {
-                    150L
-                } else {
-                    (sourceWordCount * 100L).coerceAtMost(25_000L)
-                }
-                if (activeDurationMs < minActiveMs) {
-                    DiagnosticLogBuffer.record(
-                        "GeminiLiveEngine",
-                        "Empty-transcript active speech duration too short (${activeDurationMs}ms < min=${minActiveMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
-                        level = "WARN"
-                    )
-                    return false
-                }
+            val effectiveSpokenMs = measureEffectiveSpokenDurationMs(
+                chunks = bufferedChunks,
+                firstActiveFrame = firstActiveFrame,
+                lastActiveFrame = lastActiveFrame,
+                sampleRate = sampleRate,
+                channels = channels,
+                bytesPerFrame = bytesPerFrame
+            )
+            val minSpokenMs = minExpectedSpokenDurationMs(
+                sourceText = sourceText,
+                sourceWordCount = sourceWordCount,
+                hasTranscript = outputTranscript.isNotEmpty()
+            )
+            if (effectiveSpokenMs < minSpokenMs) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Truncated Live turn audio detected (effectiveSpoken=${effectiveSpokenMs}ms < min=${minSpokenMs}ms, rawActive=${activeDurationMs}ms, txEmpty=${outputTranscript.isEmpty()}, words=$sourceWordCount, chars=${sourceText.length}) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+                return false
             }
             return true
         }
