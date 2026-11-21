@@ -56,6 +56,14 @@ object ModelCatalog {
         "robotics"
     )
 
+    private val EXCLUDED_LIVE_NARRATION_KEYWORDS = listOf(
+        "translate",
+        "transcribe",
+        "extended-thinking",
+        "genie",
+        "robotics"
+    )
+
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -91,7 +99,8 @@ object ModelCatalog {
                     (methods.contains("generateContent") && nameLower.contains("tts"))
             }
             ModelRole.LIVE_NARRATION -> {
-                methods.contains("bidiGenerateContent") && !nameLower.contains("translate")
+                methods.contains("bidiGenerateContent") &&
+                    EXCLUDED_LIVE_NARRATION_KEYWORDS.none { keyword -> nameLower.contains(keyword) }
             }
             ModelRole.LIVE_TRANSCRIBE -> {
                 methods.contains("bidiGenerateContent") && nameLower.contains("transcribe")
@@ -155,9 +164,9 @@ object ModelCatalog {
             )
             ModelRole.LIVE_NARRATION -> listOf(
                 defaultModel,
-                "gemini-2.5-flash-native-audio-dialog",
-                "gemini-3.8-live",
-                "gemini-3-flash-live"
+                "gemini-3.1-flash-live-preview",
+                "gemini-2.5-flash-native-audio-latest",
+                "gemini-3.8-live"
             )
             ModelRole.LIVE_TRANSLATE -> listOf(
                 defaultModel,

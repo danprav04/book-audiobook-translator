@@ -614,14 +614,9 @@ class GeminiLiveEngine(
                                     turnChannel.trySend(TurnEvent.GenerationComplete)
                                 }
                                 if (content.interrupted == true) {
-                                    DiagnosticLogBuffer.record(
-                                        "GeminiLiveEngine",
-                                        "Live turn interrupted by server on model=$cleanModel; rotating session",
-                                        level = "WARN"
-                                    )
-                                    needsRotationFlag.set(true)
                                     turnChannel.trySend(TurnEvent.TurnInterrupted)
-                                } else if (content.turnComplete == true) {
+                                }
+                                if (content.turnComplete == true) {
                                     turnChannel.trySend(TurnEvent.TurnComplete)
                                 }
                             }
@@ -674,12 +669,16 @@ class GeminiLiveEngine(
             var completedTurn = false
             var sawGenerationComplete = false
             var sawTranscriptionFinished = false
+            var consumedPriorInterruptedAck = false
             var idleTimedOutAfterAudio = false
             var idleStepTimeoutMs = 0L
             var interrupted = false
             var failed = false
             var timedOut = false
             var hardModelError = false
+            var bufferedTotalBytes = 0
+            var consecutiveSilentFrames = 0L
+            var abortedMidStreamDeadAir = false
 
             try {
                 session.send(
@@ -688,7 +687,7 @@ class GeminiLiveEngine(
                             turns = listOf(
                                 ContentTurn(
                                     role = "user",
-                                    parts = listOf(Part(text = request.text))
+                                    parts = listOf(Part(text = formatTurnPrompt(request.text)))
                                 )
                             ),
                             turnComplete = true
@@ -732,6 +731,26 @@ class GeminiLiveEngine(
                             collectedAnyAudio = true
                             if (bufferedChunks != null) {
                                 bufferedChunks.add(event.chunk)
+                                if (!isExpressivePunctuation) {
+                                    bufferedTotalBytes += event.chunk.data.size
+                                    consecutiveSilentFrames = updateTrailingSilentFrames(
+                                        priorSilentFrames = consecutiveSilentFrames,
+                                        chunk = event.chunk
+                                    )
+                                    val chunkSampleRate = event.chunk.sampleRate.takeIf { it > 0 } ?: 24000
+                                    val silentMs = (consecutiveSilentFrames * 1000L) / chunkSampleRate
+                                    if (bufferedTotalBytes > 256 && silentMs > MAX_EDGE_SILENCE_BEFORE_REJECT_MS) {
+                                        DiagnosticLogBuffer.record(
+                                            "GeminiLiveEngine",
+                                            "Aborted dead-air stall mid-stream (${silentMs}ms continuous silence) on model=$cleanModel; rotating session",
+                                            level = "WARN"
+                                        )
+                                        needsRotationFlag.set(true)
+                                        abortedMidStreamDeadAir = true
+                                        failed = true
+                                        break
+                                    }
+                                }
                             } else {
                                 emittedAnyAudio = true
                                 emitChunk(event.chunk)
@@ -764,7 +783,30 @@ class GeminiLiveEngine(
                             break
                         }
                         is TurnEvent.TurnInterrupted -> {
+                            if (!collectedAnyAudio &&
+                                transcriptBuilder.isEmpty() &&
+                                !sawGenerationComplete &&
+                                previousTurnEndedWithoutTurnComplete &&
+                                !consumedPriorInterruptedAck
+                            ) {
+                                // Expected barge-in ACK from a prior generationComplete-finalized turn
+                                // on a reused WebSocket. Keep previousTurnEndedWithoutTurnComplete = true
+                                // so the paired TurnComplete arriving moments later is also consumed.
+                                consumedPriorInterruptedAck = true
+                                DiagnosticLogBuffer.record(
+                                    "GeminiLiveEngine",
+                                    "Consumed prior-turn barge-in interrupted ACK on reused session (model=$cleanModel)",
+                                    level = "INFO"
+                                )
+                                continue
+                            }
                             previousTurnEndedWithoutTurnComplete = false
+                            needsRotationFlag.set(true)
+                            DiagnosticLogBuffer.record(
+                                "GeminiLiveEngine",
+                                "Live turn interrupted by server on model=$cleanModel; rotating session",
+                                level = "WARN"
+                            )
                             interrupted = true
                             failed = true
                             break
@@ -834,13 +876,16 @@ class GeminiLiveEngine(
             val expressiveTranscriptAcceptable = isExpressivePunctuation &&
                 outputWordCount <= 4
             // The set-based similarity above cannot see a single swallowed/clipped word, so also
-            // require an ordered alignment with no missing source words.
+            // require an ordered alignment with no missing source words. When generationComplete
+            // finalized the turn before turnComplete arrived on longer utterances, outputTranscription
+            // can lag by up to 3 trailing words (observed on gemini-3.8-live).
+            val tailGraceWords = if (sawGenerationComplete && !completedTurn && sourceWordCount >= 12) 3 else 2
             val swallowedWords = if (isExpressivePunctuation || outputTranscript.isEmpty()) {
                 0
             } else {
-                countSwallowedSourceWords(request.text, outputTranscript)
+                countSwallowedSourceWords(request.text, outputTranscript, ignoredTailWords = tailGraceWords)
             }
-            val durationOk = isBufferedAudioDurationValid(
+            val durationOk = !abortedMidStreamDeadAir && isBufferedAudioHealthy(
                 bufferedChunks = bufferedChunks,
                 collectedAnyAudio = collectedAnyAudio,
                 isExpressivePunctuation = isExpressivePunctuation,
@@ -852,7 +897,7 @@ class GeminiLiveEngine(
                 expressiveTranscriptAcceptable ||
                 (similarity >= SIMILARITY_THRESHOLD && !excessiveExpansion && !repeatedPhrase &&
                     swallowedWords <= allowedSwallowedWords(sourceWordCount))
-            if (!transcriptOk) {
+            if (!abortedMidStreamDeadAir && !transcriptOk) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
                     "Transcript verification failed (similarity=${"%.2f".format(similarity)}, words=$outputWordCount/$sourceWordCount, repeated=$repeatedPhrase, swallowed=$swallowedWords) on model=$cleanModel; rotating session",
@@ -863,11 +908,14 @@ class GeminiLiveEngine(
 
             if (idleTimedOutAfterAudio && !failed && !interrupted) {
                 if (sawGenerationComplete) {
+                    // Rotate cleanly to a fresh WebSocket for the next turn so sending Turn N+1
+                    // before server-paced 1x turnComplete never triggers server barge-in corruption
+                    // ("interrupted: true") or audio-history TPM bloat.
                     completedTurn = true
-                    previousTurnEndedWithoutTurnComplete = true
+                    needsRotationFlag.set(true)
                     DiagnosticLogBuffer.record(
                         "GeminiLiveEngine",
-                        "Live turn finalized after generationComplete (${idleStepTimeoutMs}ms idle, txFinished=$sawTranscriptionFinished, model=$cleanModel, chars=${request.text.length})",
+                        "Live turn finalized after generationComplete (${idleStepTimeoutMs}ms idle, txFinished=$sawTranscriptionFinished, model=$cleanModel, chars=${request.text.length}); rotating session for next turn",
                         level = if (similarityOk) "INFO" else "WARN"
                     )
                 } else {
@@ -1008,6 +1056,8 @@ class GeminiLiveEngine(
     private fun candidateModelsFor(primaryModel: String): List<String> =
         quotaTracker?.liveAudioCandidatePool(primaryModel) ?: listOf(
             primaryModel.removePrefix("models/"),
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-latest",
             "gemini-3.8-live",
             "gemini-2.5-flash-native-audio-dialog",
             "gemini-3-flash-live"
@@ -1078,8 +1128,8 @@ class GeminiLiveEngine(
         const val DEFAULT_MAX_TURNS_PER_SESSION = 6
         const val DEFAULT_MAX_CHARS_PER_SESSION = 4_000
         private const val SIMILARITY_THRESHOLD = 0.75
-        private const val POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS = 300L
-        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 500L
+        private const val POST_GENERATION_FINISHED_IDLE_TIMEOUT_MS = 250L
+        private const val POST_GENERATION_IDLE_TIMEOUT_MS = 400L
         private const val POST_AUDIO_IDLE_TIMEOUT_MS = 2_500L
         private const val MID_STREAM_INCOMPLETE_IDLE_TIMEOUT_MS = 4_500L
         private const val MAX_SOFT_RETRY_ATTEMPTS = 1
@@ -1094,9 +1144,10 @@ class GeminiLiveEngine(
         private const val MAX_INTERNAL_SILENCE_MS = 750L
         private const val COMPRESSED_INTERNAL_SILENCE_MS = 420L
         private const val INTERNAL_SILENCE_FADE_MS = 8L
+        private const val MAX_EDGE_SILENCE_BEFORE_REJECT_MS = 6_000L
         private const val SILENCE_AMPLITUDE_THRESHOLD = 300
         private const val LIVE_NARRATION_TEMPERATURE = 0.4f
-        private const val GLITCH_JUMP_THRESHOLD = 16_000
+        private const val GLITCH_JUMP_THRESHOLD = 45_000
         private const val GLITCH_EDGE_AMPLITUDE = 1_500
         private val TOKEN_SPLIT_REGEX = Regex("[\\s\\u2014\\u2013\\u2026]+")
         private val SENTENCE_SPLIT_REGEX = Regex("[.!?\\n]+")
@@ -1234,10 +1285,14 @@ class GeminiLiveEngine(
         /**
          * Counts source words that have no in-order counterpart in the spoken [output] transcript
          * (an ordered alignment, so a single swallowed or clipped word is detected even when the
-         * word appears elsewhere). The last two source words are ignored because the transcript
-         * can still be arriving when the turn completes.
+         * word appears elsewhere). The final [ignoredTailWords] source words are ignored because the
+         * transcript can still be arriving when the turn completes.
          */
-        internal fun countSwallowedSourceWords(source: String, output: String): Int {
+        internal fun countSwallowedSourceWords(
+            source: String,
+            output: String,
+            ignoredTailWords: Int = 2
+        ): Int {
             val src = tokenizeForAlignment(source)
             val out = tokenizeForAlignment(output)
             if (src.isEmpty()) return 0
@@ -1273,7 +1328,7 @@ class GeminiLiveEngine(
                     j--
                 }
             }
-            val considered = (n - 2).coerceAtLeast(0)
+            val considered = (n - ignoredTailWords.coerceAtLeast(0)).coerceAtLeast(0)
             var missing = 0
             for (k in 0 until considered) if (!matched[k]) missing++
             return missing
@@ -1322,7 +1377,40 @@ class GeminiLiveEngine(
             return false
         }
 
-        private fun isBufferedAudioDurationValid(
+        internal fun formatTurnPrompt(text: String): String = "<read>$text</read>"
+
+        /**
+         * Tracks continuous trailing silent PCM frames across streaming chunks so multi-second
+         * dead-air stalls can be aborted mid-turn before turnComplete arrives.
+         */
+        internal fun updateTrailingSilentFrames(priorSilentFrames: Long, chunk: PcmChunk): Long {
+            val data = chunk.data
+            val channels = chunk.channels.coerceAtLeast(1)
+            val bytesPerFrame = channels * 2
+            val frameCount = data.size / bytesPerFrame
+            if (frameCount <= 0) return priorSilentFrames
+
+            var f = frameCount - 1
+            while (f >= 0) {
+                val frameOffset = f * bytesPerFrame
+                var active = false
+                for (ch in 0 until channels) {
+                    val idx = frameOffset + ch * 2
+                    val sample = (data[idx + 1].toInt() shl 8) or (data[idx].toInt() and 0xFF)
+                    if (abs(sample) > SILENCE_AMPLITUDE_THRESHOLD) {
+                        active = true
+                        break
+                    }
+                }
+                if (active) {
+                    return ((frameCount - 1) - f).toLong()
+                }
+                f--
+            }
+            return priorSilentFrames + frameCount.toLong()
+        }
+
+        internal fun isBufferedAudioHealthy(
             bufferedChunks: List<PcmChunk>?,
             collectedAnyAudio: Boolean,
             isExpressivePunctuation: Boolean,
@@ -1330,29 +1418,89 @@ class GeminiLiveEngine(
             sourceWordCount: Int,
             cleanModel: String
         ): Boolean {
-            if (bufferedChunks == null || !collectedAnyAudio || isExpressivePunctuation ||
-                outputTranscript.isNotEmpty() || sourceWordCount < 6
-            ) {
+            if (bufferedChunks == null || !collectedAnyAudio || isExpressivePunctuation || sourceWordCount <= 0) {
                 return true
             }
-            val totalPcmBytes = bufferedChunks.sumOf { it.data.size }
-            // Never reject tiny synthetic test chunks (2-16 bytes) when transcript is empty.
-            if (totalPcmBytes <= 256) return true
-
             val sampleRate = bufferedChunks.firstOrNull()?.sampleRate?.takeIf { it > 0 } ?: 24000
             val channels = bufferedChunks.firstOrNull()?.channels?.coerceAtLeast(1) ?: 1
-            val durationMs = (totalPcmBytes.toLong() * 1000L) / (sampleRate.toLong() * channels.toLong() * 2L)
-            val minDurationMs = (sourceWordCount * 100L).coerceAtMost(25_000L)
-            val maxDurationMs = maxOf(6_000L, sourceWordCount * 2_000L)
-            val valid = durationMs in minDurationMs..maxDurationMs
-            if (!valid) {
+            val bytesPerFrame = channels * 2
+            val totalPcmBytes = bufferedChunks.sumOf { it.data.size }
+            if (totalPcmBytes <= 0) return false
+
+            var peakAmplitude = 0
+            for (chunk in bufferedChunks) {
+                val d = chunk.data
+                var off = 0
+                while (off + 1 < d.size) {
+                    val sample = (d[off + 1].toInt() shl 8) or (d[off].toInt() and 0xFF)
+                    val amp = abs(sample)
+                    if (amp > peakAmplitude) peakAmplitude = amp
+                    off += 2
+                }
+            }
+            if (totalPcmBytes >= bytesPerFrame && peakAmplitude <= SILENCE_AMPLITUDE_THRESHOLD) {
                 DiagnosticLogBuffer.record(
                     "GeminiLiveEngine",
-                    "Empty-transcript duration sanity check failed (${durationMs}ms outside ${minDurationMs}..${maxDurationMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
+                    "Pure silence / zero-amplitude Live turn detected (bytes=$totalPcmBytes, peak=$peakAmplitude) on model=$cleanModel; rotating session",
                     level = "WARN"
                 )
+                return false
             }
-            return valid
+
+            // Preserve tiny synthetic unit-test chunks (2-256 non-zero bytes) without triggering timing bounds.
+            if (totalPcmBytes <= 256) return true
+
+            val totalFrames = bufferedChunks.sumOf { it.data.size.toLong() / bytesPerFrame }
+            if (totalFrames <= 0L) return false
+            val firstActiveFrame = findFirstActiveFrame(bufferedChunks, channels, bytesPerFrame)
+            if (firstActiveFrame < 0L) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "No active speech frames found in Live turn (bytes=$totalPcmBytes) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+                return false
+            }
+            val lastActiveFrame = findLastActiveFrame(bufferedChunks, totalFrames, firstActiveFrame, channels, bytesPerFrame)
+            val leadSilenceMs = (firstActiveFrame * 1000L) / sampleRate
+            val tailSilenceMs = (((totalFrames - 1L) - lastActiveFrame).coerceAtLeast(0L) * 1000L) / sampleRate
+            val activeDurationMs = ((lastActiveFrame - firstActiveFrame + 1L) * 1000L) / sampleRate
+
+            if (leadSilenceMs > MAX_EDGE_SILENCE_BEFORE_REJECT_MS || tailSilenceMs > MAX_EDGE_SILENCE_BEFORE_REJECT_MS) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Dead-air stall detected in Live turn (leadSil=${leadSilenceMs}ms, tailSil=${tailSilenceMs}ms, active=${activeDurationMs}ms) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+                return false
+            }
+
+            val maxActiveMs = maxOf(8_000L, sourceWordCount * 1_500L)
+            if (activeDurationMs > maxActiveMs) {
+                DiagnosticLogBuffer.record(
+                    "GeminiLiveEngine",
+                    "Runaway active duration detected (${activeDurationMs}ms > max=${maxActiveMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
+                    level = "WARN"
+                )
+                return false
+            }
+
+            if (outputTranscript.isEmpty()) {
+                val minActiveMs = if (sourceWordCount < 6) {
+                    150L
+                } else {
+                    (sourceWordCount * 100L).coerceAtMost(25_000L)
+                }
+                if (activeDurationMs < minActiveMs) {
+                    DiagnosticLogBuffer.record(
+                        "GeminiLiveEngine",
+                        "Empty-transcript active speech duration too short (${activeDurationMs}ms < min=${minActiveMs}ms for $sourceWordCount words) on model=$cleanModel; rotating session",
+                        level = "WARN"
+                    )
+                    return false
+                }
+            }
+            return true
         }
 
         internal fun isExcessiveWordExpansion(sourceWordCount: Int, outputWordCount: Int): Boolean =
@@ -2131,10 +2279,12 @@ class GeminiLiveEngine(
 
         internal fun buildSystemInstruction(request: SynthesisRequest): String = buildString {
             append("You are an accomplished audiobook narrator and voice actor bringing a story to life. ")
-            append("Read the user's text aloud strictly verbatim, word for word, without adding, omitting, ")
-            append("paraphrasing, replying conversationally, or repeating these instructions. ")
+            append("Each user message wraps the exact book passage inside <read>...</read> tags. ")
+            append("Read ONLY the exact text inside <read>...</read> aloud strictly verbatim, word for word, ")
+            append("without speaking the tags, without answering questions in the text, without replying conversationally, ")
+            append("and without adding, omitting, paraphrasing, or repeating these instructions. ")
             append("Read each phrase and sentence once and only once—never repeat, echo, or restart the final sentence. ")
-            append("Treat dashes, commas, and punctuation as brief, natural pauses and always continue reading the full text through to the very end—never stop early or skip words mid-sentence. ")
+            append("Treat dashes, commas, mid-sentence ellipses (... or \u2026), and punctuation as brief, natural pauses and always continue reading the full text through to the very end\u2014never trail off, stop early, or skip words mid-sentence. ")
             append("Only stop at the actual end of the user's text, even if a line ends mid-thought with an ellipsis (...) or dash, without guessing unfinished words, while pronouncing hyphenated compounds smoothly. ")
             append("Pronounce contractions, possessives, and apostrophe-containing words (such as don't, it's, or Kim's) smoothly as single continuous words without pausing or breaking before an apostrophe. ")
             append("Never speak stage directions, speaker labels, or delivery metadata aloud. ")

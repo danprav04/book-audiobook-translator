@@ -18,7 +18,7 @@ class DefaultModelsTest {
     fun testApprovedModelMappings() {
         assertEquals("gemini-3.5-live-translate-preview", DefaultModels.get(ModelRole.LIVE_TRANSLATE))
         assertEquals("gemini-3.8-flash-tts", DefaultModels.get(ModelRole.TTS))
-        assertEquals("gemini-3.8-live", DefaultModels.get(ModelRole.LIVE_NARRATION))
+        assertEquals("gemini-3.1-flash-live-preview", DefaultModels.get(ModelRole.LIVE_NARRATION))
         assertEquals("gemini-3.5-flash-lite", DefaultModels.get(ModelRole.TEXT_ANALYSIS))
         assertEquals("gemini-3.5-flash-lite", DefaultModels.get(ModelRole.TEXT_TRANSLATION))
         assertEquals("gemini-3.5-transcribe-live", DefaultModels.get(ModelRole.LIVE_TRANSCRIBE))

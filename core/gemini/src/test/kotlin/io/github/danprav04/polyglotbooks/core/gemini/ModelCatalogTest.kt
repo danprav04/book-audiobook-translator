@@ -2,6 +2,7 @@ package io.github.danprav04.polyglotbooks.core.gemini
 
 import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,5 +75,45 @@ class ModelCatalogTest {
         val textModels = ModelCatalog.filterModelsForRole(response.models, ModelRole.TEXT_ANALYSIS)
         val names = textModels.map { it.name }
         assertTrue(names.contains("models/gemini-3.5-flash-lite"))
+    }
+
+    @Test
+    fun `matchesRole for LIVE_NARRATION excludes transcribe, genie, robotics, and extended-thinking models`() {
+        val models = listOf(
+            ModelItem("models/gemini-3.8-live", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-3.1-flash-live-preview", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-2.5-flash-native-audio-latest", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-3.5-transcribe-live", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-3.8-live-extended-thinking", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/genie-4", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-robotics-er-2-streaming-preview", supportedGenerationMethods = listOf("bidiGenerateContent")),
+            ModelItem("models/gemini-3.5-live-translate-preview", supportedGenerationMethods = listOf("bidiGenerateContent"))
+        )
+
+        val liveNarrationIds = ModelCatalog.filterModelsForRole(models, ModelRole.LIVE_NARRATION).map { it.id }
+        assertEquals(
+            listOf(
+                "gemini-3.8-live",
+                "gemini-3.1-flash-live-preview",
+                "gemini-2.5-flash-native-audio-latest"
+            ),
+            liveNarrationIds
+        )
+    }
+
+    @Test
+    fun `recommendedModelsForRole and liveAudioCandidatePool exclude removed nonexistent live models by default`() {
+        val recommended = ModelCatalog.recommendedModelsForRole(ModelRole.LIVE_NARRATION)
+        assertFalse(recommended.contains("gemini-2.5-flash-native-audio-dialog"))
+        assertFalse(recommended.contains("gemini-3-flash-live"))
+        assertTrue(recommended.contains("gemini-3.1-flash-live-preview"))
+        assertTrue(recommended.contains("gemini-2.5-flash-native-audio-latest"))
+
+        val pool = GeminiQuotaTracker().liveAudioCandidatePool("gemini-3.1-flash-live-preview")
+        assertFalse(pool.contains("gemini-2.5-flash-native-audio-dialog"))
+        assertFalse(pool.contains("gemini-3-flash-live"))
+        assertTrue(pool.contains("gemini-3.1-flash-live-preview"))
+        assertTrue(pool.contains("gemini-2.5-flash-native-audio-latest"))
+        assertTrue(pool.contains("gemini-3.8-live"))
     }
 }

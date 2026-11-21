@@ -297,6 +297,74 @@ class InteractionsTtsClientTest {
     }
 
     @Test
+    fun `OkHttpInteractionsTtsClient caches speechMetadata rejection per model across calls`() = runTest {
+        val capturedBodies = mutableListOf<String>()
+        val rawPcm = byteArrayOf(7, 8, 9, 10)
+        val b64Audio = Base64.getEncoder().encodeToString(wrapPcmAsWav(rawPcm))
+        var calls = 0
+
+        val okHttp = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                calls += 1
+                val req = chain.request()
+                val buffer = Buffer()
+                req.body?.writeTo(buffer)
+                capturedBodies.add(buffer.readUtf8())
+
+                if (calls == 1) {
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(400)
+                        .message("Bad Request")
+                        .body("""{"error":{"message":"Invalid speechMetadata"}}""".toResponseBody("application/json".toMediaType()))
+                        .build()
+                } else {
+                    val responseJson = """
+                        {
+                          "candidates": [
+                            { "content": { "parts": [ { "inlineData": { "mimeType": "audio/wav", "data": "$b64Audio" } } ] } }
+                          ]
+                        }
+                    """.trimIndent()
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .body(responseJson.toResponseBody("application/json".toMediaType()))
+                        .build()
+                }
+            })
+            .build()
+
+        val client = OkHttpInteractionsTtsClient(okHttpClient = okHttp, baseUrl = "https://mock.local")
+        val req1 = TtsRequest(
+            text = "First line",
+            model = "gemini-3.1-flash-tts-preview",
+            voiceName = "Zephyr",
+            style = "tense"
+        )
+        val req2 = TtsRequest(
+            text = "Second line",
+            model = "gemini-3.1-flash-tts-preview",
+            voiceName = "Zephyr",
+            style = "tense"
+        )
+        assertArrayEquals(rawPcm, client.synthesizeUnary("test-key", req1))
+        assertArrayEquals(rawPcm, client.synthesizeUnary("test-key", req2))
+
+        assertEquals(3, calls)
+        assertFalse(client.supportsSpeechMetadata("gemini-3.1-flash-tts-preview"))
+        val p0 = json.parseToJsonElement(capturedBodies[0]).jsonObject["contents"]!!.jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        val p1 = json.parseToJsonElement(capturedBodies[1]).jsonObject["contents"]!!.jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        val p2 = json.parseToJsonElement(capturedBodies[2]).jsonObject["contents"]!!.jsonArray[0].jsonObject["parts"]!!.jsonArray[0].jsonObject
+        assertTrue(p0["speechMetadata"] != null)
+        assertNull(p1["speechMetadata"])
+        assertNull(p2["speechMetadata"])
+    }
+
+    @Test
     fun `buildPromptText and buildRequestJson normalize paired single quotes while keeping apostrophes`() {
         val client = OkHttpInteractionsTtsClient(
             okHttpClient = OkHttpClient(),

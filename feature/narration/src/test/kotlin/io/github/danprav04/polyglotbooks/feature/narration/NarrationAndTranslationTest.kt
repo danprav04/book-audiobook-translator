@@ -321,7 +321,7 @@ class NarrationAndTranslationTest {
                     }
 
                     override suspend fun send(message: LiveClientMessage) {
-                        if (modelName.contains("3.8-live")) {
+                        if (modelName.contains("3.1-flash-live-preview")) {
                             incoming.emit(LiveServerMessage.ErrorMessage(LiveErrorData(code = 429, message = "Please retry in 30s")))
                         } else {
                             incoming.emit(
@@ -356,9 +356,9 @@ class NarrationAndTranslationTest {
         assertEquals(1, chunks.size)
         assertTrue(rawAudio.contentEquals(chunks[0].data))
         assertEquals(2, attemptedModels.size)
-        assertTrue(attemptedModels[0].contains("gemini-3.8-live"))
-        assertTrue(attemptedModels[1].contains("gemini-2.5-flash-native-audio-dialog"))
-        assertFalse(tracker.isModelAvailable("gemini-3.8-live"))
+        assertTrue(attemptedModels[0].contains("gemini-3.1-flash-live-preview"))
+        assertTrue(attemptedModels[1].contains("gemini-2.5-flash-native-audio-latest"))
+        assertFalse(tracker.isModelAvailable("gemini-3.1-flash-live-preview"))
 
         // If all Live candidates error, fall back to fallbackEngine
         val errorEngine = GeminiLiveEngine(
@@ -620,7 +620,7 @@ class NarrationAndTranslationTest {
         assertTrue(rawAudio.contentEquals(chunks[0].data))
         assertEquals(1, capturedSetups.size)
         assertEquals(jaInstruction, capturedSetups[0].systemInstruction?.parts?.firstOrNull()?.text)
-        assertEquals(listOf("こんにちは"), capturedClientTurns)
+        assertEquals(listOf("<read>こんにちは</read>"), capturedClientTurns)
 
         // Blank and punctuation-only turns must stay silent pauses without invoking Live model
         val liveSession = engine.openStreamingSession()

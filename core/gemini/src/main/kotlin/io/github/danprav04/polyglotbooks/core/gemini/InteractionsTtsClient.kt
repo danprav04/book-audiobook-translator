@@ -32,6 +32,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Request payload for text-to-speech synthesis via the Interactions API.
@@ -94,6 +95,7 @@ class OkHttpInteractionsTtsClient(
 ) : InteractionsTtsClient {
 
     private val json = Json { ignoreUnknownKeys = true }
+    private val modelsRejectingSpeechMetadata = ConcurrentHashMap.newKeySet<String>()
 
     override suspend fun synthesizeUnary(apiKey: String, request: TtsRequest): ByteArray =
         withContext(Dispatchers.IO) {
@@ -177,9 +179,10 @@ class OkHttpInteractionsTtsClient(
                         return@withContext audioBytes
                     }
 
-                    // If an older/gateway endpoint rejects speechMetadata with HTTP 400, retry the
-                    // same model once with pure verbatim text parts before consuming fallback quota.
+                    // If an older/gateway endpoint rejects speechMetadata with HTTP 400, remember the
+                    // model and retry the same model with pure verbatim text parts before consuming fallback quota.
                     if (response.code == 400 && useSpeechMetadata) {
+                        modelsRejectingSpeechMetadata.add(modelId.trim().removePrefix("models/").lowercase())
                         stripMetadataForCurrentModel = true
                         DiagnosticLogBuffer.record(
                             "InteractionsTtsClient",
@@ -255,8 +258,10 @@ class OkHttpInteractionsTtsClient(
         val styleCue: String?
     )
 
-    internal fun supportsSpeechMetadata(modelId: String): Boolean =
-        !modelId.contains("2.5", ignoreCase = true)
+    internal fun supportsSpeechMetadata(modelId: String): Boolean {
+        val clean = modelId.trim().removePrefix("models/").lowercase()
+        return !clean.contains("2.5") && clean !in modelsRejectingSpeechMetadata
+    }
 
     internal fun buildRequestJson(
         request: TtsRequest,

@@ -176,4 +176,11 @@ class SpeechTextNormalizerTest {
             assertEquals(sample, SpeechTextNormalizer.normalizeDashesForSpeech(sample))
         }
     }
+
+    @Test
+    fun addsPauseSpaceAfterGluedEllipsisBetweenLettersOnly() {
+        assertEquals("That\u2026 you know.", SpeechTextNormalizer.normalizeForSpeech("That\u2026you know."))
+        assertEquals("\u2026What are you doing?", SpeechTextNormalizer.normalizeForSpeech("\u2026What are you doing?"))
+        assertEquals("\"Ranvir Khan\u2026\"", SpeechTextNormalizer.normalizeForSpeech("\"Ranvir Khan\u2026\""))
+    }
 }

@@ -15,6 +15,8 @@ import io.github.danprav04.polyglotbooks.core.gemini.ServerContentData
 import io.github.danprav04.polyglotbooks.core.gemini.SetupConfig
 import io.github.danprav04.polyglotbooks.core.gemini.TranscriptionData
 import io.github.danprav04.polyglotbooks.core.model.Character
+import io.github.danprav04.polyglotbooks.core.model.DefaultModels
+import io.github.danprav04.polyglotbooks.core.model.ModelRole
 import io.github.danprav04.polyglotbooks.core.model.NarrationLine
 import io.github.danprav04.polyglotbooks.core.model.PcmChunk
 import kotlinx.coroutines.CompletableDeferred
@@ -154,8 +156,9 @@ class GeminiLiveEngineStreamingTest {
             liveSessionFactory = {
                 val idx = createdSessions.size
                 FakeReplayLiveSession(replayCount = 16) { session, msg ->
-                    val text = (msg as LiveClientMessage.ClientContentMessage)
+                    val rawText = (msg as LiveClientMessage.ClientContentMessage)
                         .clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text.orEmpty()
+                    val text = rawText.removePrefix("<read>").removeSuffix("</read>")
                     val marker = ((idx * 10) + text.last().digitToIntOrNull().let { it ?: 1 }).toByte()
                     session.emitServerMessage(
                         audioServerMessage(
@@ -209,6 +212,8 @@ class GeminiLiveEngineStreamingTest {
                 FakeReplayLiveSession { session, msg ->
                     val text = (msg as LiveClientMessage.ClientContentMessage)
                         .clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text.orEmpty()
+                        .removePrefix("<read>")
+                        .removeSuffix("</read>")
                     session.emitServerMessage(
                         audioServerMessage(
                             pcmBytes = byteArrayOf(9, 8),
@@ -732,7 +737,7 @@ class GeminiLiveEngineStreamingTest {
             val sentTexts = createdSessions.single().sentMessages
                 .filterIsInstance<LiveClientMessage.ClientContentMessage>()
                 .mapNotNull { it.clientContent.turns?.firstOrNull()?.parts?.firstOrNull()?.text }
-            assertEquals(listOf(expected1, expected2), sentTexts)
+            assertEquals(listOf("<read>$expected1</read>", "<read>$expected2</read>"), sentTexts)
             assertTrue(sentTexts.none { '\'' in it })
         } finally {
             live.close()
@@ -948,7 +953,7 @@ class GeminiLiveEngineStreamingTest {
     }
 
     @Test
-    fun `generationComplete with finished transcription finalizes fast without turnComplete reuses session and ignores stray turnComplete`() = runTest {
+    fun `generationComplete with finished transcription finalizes fast without turnComplete and rotates cleanly on next turn`() = runTest {
         val createdSessions = mutableListOf<FakeReplayLiveSession>()
         var fallbackCalled = false
         val fallbackEngine = object : NarrationEngine {
@@ -974,7 +979,7 @@ class GeminiLiveEngineStreamingTest {
             bufferAndVerifyTurns = true
         )
         try {
-            // Turn 1: generationComplete=true + outputTranscription.finished=true without turnComplete -> completes ~300ms and keeps WebSocket open.
+            // Turn 1: generationComplete=true + outputTranscription.finished=true without turnComplete -> completes ~250ms.
             val turn1Chunks = mutableListOf<PcmChunk>()
             val t1Job = launch(dispatcher) {
                 live.synthesizeTurnStreaming(
@@ -999,7 +1004,7 @@ class GeminiLiveEngineStreamingTest {
             runCurrent()
             assertTrue("Should still wait briefly after generationComplete for stray tail packets", turn1Chunks.isEmpty())
 
-            advanceTimeBy(350L)
+            advanceTimeBy(300L)
             runCurrent()
             t1Job.join()
 
@@ -1008,9 +1013,8 @@ class GeminiLiveEngineStreamingTest {
             assertEquals(11.toByte(), turn1Chunks[0].data[0])
             assertEquals(1, createdSessions.size)
             assertEquals(0, createdSessions.single().disconnectCount)
-            assertEquals(0, live.sessionRotationCount)
 
-            // Turn 2: reuses exact same WebSocket; delayed stray turnComplete from turn 1 arrives first and must be ignored.
+            // Turn 2: cleanly rotates to a fresh WebSocket so sending Turn 2 never triggers server barge-in.
             val turn2Chunks = mutableListOf<PcmChunk>()
             val t2Job = launch(dispatcher) {
                 live.synthesizeTurnStreaming(
@@ -1018,19 +1022,11 @@ class GeminiLiveEngineStreamingTest {
                 ).collect { turn2Chunks += it }
             }
             runCurrent()
-            assertEquals(1, createdSessions.size)
-            assertEquals(2, createdSessions.single().sentMessages.size)
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertEquals(1, live.sessionRotationCount)
 
-            // Delayed turnComplete from turn 1 arrives before turn 2 emits anything -> must NOT abort turn 2!
-            createdSessions.single().emitServerMessage(
-                LiveServerMessage.ServerContentMessage(ServerContentData(turnComplete = true))
-            )
-            runCurrent()
-            assertFalse("Stray turnComplete from turn 1 must be consumed without terminating turn 2", t2Job.isCompleted)
-            assertTrue(turn2Chunks.isEmpty())
-
-            // Now turn 2 emits its own audio + transcript + turnComplete -> succeeds on same session.
-            createdSessions.single().emitServerMessage(
+            createdSessions[1].emitServerMessage(
                 audioServerMessage(
                     pcmBytes = byteArrayOf(21, 22),
                     transcript = "Then the bell rang.",
@@ -1041,7 +1037,6 @@ class GeminiLiveEngineStreamingTest {
             t2Job.join()
 
             assertFalse(fallbackCalled)
-            assertEquals(1, createdSessions.size)
             assertEquals(1, turn2Chunks.size)
             assertEquals(21.toByte(), turn2Chunks[0].data[0])
         } finally {
@@ -1062,9 +1057,11 @@ class GeminiLiveEngineStreamingTest {
                 return flowOf(PcmChunk(byteArrayOf(99), 24000, 1))
             }
         }
+        val primaryModel = DefaultModels.get(ModelRole.LIVE_NARRATION)
         val tracker = GeminiQuotaTracker().apply {
-            recordHttpError("gemini-2.5-flash-native-audio-dialog", 404, "not found")
-            recordHttpError("gemini-3-flash-live", 404, "not found")
+            liveAudioCandidatePool(primaryModel)
+                .filter { it != primaryModel }
+                .forEach { recordHttpError(it, 404, "not found") }
         }
         val engine = GeminiLiveEngine(
             fallbackEngine = fallbackEngine,
@@ -1404,7 +1401,7 @@ class GeminiLiveEngineStreamingTest {
             j1.join()
             assertEquals(2, chunks1.size)
 
-            // 2. generationComplete=true without transcription.finished finalizes after 500ms idle and reuses session.
+            // 2. generationComplete=true without transcription.finished finalizes after 400ms idle and rotates cleanly on next turn.
             val chunks2 = mutableListOf<PcmChunk>()
             val j2 = launch(dispatcher) {
                 live.synthesizeTurnStreaming(SynthesisRequest(text = "Short line.", voiceId = "Charon")).collect { chunks2 += it }
@@ -1423,15 +1420,296 @@ class GeminiLiveEngineStreamingTest {
                 )
             )
             runCurrent()
-            advanceTimeBy(350L)
+            advanceTimeBy(250L)
             runCurrent()
-            assertFalse("Without finished=true should wait up to 500ms", j2.isCompleted)
+            assertFalse("Without finished=true should wait up to 400ms", j2.isCompleted)
 
             advanceTimeBy(200L)
             runCurrent()
             j2.join()
             assertEquals(1, chunks2.size)
             assertEquals(0, createdSessions[1].disconnectCount)
+
+            // 3. Starting next turn rotates away from session 1 cleanly instead of risking barge-in.
+            val chunks3 = mutableListOf<PcmChunk>()
+            val j3 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Next line.", voiceId = "Charon")).collect { chunks3 += it }
+            }
+            runCurrent()
+            assertEquals(3, createdSessions.size)
+            assertEquals(1, createdSessions[1].disconnectCount)
+            createdSessions[2].emitServerMessage(
+                audioServerMessage(byteArrayOf(31, 32), transcript = "Next line.", turnComplete = true)
+            )
+            runCurrent()
+            j3.join()
+            assertEquals(1, chunks3.size)
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `generationComplete without turnComplete rotates cleanly to fresh session instead of risking barge-in`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            // Turn 1 finalizes on generationComplete=true + 400ms idle (no turnComplete sent).
+            val chunks1 = mutableListOf<PcmChunk>()
+            val j1 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "First turn line.", voiceId = "Zephyr")).collect { chunks1 += it }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+            createdSessions[0].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(byteArrayOf(11, 12)))))
+                        ),
+                        outputTranscription = TranscriptionData(text = "First turn line.", finished = false),
+                        generationComplete = true,
+                        turnComplete = false
+                    )
+                )
+            )
+            runCurrent()
+            advanceTimeBy(450L)
+            runCurrent()
+            j1.join()
+            assertEquals(1, chunks1.size)
+
+            // Turn 2 opens a fresh session cleanly without sending onto uncompleted Turn 1 socket.
+            val chunks2 = mutableListOf<PcmChunk>()
+            val j2 = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Second turn line.", voiceId = "Zephyr")).collect { chunks2 += it }
+            }
+            runCurrent()
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            assertEquals(1, live.sessionRotationCount)
+
+            createdSessions[1].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(
+                    ServerContentData(
+                        modelTurn = ModelTurn(
+                            parts = listOf(Part(inlineData = Blob("audio/pcm;rate=24000", Base64.getEncoder().encodeToString(byteArrayOf(31, 32)))))
+                        ),
+                        outputTranscription = TranscriptionData(text = "Second turn line.", finished = true),
+                        generationComplete = true,
+                        turnComplete = true
+                    )
+                )
+            )
+            runCurrent()
+            j2.join()
+
+            assertEquals(2, createdSessions.size)
+            assertEquals(1, chunks2.size)
+            assertEquals(31.toByte(), chunks2[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `audio health validator rejects pure silence, dead-air tails, and runaway loops and retries cleanly`() = runTest {
+        fun encodeTone(frames: Int, amp: Int = 5000): ByteArray {
+            val out = ByteArray(frames * 2)
+            for (i in 0 until frames) {
+                val v = (amp * Math.sin(i * 0.08)).toInt()
+                out[i * 2] = (v and 0xFF).toByte()
+                out[i * 2 + 1] = ((v ushr 8) and 0xFF).toByte()
+            }
+            return out
+        }
+
+        // Direct unit checks on isBufferedAudioHealthy:
+        assertFalse(
+            "All-zero pure silence turn must be rejected even with verbatim transcript",
+            GeminiLiveEngine.isBufferedAudioHealthy(
+                bufferedChunks = listOf(PcmChunk(ByteArray(240), 24000, 1)),
+                collectedAnyAudio = true,
+                isExpressivePunctuation = false,
+                outputTranscript = "Nothing.",
+                sourceWordCount = 1,
+                cleanModel = "gemini-3.1-flash-live-preview"
+            )
+        )
+        val deadAirTail = encodeTone(24_000) + ByteArray(24_000 * 8 * 2)
+        assertFalse(
+            "Turn with >6s dead-air tail must be rejected",
+            GeminiLiveEngine.isBufferedAudioHealthy(
+                bufferedChunks = listOf(PcmChunk(deadAirTail, 24000, 1)),
+                collectedAnyAudio = true,
+                isExpressivePunctuation = false,
+                outputTranscript = "Nothing.",
+                sourceWordCount = 1,
+                cleanModel = "gemini-3.1-flash-live-preview"
+            )
+        )
+        val runaway22s = encodeTone(24_000 * 22)
+        assertFalse(
+            "22s active audio for 5 words must be rejected as runaway",
+            GeminiLiveEngine.isBufferedAudioHealthy(
+                bufferedChunks = listOf(PcmChunk(runaway22s, 24000, 1)),
+                collectedAnyAudio = true,
+                isExpressivePunctuation = false,
+                outputTranscript = "Kuwaaaaah I shall block this",
+                sourceWordCount = 5,
+                cleanModel = "gemini-3.1-flash-live-preview"
+            )
+        )
+
+        // End-to-end session retry on pure digital silence turn:
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val cleanPcm = encodeTone(12_000)
+            val chunks = mutableListOf<PcmChunk>()
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Nothing.", voiceId = "Zephyr")).collect { chunks += it }
+            }
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(ByteArray(240), transcript = "Nothing.", turnComplete = true)
+            )
+            runCurrent()
+            assertTrue("Pure silence attempt must rotate to another candidate/retry", createdSessions.size >= 2)
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(cleanPcm, transcript = "Nothing.", turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(cleanPcm.size, chunks.sumOf { it.data.size })
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `mid-turn interrupted after audio started still discards partial turn rotates session and retries`() = runTest {
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val chunks = mutableListOf<PcmChunk>()
+            val j = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Clean complete line.", voiceId = "Zephyr")).collect { chunks += it }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+            // Audio started, then interrupted mid-turn!
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(byteArrayOf(9, 10), transcript = "Clean", turnComplete = false)
+            )
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                LiveServerMessage.ServerContentMessage(ServerContentData(interrupted = true))
+            )
+            runCurrent()
+
+            // Engine should rotate to a fresh session (either next candidate or retry) and emit ONLY clean audio.
+            assertTrue("Expected rotation after mid-turn interruption", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(byteArrayOf(41, 42), transcript = "Clean complete line.", turnComplete = true)
+            )
+            runCurrent()
+            j.join()
+
+            assertEquals(1, chunks.size)
+            assertEquals(41.toByte(), chunks[0].data[0])
+        } finally {
+            live.close()
+        }
+    }
+
+    @Test
+    fun `mid-stream dead-air stall exceeding 6s continuous silence aborts before turnComplete rotates session and retries`() = runTest {
+        fun encodeToneFrames(frameCount: Int, amplitude: Short = 4000): ByteArray {
+            val out = ByteArray(frameCount * 2)
+            for (i in 0 until frameCount) {
+                val sample = if (i % 2 == 0) amplitude.toInt() else -amplitude.toInt()
+                out[i * 2] = (sample and 0xFF).toByte()
+                out[i * 2 + 1] = ((sample ushr 8) and 0xFF).toByte()
+            }
+            return out
+        }
+
+        val createdSessions = mutableListOf<FakeReplayLiveSession>()
+        val engine = GeminiLiveEngine(
+            liveSessionFactory = {
+                FakeReplayLiveSession { _, _ -> }.also { createdSessions += it }
+            },
+            apiKeyProvider = { "test-key" }
+        )
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val live = engine.openStreamingSession(dispatcher = dispatcher, bufferAndVerifyTurns = true)
+        try {
+            val speechPrefix = encodeToneFrames(4_800) // 200ms active speech
+            val silentChunk3500Ms = ByteArray(24_000 * 2 * 35 / 10) // 3.5s digital silence
+            val cleanRetryPcm = encodeToneFrames(12_000)
+            val collected = mutableListOf<PcmChunk>()
+
+            val job = launch(dispatcher) {
+                live.synthesizeTurnStreaming(SynthesisRequest(text = "Clean complete line.", voiceId = "Zephyr")).collect {
+                    collected += it
+                }
+            }
+            runCurrent()
+            assertEquals(1, createdSessions.size)
+
+            // Emit 200ms of speech followed by 7.0s of silence in 2 chunks WITHOUT sending turnComplete.
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(speechPrefix, transcript = "Clean", turnComplete = false)
+            )
+            runCurrent()
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(silentChunk3500Ms, turnComplete = false)
+            )
+            runCurrent()
+            // Still under 6s threshold -> must remain on first session awaiting more audio.
+            assertEquals(1, createdSessions.size)
+
+            createdSessions[0].emitServerMessage(
+                audioServerMessage(silentChunk3500Ms, turnComplete = false)
+            )
+            runCurrent()
+
+            // Crossing 6,000ms continuous silence must abort mid-stream without waiting for turnComplete and rotate.
+            assertTrue("Expected immediate mid-stream rotation after >6s silence", createdSessions.size >= 2)
+            assertEquals(1, createdSessions[0].disconnectCount)
+
+            createdSessions.last().emitServerMessage(
+                audioServerMessage(cleanRetryPcm, transcript = "Clean complete line.", turnComplete = true)
+            )
+            runCurrent()
+            job.join()
+
+            assertEquals(cleanRetryPcm.size, collected.sumOf { it.data.size })
+            assertEquals(4000.toByte(), (collected.first().data[0].toInt() or (collected.first().data[1].toInt() shl 8)).let { (it and 0xFF).toByte() })
         } finally {
             live.close()
         }

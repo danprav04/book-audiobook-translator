@@ -7,7 +7,7 @@ object DefaultModels {
     val map: Map<ModelRole, String> = mapOf(
         ModelRole.LIVE_TRANSLATE to "gemini-3.5-live-translate-preview",
         ModelRole.TTS to "gemini-3.8-flash-tts",
-        ModelRole.LIVE_NARRATION to "gemini-3.8-live",
+        ModelRole.LIVE_NARRATION to "gemini-3.1-flash-live-preview",
         ModelRole.TEXT_ANALYSIS to "gemini-3.5-flash-lite",
         ModelRole.TEXT_TRANSLATION to "gemini-3.5-flash-lite",
         ModelRole.LIVE_TRANSCRIBE to "gemini-3.5-transcribe-live"

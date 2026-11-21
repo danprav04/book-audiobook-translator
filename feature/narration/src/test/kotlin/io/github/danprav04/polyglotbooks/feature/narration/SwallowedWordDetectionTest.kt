@@ -78,6 +78,29 @@ class SwallowedWordDetectionTest {
     }
 
     @Test
+    fun `clean high-sibilant speech jump under 45k is not flagged as glitch while 50k click is caught`() {
+        val s = tone(24000)
+        // Observed clean 24kHz Zephyr and 2.5-native-audio speech jumps reach ~22,845..36,283 sample delta.
+        s[4000] = 18_500
+        s[4001] = -18_500
+        assertFalse(GeminiLiveEngine.hasPcmGlitch(listOf(pcm(s))))
+
+        s[5000] = 25_000
+        s[5001] = -25_000
+        assertTrue(GeminiLiveEngine.hasPcmGlitch(listOf(pcm(s))))
+    }
+
+    @Test
+    fun `ignoredTailWords 3 tolerates trailing ASR lag on long turn while still catching mid-sentence drop`() {
+        val longSource = "The fallen constellations who were watching from above were genuinely startled by his bold words but that was for then."
+        val tailLagged = "The fallen constellations who were watching from above were genuinely startled by his bold words but that"
+        assertEquals(0, GeminiLiveEngine.countSwallowedSourceWords(longSource, tailLagged, ignoredTailWords = 3))
+
+        val midDrop = "The fallen constellations were watching from above were genuinely startled by his bold words but that was for then."
+        assertEquals(1, GeminiLiveEngine.countSwallowedSourceWords(longSource, midDrop, ignoredTailWords = 3))
+    }
+
+    @Test
     fun `compressExcessiveInternalSilence preserves smooth transitions across multiple long gaps`() {
         val sr = 24000
         val speech = tone(sr / 4, amp = 5000) // 250ms active

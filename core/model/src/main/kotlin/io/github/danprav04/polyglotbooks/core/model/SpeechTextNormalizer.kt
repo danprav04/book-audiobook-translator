@@ -61,6 +61,7 @@ object SpeechTextNormalizer {
     private val MID_SENTENCE_DASH_REGEX = Regex(
         "[ \\t]*(?:[$ALL_DASH_CHARS]{2,}|[\\u2012\\u2014\\u2015\\u2E3A\\u2E3B])(?:[ \\t]+(?:[$ALL_DASH_CHARS]{2,}|[\\u2012\\u2014\\u2015\\u2E3A\\u2E3B]))*[ \\t]*|(?<=\\S)[ \\t]+[\\u2013-][ \\t]+(?=\\S)"
     )
+    private val GLUED_ELLIPSIS_BETWEEN_LETTERS_REGEX = Regex("(?<=\\p{L})\\u2026(?=\\p{L})")
     private val HORIZONTAL_SPACES_REGEX = Regex("[ \\t]{2,}")
 
     private val UNAMBIGUOUS_OPENERS = setOf('\u201C', '\u2018', '[', '(', '\u300C', '\u300E')
@@ -93,7 +94,8 @@ object SpeechTextNormalizer {
         if (text.isEmpty()) return text
 
         val quoteNormalized = normalizeQuotesAndApostrophes(text)
-        return normalizeDashesForSpeech(quoteNormalized)
+        val dashNormalized = normalizeDashesForSpeech(quoteNormalized)
+        return GLUED_ELLIPSIS_BETWEEN_LETTERS_REGEX.replace(dashNormalized, "\u2026 ")
     }
 
     /**

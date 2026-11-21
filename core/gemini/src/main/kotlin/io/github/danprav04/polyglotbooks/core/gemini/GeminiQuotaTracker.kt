@@ -265,24 +265,33 @@ class GeminiQuotaTracker(
 
     fun liveAudioCandidatePool(primaryModel: String): List<String> {
         val primary = normalizeId(primaryModel)
+        val excludedLiveKeywords = listOf("translate", "transcribe", "extended-thinking", "genie", "robotics")
         val catalogLive = synchronized(lock) {
             ModelCatalog.filterModelsForRole(discoveredModels, ModelRole.LIVE_NARRATION)
                 .map { normalizeId(it.id) }
-                .filter {
-                    it.isNotEmpty() &&
-                        !isExcludedZeroQuotaModel(it) &&
-                        !it.contains("transcribe", ignoreCase = true)
+                .filter { id ->
+                    id.isNotEmpty() &&
+                        !isExcludedZeroQuotaModel(id) &&
+                        excludedLiveKeywords.none { kw -> id.contains(kw, ignoreCase = true) }
                 }
         }
+        val preferredOrder = listOf(
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.5-flash-native-audio-latest",
+            "gemini-3.8-live"
+        )
+        val prioritizedCatalog = preferredOrder.filter { it in catalogLive }
+        val remainingCatalog = catalogLive.filterNot { it in prioritizedCatalog }
 
         return buildList {
             if (primary.isNotEmpty() && !isExcludedZeroQuotaModel(primary)) {
                 add(primary)
             }
-            addAll(catalogLive)
+            addAll(prioritizedCatalog)
+            addAll(remainingCatalog)
+            add("gemini-3.1-flash-live-preview")
+            add("gemini-2.5-flash-native-audio-latest")
             add("gemini-3.8-live")
-            add("gemini-2.5-flash-native-audio-dialog")
-            add("gemini-3-flash-live")
         }.distinct()
     }
 
