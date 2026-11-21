@@ -296,8 +296,8 @@ class DataStoreSettingsRepository(
         const val DEFAULT_READER_FONT_FAMILY: String = "Serif"
         const val DEFAULT_NARRATOR_VOICE_ID: String = GeminiStudioVoices.DEFAULT_NARRATOR_VOICE_ID
         const val MIN_LIVE_PRELOAD_CHUNKS: Int = 1
-        const val MAX_LIVE_PRELOAD_CHUNKS: Int = 8
-        const val DEFAULT_LIVE_PRELOAD_CHUNKS: Int = 3
+        const val MAX_LIVE_PRELOAD_CHUNKS: Int = 20
+        const val DEFAULT_LIVE_PRELOAD_CHUNKS: Int = 6
 
         fun modelRoleKey(role: ModelRole) = stringPreferencesKey("model_role_${role.name}")
     }

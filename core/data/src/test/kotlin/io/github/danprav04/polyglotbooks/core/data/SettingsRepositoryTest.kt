@@ -264,15 +264,19 @@ class SettingsRepositoryTest {
             DataStoreSettingsRepository.DEFAULT_LIVE_PRELOAD_CHUNKS,
             repository.livePreloadChunks.first()
         )
-        assertEquals(3, repository.livePreloadChunks.first())
+        assertEquals(6, repository.livePreloadChunks.first())
 
-        repository.setLivePreloadChunks(5)
-        assertEquals(5, repository.livePreloadChunks.first())
+        repository.setLivePreloadChunks(12)
+        assertEquals(12, repository.livePreloadChunks.first())
 
         repository.setLivePreloadChunks(0)
         assertEquals(1, repository.livePreloadChunks.first())
 
-        repository.setLivePreloadChunks(12)
-        assertEquals(8, repository.livePreloadChunks.first())
+        repository.setLivePreloadChunks(25)
+        assertEquals(
+            DataStoreSettingsRepository.MAX_LIVE_PRELOAD_CHUNKS,
+            repository.livePreloadChunks.first()
+        )
+        assertEquals(20, repository.livePreloadChunks.first())
     }
 }
